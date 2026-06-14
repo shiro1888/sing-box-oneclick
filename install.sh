@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|uninstall]
+#    本地:        sudo bash install.sh [install|info|cf|uninstall]
 #
 #  常用环境变量(可选,覆盖默认):
 #    LIMIT_GB=200            每月显示/限流额度
@@ -19,6 +19,9 @@
 #    REALITY_SNI/TLS_SNI     伪装域名(默认 www.microsoft.com / www.bing.com)
 #    ENABLE_BBR=1            开启 BBR(默认开,纯 sysctl,安全)
 #    ENABLE_UFW=0            自动配置并启用 ufw(默认关,避免锁死SSH)
+#
+#  可选第5节点 CF-Vless(大保底, 需先在 CF 后台建 Tunnel 拿 token+域名):
+#    CF_TOKEN=... CF_HOSTNAME=cf.example.com  bash install.sh cf
 #
 #  适配: Debian/Ubuntu(完整) ; RHEL系 dnf/yum(尽力,nginx 默认站点可能需手动处理)
 # =============================================================================
@@ -49,6 +52,7 @@ ANYTLS_PORT="${ANYTLS_PORT:-4434}"
 VLESS_PORT="${VLESS_PORT:-443}"
 SS_PORT="${SS_PORT:-4435}"
 SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
+CF_PORT="${CF_PORT:-28080}"   # CF-Vless 本地 WS 入站端口(只听 127.0.0.1)
 REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
@@ -64,6 +68,7 @@ NGINX_CONF=/etc/nginx/conf.d/00-singbox-sub.conf
 TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
 BBR_CONF=/etc/sysctl.d/99-bbr.conf
+CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
 
 # 运行期填充(写成可被环境覆盖, 既不影响生产, 也便于测试渲染函数)
 PKG="${PKG:-}"; OS_ID="${OS_ID:-}"; PUBLIC_IP="${PUBLIC_IP:-}"; SUB_HOST="${SUB_HOST:-}"
@@ -73,6 +78,8 @@ ANYTLS_OK="${ANYTLS_OK:-1}"; EXPIRE_VALUE="${EXPIRE_VALUE:-}"
 HY2_PASSWORD="${HY2_PASSWORD:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"; VLESS_UUID="${VLESS_UUID:-}"
 REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"; REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
+# CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
+CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
 
 # ----------------------------------------------------------------- 工具
 need_root() { [ "$(id -u)" = 0 ] || die "请用 root 运行(sudo bash install.sh)"; }
@@ -264,6 +271,21 @@ render_singbox_config() {
 JSON
 )"
   fi
+  local cf_block=""
+  if [ -n "$CF_HOSTNAME" ] && [ -n "$CF_VLESS_UUID" ]; then
+    cf_block="$(cat <<JSON
+,
+    {
+      "type": "vless",
+      "tag": "cf-vless-ws-in",
+      "listen": "127.0.0.1",
+      "listen_port": $CF_PORT,
+      "users": [ { "uuid": "$CF_VLESS_UUID" } ],
+      "transport": { "type": "ws", "path": "$CF_WS_PATH" }
+    }
+JSON
+)"
+  fi
   cat <<JSON
 {
   "log": { "disabled": false, "level": "info" },
@@ -301,7 +323,7 @@ $anytls_block
       "listen_port": $SS_PORT,
       "method": "$SS_METHOD",
       "password": "$SS_PASSWORD"
-    }
+    }$cf_block
   ],
   "outbounds": [ { "type": "direct", "tag": "direct" } ]
 }
@@ -315,6 +337,7 @@ render_subscription_yaml() {
   REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
+  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
   "$PY" - <<'PY'
 import os
 ip  = os.environ["PUBLIC_IP"]
@@ -361,7 +384,26 @@ proxies.append(f'''  - name: "SS2022"
     password: "{os.environ["SS_PASSWORD"]}"
     udp: true''')
 
-names = ["Hysteria2"] + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"]
+cf_host = os.environ.get("CF_HOSTNAME", "")
+cf_uuid = os.environ.get("CF_VLESS_UUID", "")
+cf_on = bool(cf_host and cf_uuid)
+if cf_on:
+    proxies.append(f'''  - name: "CF-Vless"
+    type: vless
+    server: {cf_host}
+    port: 443
+    uuid: {cf_uuid}
+    network: ws
+    udp: true
+    tls: true
+    servername: {cf_host}
+    client-fingerprint: chrome
+    ws-opts:
+      path: {os.environ["CF_WS_PATH"]}
+      headers:
+        Host: {cf_host}''')
+
+names = ["Hysteria2"] + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"] + (["CF-Vless"] if cf_on else [])
 grp = "\n".join(f'      - "{n}"' for n in names)
 
 rules = []
@@ -682,10 +724,12 @@ print_summary() {
   [ "$ANYTLS_OK" = 1 ] && printf '    - AnyTLS     (TCP %s)\n' "$ANYTLS_PORT"
   printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
   printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
+  [ -n "$CF_HOSTNAME" ] && printf '    - CF-Vless   (WS via %s, Argo 大保底)\n' "$CF_HOSTNAME"
   echo
   printf '  管理命令:\n'
-  printf '    查看信息:  bash install.sh info\n'
-  printf '    卸载:      bash install.sh uninstall\n'
+  printf '    查看信息:    bash install.sh info\n'
+  printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
+  printf '    卸载:        bash install.sh uninstall\n'
 
   echo
   warn "----- 需要你手动完成 / 本机无法自动完成的部分 -----"
@@ -706,6 +750,7 @@ do_info() {
   # shellcheck disable=SC1090
   . "$SECRETS"
   [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true   # 接入过 CF-Vless 则一并显示
   # 优先用安装时存下的 SUB_HOST(纯读, 不崩); 老版本无此字段才回退探测且探测失败不致命
   [ -n "${SUB_HOST:-}" ] || SOFT_DETECT=1 detect_net
   command -v sing-box >/dev/null 2>&1 && SB_VER="$(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
@@ -735,9 +780,92 @@ do_uninstall() {
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
   rm -f "$WWW"/sub-*.yaml 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅文件
   rm -f /run/sing-box-quota-stopped 2>/dev/null || true
+  if [ -f "$CF_ENV" ]; then
+    cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
+    rm -f "$CF_ENV" 2>/dev/null || true
+    warn "已停止本脚本 cf 子命令装的 cloudflared(CF 后台那条 Tunnel 需你自行删除)"
+  else
+    warn "未触碰 cloudflared(若你手动搭过 CF, 请自行处理 /etc/cloudflared, 凭证别误删)"
+  fi
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
-  warn "未触碰 cloudflared(若你手动搭过 CF-Vless 大保底, 请自行处理 /etc/cloudflared, 凭证别误删)"
   ok "已卸载(保留 sing-box 程序与 BBR sysctl; 备份见上)"
+}
+
+# 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
+do_cf() {
+  umask 077
+  [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再加 CF-Vless"
+  # shellcheck disable=SC1090
+  . "$SECRETS"
+  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true
+  CF_PORT="${CF_PORT:-28080}"
+
+  if [ -z "${CF_TOKEN:-}" ] || [ -z "${CF_HOSTNAME:-}" ]; then
+    cat <<EOF
+CF-Vless 大保底(第5节点)需要先在 Cloudflare 后台建一条 Tunnel:
+  Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared
+  · Public hostname: 你的域名(如 cf.example.com)
+    Service: http://127.0.0.1:${CF_PORT}
+  · 复制 Connector token
+然后回本机运行:
+  CF_TOKEN='粘贴token' CF_HOSTNAME='cf.example.com' bash install.sh cf
+EOF
+    die "缺少 CF_TOKEN 或 CF_HOSTNAME"
+  fi
+  case "$CF_HOSTNAME" in *[!A-Za-z0-9.-]*) die "CF_HOSTNAME 含非法字符: $CF_HOSTNAME";; esac
+  case "$CF_PORT" in ''|*[!0-9]*) die "CF_PORT 必须是数字: $CF_PORT";; esac
+
+  CF_VLESS_UUID="${CF_VLESS_UUID:-$(sing-box generate uuid)}"
+  CF_WS_PATH="${CF_WS_PATH:-/cf-$(openssl rand -hex 8)}"
+  case "$CF_WS_PATH" in /*) ;; *) CF_WS_PATH="/$CF_WS_PATH";; esac
+
+  cat >"$CF_ENV" <<EOF
+CF_HOSTNAME=$CF_HOSTNAME
+CF_PORT=$CF_PORT
+CF_VLESS_UUID=$CF_VLESS_UUID
+CF_WS_PATH=$CF_WS_PATH
+EOF
+  chmod 600 "$CF_ENV"
+
+  # 装 cloudflared(直接下二进制, 跨发行版)
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    log "下载 cloudflared..."
+    local cfarch
+    case "$(uname -m)" in
+      x86_64|amd64)  cfarch=amd64 ;;
+      aarch64|arm64) cfarch=arm64 ;;
+      *) die "cloudflared 不支持架构 $(uname -m)" ;;
+    esac
+    curl -fsSL -o /usr/local/bin/cloudflared \
+      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cfarch" \
+      || die "cloudflared 下载失败"
+    chmod 755 /usr/local/bin/cloudflared
+  fi
+  log "安装 cloudflared 服务(token)..."
+  cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
+  cloudflared service install "$CF_TOKEN" || die "cloudflared service install 失败(token 是否正确?)"
+  systemctl enable --now cloudflared >/dev/null 2>&1 || true
+
+  # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
+  detect_net
+  render_singbox_config >"$SB_DIR/config.json"; chmod 600 "$SB_DIR/config.json"
+  sing-box check -c "$SB_DIR/config.json" || die "加入 CF 入站后 sing-box 配置校验失败"
+  systemctl restart sing-box
+  render_subscription_yaml >"$WWW$SUB_PATH"; chmod 644 "$WWW$SUB_PATH"
+
+  ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
+  log "验证隧道(看到 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
+  if curl -isS -m 10 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+       -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' \
+       "https://$CF_HOSTNAME$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
+    ok "隧道连通(101 Switching Protocols)。客户端重新拉取订阅即可看到 CF-Vless。"
+  else
+    warn "暂未拿到 101: cloudflared 可能还在连接, 或 CF 后台 hostname→http://127.0.0.1:$CF_PORT 未配好。"
+    echo "  等几秒后手动复测: systemctl is-active cloudflared sing-box"
+    echo "  curl -i -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' https://$CF_HOSTNAME$CF_WS_PATH"
+  fi
 }
 
 do_install() {
@@ -749,6 +877,8 @@ do_install() {
   install_singbox
   detect_net
   gen_secrets
+  # shellcheck disable=SC1090
+  [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true   # 已接入过 CF-Vless 则重装时保留
   gen_cert
   write_env
   write_singbox_config
@@ -765,8 +895,9 @@ main() {
   case "${1:-install}" in
     install)   do_install ;;
     info)      do_info ;;
+    cf)        do_cf ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|cf|uninstall]"; exit 1 ;;
   esac
 }
 

@@ -14,8 +14,9 @@
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
 - **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
 - **安全细节**：`server_tokens off`、密钥文件 600、流量头只挂在订阅路径（不污染首页/404）。
+- **可选第 5 节点**：CF-Vless 大保底（Argo 命名隧道），`install.sh cf` 半自动接入——VPS 侧全自动，只有 CF 后台建 Tunnel 那步要你做。直连 IP 被墙时兜底。
 - **可选**：BBR（默认开）、ufw（默认关，避免锁死 SSH）。
-- **不破坏现有节点**：二次运行复用已有密钥。
+- **不破坏现有节点**：二次运行复用已有密钥（含升级时自动补 SS2022 / 保留 CF-Vless）。
 
 ---
 
@@ -73,6 +74,7 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 
 ```bash
 sudo bash install.sh info        # 重新打印订阅 URL 和节点信息
+sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf   # 接入可选第 5 节点 CF-Vless(见第 3 节)
 sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 ```
 
@@ -86,7 +88,7 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 脚本能配主机内的 ufw，但**改不了云端安全组**（阿里云/腾讯云/Oracle/AWS 等控制台里的入站规则）。云安全组默认拒绝入站、而且经常拦 UDP。请在控制台放行：
 
 ```
-22/tcp  80/tcp  443/tcp  4434/tcp  4433/udp     ← 尤其 4433/udp
+22/tcp  80/tcp  443/tcp  4434/tcp  4435/tcp  4433/udp  4435/udp     ← 尤其 UDP(4433、4435)
 ```
 
 > 现象：HY2（UDP）连不上、Vless（TCP 443）却正常 = 八成是 UDP 没放行。注意本机 `ss -lntup` 只证明在监听，证明不了外部能连进来。
@@ -97,15 +99,22 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 - 要真正的 HTTPS（443 已被 Reality 占用），推荐把订阅路径挂到下面的 Cloudflare Tunnel 上走 HTTPS，而不是在 VPS 上另开 443。
 - 临时缓解：拉取一次后可换 `SUB_PATH`（等于换凭证），或拉完就把订阅文件删掉本地保存。
 
-### 3.（可选）CF-Vless 大保底 / 「Argo 隧道」（IP 被墙时兜底）
-网上说的 **「Argo 隧道」就是这里的 Cloudflare Tunnel**，下面这个**命名隧道（固定域名）就是稳定版的 Argo**。需要 Cloudflare 账号 + 一个托管在 CF 的域名 + Tunnel，**无法在通用脚本里自动完成**。手动步骤：
-1. `apt install cloudflared`；
-2. 给 sing-box 加一个只监听 `127.0.0.1:28080` 的 VLESS-WS 入站；
-3. 建 Tunnel 把 `cf.example.com` → `http://127.0.0.1:28080`；
-4. Tunnel 通了之后，再把 `CF-Vless` 节点加进订阅（没通就别加，否则是死节点）。
+### 3.（可选）CF-Vless 大保底 / 「Argo 隧道」（IP 被墙时兜底）—— 第 5 节点
+网上说的 **「Argo 隧道」就是这里的 Cloudflare Tunnel**，这个**命名隧道（固定域名）就是稳定版的 Argo**。VPS 这一侧脚本能自动做，**只有 Cloudflare 后台那步需要你**（要你自己的账号 + 一个托管在 CF 的域名）。
 
-详细配置见 sing-box / cloudflared 官方文档。
-> 注意：部分 VPS 商家对 Cloudflare/CDN 流量额外计费或不适合走 CF，这种机器就别开。
+**第一步（你手动，在 CF 后台）**：Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared
+- 加一个 Public hostname：你的域名（如 `cf.example.com`），Service 填 `http://127.0.0.1:28080`
+- 复制 Connector **token**
+
+**第二步（脚本自动）**：回到 VPS 运行
+```bash
+sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh cf
+```
+脚本会：加一个只监听 `127.0.0.1:28080` 的 VLESS-WS 入站、下载安装 cloudflared 并以 token 起服务、生成 CF 节点密钥、把 `CF-Vless` 并进订阅、再用 `101 Switching Protocols` 验证隧道是否打通。
+
+**第三步**：看到 `101` 后，客户端**重新拉取订阅**，就多出 `CF-Vless` 节点（排在最后，平时不用，直连都挂了再切它）。没通就先别用——脚本会告诉你怎么复测。
+
+> 注意：部分 VPS 商家对 Cloudflare/CDN 流量额外计费或不适合走 CF，这种机器就别开。`uninstall` 会一并停掉脚本装的 cloudflared，但 CF 后台那条 Tunnel 要你自己去删。
 
 > **关于「Argo 隧道加速」**——别被「加速」二字误导：
 > - 所谓加速 = 客户端连一个**优选 Cloudflare 域名/IP**（路由好的边缘），由 CF 骨干回源到你的隧道。它**只在直连路由差/被墙时**可能更快；正常情况多一跳，往往比直连**更慢**。真正的智能路由（Argo Smart Routing）是 **按量付费**的，多数教程其实只是用了免费的「优选 IP」。
@@ -123,6 +132,7 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 /etc/sing-box/config.json          sing-box 服务端配置 (600)
 /etc/sing-box/server.{crt,key}     HY2/AnyTLS 自签证书
 /etc/sing-box/node-secrets.env     密钥与随机路径 (600，复用用)
+/etc/sing-box/cf.env               CF-Vless 状态 (600，仅在跑过 cf 后存在)
 /etc/sing-box-node.env             运行参数单一来源 (600)
 /var/www/html/sub-xxxx.yaml        Clash/Mihomo 订阅(644，含凭证，见安全须知)
 /etc/nginx/conf.d/00-singbox-sub.conf   订阅 server 块(仅 server 块；流量头单独在 snippets 内、只对订阅 location include，首页/404 不带头)

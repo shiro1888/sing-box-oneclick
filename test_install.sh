@@ -3,7 +3,9 @@
 # 注: 用 Windows python 验证时强制 UTF-8(PYTHONUTF8), 否则写 🚀 会触发 gbk 编码错误;
 #     Linux VPS 上是 UTF-8 locale, 无此问题。
 cd "$(dirname "$0")" || exit 1
-export PYTHON=python PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+# MSYS2_ENV_CONV_EXCL: 阻止 Git Bash 把 /cf-abc 这种斜杠开头的环境变量值转成 Windows 路径
+# (纯 Windows 测试环境问题; Linux VPS 上不存在路径转换)
+export PYTHON=python PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH'
 fail=0
 TMP="${TMPDIR:-/tmp}"
 
@@ -71,6 +73,29 @@ assert [p['name'] for p in d['proxies']]==['Hysteria2','Vless','SS2022']
 assert any(r.startswith('DOMAIN,node.example.com,DIRECT') for r in d['rules'])
 PYV
 then echo "PASS  订阅YAML(跳anytls+域名直连规则) 合法"; else echo "FAIL  subB"; cat "$TMP/e"; fail=1; fi
+
+echo
+echo "=== 4b) CF-Vless 接入后渲染(可选第5节点) ==="
+CFCFG="$(ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfuuid CF_WS_PATH=/cf-abc render render_singbox_config)"
+if printf '%s' "$CFCFG" | python -c "import json,sys;d=json.load(sys.stdin);assert [i['tag'] for i in d['inbounds']]==['hy2-in','anytls-in','vless-in','ss-in','cf-vless-ws-in'];c=[i for i in d['inbounds'] if i['tag']=='cf-vless-ws-in'][0];assert c['listen']=='127.0.0.1' and c['transport']['type']=='ws'" 2>"$TMP/e"; then
+  echo "PASS  含 cf 入站(127.0.0.1 ws)且为第5入站"; else echo "FAIL  cf-config"; cat "$TMP/e"; fail=1; fi
+
+ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfuuid CF_WS_PATH=/cf-abc render render_subscription_yaml > "$TMP/subcf.yaml"
+if python - "$TMP/subcf.yaml" <<'PYV' 2>"$TMP/e"
+import yaml,sys
+d=yaml.safe_load(open(sys.argv[1],encoding='utf-8'))
+names=[p['name'] for p in d['proxies']]
+assert names==['Hysteria2','AnyTLS','Vless','SS2022','CF-Vless'], names
+cf=[p for p in d['proxies'] if p['name']=='CF-Vless'][0]
+assert cf['type']=='vless' and cf['network']=='ws' and cf['server']=='cf.example.com'
+assert cf['ws-opts']['path']=='/cf-abc' and cf['ws-opts']['headers']['Host']=='cf.example.com'
+assert d['proxy-groups'][0]['proxies'][-1]=='CF-Vless'
+PYV
+then echo "PASS  订阅含 CF-Vless 节点且在代理组末位"; else echo "FAIL  cf-sub"; cat "$TMP/e"; fail=1; fi
+
+# 确认不开 CF 时不会冒出 CF 节点
+NOCF="$(ANYTLS_OK=1 render render_subscription_yaml)"
+if printf '%s' "$NOCF" | grep -q 'CF-Vless'; then echo "FAIL  未开CF却出现CF-Vless"; fail=1; else echo "PASS  不开 CF 时无 CF-Vless(条件渲染正确)"; fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
