@@ -98,6 +98,24 @@ NOCF="$(ANYTLS_OK=1 render render_subscription_yaml)"
 if printf '%s' "$NOCF" | grep -q 'CF-Vless'; then echo "FAIL  未开CF却出现CF-Vless"; fail=1; else echo "PASS  不开 CF 时无 CF-Vless(条件渲染正确)"; fi
 
 echo
+echo "=== 4c) 分享链接 render_share_links + 通用订阅 ==="
+LINKS="$(ANYTLS_OK=1 render render_share_links)"
+clink() { if printf '%s' "$LINKS" | grep -qE "$1"; then echo "PASS  含 $2"; else echo "FAIL  缺 $2"; fail=1; fi; }
+clink '^hysteria2://.+@1\.2\.3\.4:4433/\?insecure=1&sni=' 'hysteria2:// 链接'
+clink '^anytls://.+@1\.2\.3\.4:4434/\?insecure=1&sni=' 'anytls:// 链接'
+clink '^vless://.+@1\.2\.3\.4:443\?.*flow=xtls-rprx-vision.*security=reality' 'vless reality 链接'
+clink '^ss://2022-blake3-aes-128-gcm:.+@1\.2\.3\.4:4435#' 'ss SIP022 链接(method:百分号密码)'
+# SS 密码里的 base64 '==' 应被百分号编码成 %3D, 不能原样出现
+if printf '%s' "$LINKS" | grep -q 'ss://.*=='; then echo "FAIL  ss 密码未百分号编码"; fail=1; else echo "PASS  ss 密码已百分号编码(无裸 ==)"; fi
+if printf '%s' "$LINKS" | grep -q 'CF-Vless'; then echo "FAIL  未开CF却有CF-Vless链接"; fail=1; else echo "PASS  无CF时无 CF-Vless 链接"; fi
+
+LINKSCF="$(ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfu CF_WS_PATH=/cf-x render render_share_links)"
+if printf '%s' "$LINKSCF" | grep -qE '^vless://cfu@cf\.example\.com:443\?.*type=ws'; then echo "PASS  开CF后有 CF-Vless(ws) 链接"; else echo "FAIL  CF 链接"; fail=1; fi
+
+B64="$(ANYTLS_OK=1 render render_share_links | base64 -w0)"
+if printf '%s' "$B64" | base64 -d 2>/dev/null | grep -q '^hysteria2://'; then echo "PASS  base64 通用订阅可解码且含链接"; else echo "FAIL  base64 往返"; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then

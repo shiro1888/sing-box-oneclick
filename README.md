@@ -10,6 +10,7 @@
 
 - **四协议**：Hysteria2（UDP，快）、AnyTLS（TCP，兼容好）、VLESS-Reality-Vision（TCP，稳/隐蔽）、Shadowsocks-2022（TCP+UDP，简单快，指纹不同的备选）。
 - **零交互**：自动装依赖与 sing-box、自动生成全部密钥、自动探测公网 IP 和网卡。
+- **多格式订阅**：Clash/Mihomo（YAML）+ 通用 base64 订阅（v2rayN / Shadowrocket / NekoBox 等）两个 URL；`install.sh links` 还能单独打印每个节点的分享链接（`vless://` / `hysteria2://` / `anytls://` / `ss://`）。
 - **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
 - **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
@@ -74,9 +75,16 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 
 ```bash
 sudo bash install.sh info        # 重新打印订阅 URL 和节点信息
+sudo bash install.sh links       # 打印每个节点的分享链接 + 两个订阅 URL
 sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf   # 接入可选第 5 节点 CF-Vless(见第 3 节)
 sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 ```
+
+### 两种订阅，按客户端选
+- **Clash/Mihomo**：用 `http://<IP>/<随机.yaml>`（默认那条），支持分流规则、显示流量。
+- **v2rayN / Shadowrocket / NekoBox 等**：用**通用(base64)订阅** `http://<IP>/<随机-b64.txt>`，里面是各节点的分享链接。
+- 只想要单条节点：`install.sh links` 直接把 `vless://`/`hysteria2://`/`anytls://`/`ss://` 打印出来复制。
+> 注：`anytls://` 较新，只有 mihomo / sing-box 系客户端认；v2rayN 等用 vless/hysteria2/ss 那几条即可。两种订阅都带流量头，客户端都能显示已用/到期。
 
 ---
 
@@ -135,6 +143,7 @@ sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh c
 /etc/sing-box/cf.env               CF-Vless 状态 (600，仅在跑过 cf 后存在)
 /etc/sing-box-node.env             运行参数单一来源 (600)
 /var/www/html/sub-xxxx.yaml        Clash/Mihomo 订阅(644，含凭证，见安全须知)
+/var/www/html/sub-b64-xxxx.txt     通用(base64)订阅(644，含凭证，供 v2rayN 等)
 /etc/nginx/conf.d/00-singbox-sub.conf   订阅 server 块(仅 server 块；流量头单独在 snippets 内、只对订阅 location include，首页/404 不带头)
 /etc/nginx/snippets/sub_headers.conf    流量头(只挂订阅路径)
 /usr/local/bin/traffic_limit.py    流量统计/限流

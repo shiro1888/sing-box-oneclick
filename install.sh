@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|cf|uninstall]
+#    本地:        sudo bash install.sh [install|info|links|cf|uninstall]
 #
 #  常用环境变量(可选,覆盖默认):
 #    LIMIT_GB=200            每月显示/限流额度
@@ -78,6 +78,7 @@ ANYTLS_OK="${ANYTLS_OK:-1}"; EXPIRE_VALUE="${EXPIRE_VALUE:-}"
 HY2_PASSWORD="${HY2_PASSWORD:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"; VLESS_UUID="${VLESS_UUID:-}"
 REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"; REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
+SUB_B64_PATH="${SUB_B64_PATH:-}"   # 通用(base64)订阅路径(供 v2rayN 等; gen_secrets 生成)
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
 
@@ -203,6 +204,10 @@ gen_secrets() {
       printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
       log "已为升级补充 SS2022 密钥"
     fi
+    if [ -z "${SUB_B64_PATH:-}" ]; then  # 旧版无通用订阅路径, 升级时补一个
+      SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
+      printf 'SUB_B64_PATH=%s\n' "$SUB_B64_PATH" >>"$SECRETS"
+    fi
     return
   fi
   log "生成密钥与随机参数..."
@@ -214,6 +219,7 @@ gen_secrets() {
   REALITY_PUBLIC_KEY="$(printf '%s\n' "$kp" | awk '/PublicKey/{print $NF}')"
   REALITY_SHORT_ID="$(openssl rand -hex 8)"
   SUB_PATH="/sub-$(openssl rand -hex 8).yaml"
+  SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
   SS_PASSWORD="$(gen_ss_password)"
   ( umask 077
     cat >"$SECRETS" <<EOF
@@ -224,6 +230,7 @@ REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
 REALITY_SHORT_ID=$REALITY_SHORT_ID
 SUB_PATH=$SUB_PATH
+SUB_B64_PATH=$SUB_B64_PATH
 SS_PASSWORD="$SS_PASSWORD"
 EOF
   )
@@ -251,6 +258,7 @@ EXPIRE_AT="$EXPIRE_VALUE"
 INTERFACE=$INTERFACE
 COUNT_MODE=$COUNT_MODE
 SUB_HOST="$SUB_HOST"
+PUBLIC_IP="$PUBLIC_IP"
 EOF
   chmod 600 "$ENVFILE"
 }
@@ -454,6 +462,40 @@ sys.stdout.write(doc)
 PY
 }
 
+# 各节点的分享链接(vless:// hysteria2:// anytls:// ss://), 一行一条; 通用订阅就是它的 base64
+render_share_links() {
+  ANYTLS_OK="$ANYTLS_OK" PUBLIC_IP="$PUBLIC_IP" \
+  HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" VLESS_PORT="$VLESS_PORT" SS_PORT="$SS_PORT" \
+  HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" VLESS_UUID="$VLESS_UUID" \
+  SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
+  REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
+  REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
+  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  "$PY" - <<'PY'
+import os, urllib.parse as u
+def q(s): return u.quote(str(s), safe='')
+ip  = os.environ["PUBLIC_IP"]
+tls = os.environ["TLS_SNI"]
+out = []
+out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{os.environ['HY2_PORT']}/?insecure=1&sni={q(tls)}#{q('Hysteria2')}")
+if os.environ["ANYTLS_OK"] == "1":
+    out.append(f"anytls://{q(os.environ['ANYTLS_PASSWORD'])}@{ip}:{os.environ['ANYTLS_PORT']}/?insecure=1&sni={q(tls)}#{q('AnyTLS')}")
+vq = u.urlencode({'encryption':'none','flow':'xtls-rprx-vision','security':'reality',
+                  'sni':os.environ['REALITY_SNI'],'fp':'chrome',
+                  'pbk':os.environ['REALITY_PUBLIC_KEY'],'sid':os.environ['REALITY_SHORT_ID'],'type':'tcp'})
+out.append(f"vless://{os.environ['VLESS_UUID']}@{ip}:{os.environ['VLESS_PORT']}?{vq}#{q('Vless')}")
+# SS2022(SIP022): method:password(密码百分号编码), 不做 base64
+out.append(f"ss://{os.environ['SS_METHOD']}:{q(os.environ['SS_PASSWORD'])}@{ip}:{os.environ['SS_PORT']}#{q('SS2022')}")
+cfh = os.environ.get("CF_HOSTNAME",""); cfu = os.environ.get("CF_VLESS_UUID","")
+if cfh and cfu:
+    cq = u.urlencode({'encryption':'none','security':'tls','sni':cfh,'fp':'chrome',
+                      'type':'ws','host':cfh,'path':os.environ['CF_WS_PATH']})
+    out.append(f"vless://{cfu}@{cfh}:443?{cq}#{q('CF-Vless')}")
+import sys
+sys.stdout.write("\n".join(out) + "\n")
+PY
+}
+
 render_header() {
   LIMIT_GB="$LIMIT_GB" EXPIRE_AT_VAL="$1" "$PY" - <<'PY'
 import os, datetime
@@ -475,11 +517,15 @@ write_singbox_config() {
 }
 
 write_subscription() {
-  log "生成 Clash/Mihomo 订阅..."
+  log "生成 Clash/Mihomo 订阅 + 通用(base64)订阅..."
   mkdir -p "$WWW"
   chmod 755 "$WWW"   # 防止 umask 077 下新建的 web 根变 700, 导致 nginx(www-data) 无法遍历→订阅 403
   render_subscription_yaml >"$WWW$SUB_PATH"
   chmod 644 "$WWW$SUB_PATH"
+  if [ -n "${SUB_B64_PATH:-}" ]; then   # 通用订阅: 各节点分享链接的 base64, 供 v2rayN/Shadowrocket/NekoBox 等
+    render_share_links | base64 -w0 >"$WWW$SUB_B64_PATH"
+    chmod 644 "$WWW$SUB_B64_PATH"
+  fi
 }
 
 config_nginx() {
@@ -504,6 +550,12 @@ server {
     location = $SUB_PATH {
         include $NGINX_SNIPPET;
         default_type application/octet-stream;
+        try_files \$uri =404;
+    }
+
+    location = $SUB_B64_PATH {
+        include $NGINX_SNIPPET;
+        default_type text/plain;
         try_files \$uri =404;
     }
 
@@ -716,8 +768,9 @@ print_summary() {
   echo
   ok "================= 部署完成 ================="
   echo
-  printf '  订阅名称:  %s\n' "$AIRPORT_NAME"
-  printf '  订阅 URL:  %s\n' "$sub_url"
+  printf '  订阅名称:         %s\n' "$AIRPORT_NAME"
+  printf '  Clash/Mihomo 订阅: %s\n' "$sub_url"
+  [ -n "${SUB_B64_PATH:-}" ] && printf '  通用(base64)订阅:  http://%s%s   (v2rayN/Shadowrocket/NekoBox)\n' "$SUB_HOST" "$SUB_B64_PATH"
   echo
   printf '  节点(客户端里显示名):\n'
   printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
@@ -728,6 +781,7 @@ print_summary() {
   echo
   printf '  管理命令:\n'
   printf '    查看信息:    bash install.sh info\n'
+  printf '    分享链接:    bash install.sh links\n'
   printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
   printf '    卸载:        bash install.sh uninstall\n'
 
@@ -758,6 +812,23 @@ do_info() {
   print_summary
 }
 
+do_links() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  # shellcheck disable=SC1090
+  . "$SECRETS"
+  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true
+  [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
+  SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
+  echo "===== 各节点分享链接(单条可粘进 v2rayN / NekoBox / Shadowrocket 等) ====="
+  render_share_links
+  echo
+  echo "===== 订阅 URL ====="
+  printf 'Clash/Mihomo:  http://%s%s\n' "$SUB_HOST" "$SUB_PATH"
+  [ -n "${SUB_B64_PATH:-}" ] && printf '通用(base64):  http://%s%s\n' "$SUB_HOST" "$SUB_B64_PATH"
+}
+
 do_uninstall() {
   warn "即将卸载 sing-box 节点及相关配置。"
   if [ "${FORCE:-0}" != 1 ]; then
@@ -778,7 +849,8 @@ do_uninstall() {
   rm -f "$SB_DIR/config.json" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$SECRETS" 2>/dev/null || true
   rm -f "$ENVFILE" "$TRAFFIC_PY" "$CRON" "$NGINX_SNIPPET" "$NGINX_CONF" 2>/dev/null || true
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
-  rm -f "$WWW"/sub-*.yaml 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅文件
+  [ -n "${SUB_B64_PATH:-}" ] && rm -f "$WWW$SUB_B64_PATH" 2>/dev/null || true
+  rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅文件
   rm -f /run/sing-box-quota-stopped 2>/dev/null || true
   if [ -f "$CF_ENV" ]; then
     cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
@@ -853,7 +925,7 @@ EOF
   render_singbox_config >"$SB_DIR/config.json"; chmod 600 "$SB_DIR/config.json"
   sing-box check -c "$SB_DIR/config.json" || die "加入 CF 入站后 sing-box 配置校验失败"
   systemctl restart sing-box
-  render_subscription_yaml >"$WWW$SUB_PATH"; chmod 644 "$WWW$SUB_PATH"
+  write_subscription   # 同时刷新 Clash 订阅与通用(base64)订阅, 都带上 CF-Vless
 
   ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
   log "验证隧道(看到 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
@@ -895,9 +967,10 @@ main() {
   case "${1:-install}" in
     install)   do_install ;;
     info)      do_info ;;
+    links)     do_links ;;
     cf)        do_cf ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|cf|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|links|cf|uninstall]"; exit 1 ;;
   esac
 }
 
