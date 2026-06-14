@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  sing-box 三协议一键部署脚本
-#  Hysteria2 + AnyTLS + VLESS-Reality-Vision  ->  Clash/Mihomo 订阅
+#  sing-box 四协议一键部署脚本
+#  Hysteria2 + AnyTLS + VLESS-Reality-Vision + Shadowsocks-2022  ->  Clash/Mihomo 订阅
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
@@ -14,7 +14,8 @@
 #    DOMAIN=node.example.com 订阅域名(留空=用公网IP,无需域名)
 #    AIRPORT_NAME=MyNode     客户端订阅显示名
 #    PUBLIC_IP=1.2.3.4       手动指定公网IP(探测失败时)
-#    HY2_PORT/ANYTLS_PORT/VLESS_PORT  端口(默认 4433/4434/443)
+#    HY2_PORT/ANYTLS_PORT/VLESS_PORT/SS_PORT  端口(默认 4433/4434/443/4435)
+#    SS_METHOD=2022-blake3-aes-128-gcm  SS2022 加密方法(可改 256-gcm/chacha)
 #    REALITY_SNI/TLS_SNI     伪装域名(默认 www.microsoft.com / www.bing.com)
 #    ENABLE_BBR=1            开启 BBR(默认开,纯 sysctl,安全)
 #    ENABLE_UFW=0            自动配置并启用 ufw(默认关,避免锁死SSH)
@@ -46,6 +47,8 @@ AIRPORT_NAME="${AIRPORT_NAME:-MyNode}"
 HY2_PORT="${HY2_PORT:-4433}"
 ANYTLS_PORT="${ANYTLS_PORT:-4434}"
 VLESS_PORT="${VLESS_PORT:-443}"
+SS_PORT="${SS_PORT:-4435}"
+SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
 REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
@@ -69,7 +72,7 @@ ANYTLS_OK="${ANYTLS_OK:-1}"; EXPIRE_VALUE="${EXPIRE_VALUE:-}"
 # 密钥(gen_secrets 填充或从 SECRETS 复用)
 HY2_PASSWORD="${HY2_PASSWORD:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"; VLESS_UUID="${VLESS_UUID:-}"
 REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"; REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
-REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"
+REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
 
 # ----------------------------------------------------------------- 工具
 need_root() { [ "$(id -u)" = 0 ] || die "请用 root 运行(sudo bash install.sh)"; }
@@ -81,7 +84,7 @@ ver_ge() { # ver_ge A B  -> A >= B ?
 # 装前输入校验(端口/SNI/域名/到期时间), 不合法立即报错, 避免装到一半才崩
 validate_inputs() {
   local p
-  for p in "$HY2_PORT" "$ANYTLS_PORT" "$VLESS_PORT"; do
+  for p in "$HY2_PORT" "$ANYTLS_PORT" "$VLESS_PORT" "$SS_PORT"; do
     case "$p" in ''|*[!0-9]*) die "端口必须是数字: '$p'";; esac
     { [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; } || die "端口超出范围 1-65535: '$p'"
   done
@@ -176,12 +179,23 @@ detect_net() {
   [ -n "$DOMAIN" ] && note "订阅域名 $DOMAIN: 请确认已把它的 DNS A 记录解析到 $PUBLIC_IP(本脚本无法替你改 DNS)。"
 }
 
+# SS2022 密钥: base64, 长度按方法自适应(128-gcm=16字节, 256/chacha=32字节)
+gen_ss_password() {
+  local b=16; case "$SS_METHOD" in *aes-256*|*chacha*) b=32;; esac
+  openssl rand -base64 "$b" | tr -d '\n'
+}
+
 gen_secrets() {
   mkdir -p "$SB_DIR"; chmod 700 "$SB_DIR" 2>/dev/null || true   # 目录对非 root 封闭
   if [ -f "$SECRETS" ]; then
     log "检测到已有密钥, 复用(不破坏现有客户端)"
     # shellcheck disable=SC1090
     . "$SECRETS"
+    if [ -z "${SS_PASSWORD:-}" ]; then   # 旧版安装无 SS2022 密钥, 升级时补一个(不影响其它节点)
+      SS_PASSWORD="$(gen_ss_password)"
+      printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
+      log "已为升级补充 SS2022 密钥"
+    fi
     return
   fi
   log "生成密钥与随机参数..."
@@ -193,6 +207,7 @@ gen_secrets() {
   REALITY_PUBLIC_KEY="$(printf '%s\n' "$kp" | awk '/PublicKey/{print $NF}')"
   REALITY_SHORT_ID="$(openssl rand -hex 8)"
   SUB_PATH="/sub-$(openssl rand -hex 8).yaml"
+  SS_PASSWORD="$(gen_ss_password)"
   ( umask 077
     cat >"$SECRETS" <<EOF
 HY2_PASSWORD=$HY2_PASSWORD
@@ -202,6 +217,7 @@ REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
 REALITY_SHORT_ID=$REALITY_SHORT_ID
 SUB_PATH=$SUB_PATH
+SS_PASSWORD="$SS_PASSWORD"
 EOF
   )
   chmod 600 "$SECRETS"
@@ -277,6 +293,14 @@ $anytls_block
           "short_id": ["$REALITY_SHORT_ID"]
         }
       }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "::",
+      "listen_port": $SS_PORT,
+      "method": "$SS_METHOD",
+      "password": "$SS_PASSWORD"
     }
   ],
   "outbounds": [ { "type": "direct", "tag": "direct" } ]
@@ -290,6 +314,7 @@ render_subscription_yaml() {
   HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" VLESS_UUID="$VLESS_UUID" \
   REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
+  SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
   "$PY" - <<'PY'
 import os
 ip  = os.environ["PUBLIC_IP"]
@@ -328,8 +353,15 @@ proxies.append(f'''  - name: "Vless"
     reality-opts:
       public-key: {os.environ["REALITY_PUBLIC_KEY"]}
       short-id: {os.environ["REALITY_SHORT_ID"]}''')
+proxies.append(f'''  - name: "SS2022"
+    type: ss
+    server: {ip}
+    port: {os.environ["SS_PORT"]}
+    cipher: {os.environ["SS_METHOD"]}
+    password: "{os.environ["SS_PASSWORD"]}"
+    udp: true''')
 
-names = ["Hysteria2"] + (["AnyTLS"] if anytls else []) + ["Vless"]
+names = ["Hysteria2"] + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"]
 grp = "\n".join(f'      - "{n}"' for n in names)
 
 rules = []
@@ -602,7 +634,7 @@ EOF
 }
 
 config_firewall() {
-  note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $HY2_PORT/udp —— 尤其 $HY2_PORT/udp。本脚本改不了云端安全组, 这是'HY2 连不上、Vless 却正常'的头号原因。"
+  note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $SS_PORT/tcp+udp $HY2_PORT/udp —— 尤其 UDP($HY2_PORT、$SS_PORT)。本脚本改不了云端安全组, 这是'HY2/SS 连不上、Vless 却正常'的头号原因。"
   if ! command -v ufw >/dev/null 2>&1; then return 0; fi
   if [ "$ENABLE_UFW" = 1 ]; then
     log "配置并启用 ufw..."
@@ -611,6 +643,8 @@ config_firewall() {
     ufw allow "$VLESS_PORT"/tcp  >/dev/null 2>&1 || true
     ufw allow "$ANYTLS_PORT"/tcp >/dev/null 2>&1 || true
     ufw allow "$HY2_PORT"/udp    >/dev/null 2>&1 || true
+    ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
+    ufw allow "$SS_PORT"/udp     >/dev/null 2>&1 || true
     # 启用前确认 22 已放行, 否则不启用以免把自己 SSH 关在门外
     if ufw status 2>/dev/null | grep -q '22/tcp'; then
       yes | ufw enable >/dev/null 2>&1 || true
@@ -626,9 +660,11 @@ config_firewall() {
     ufw allow "$VLESS_PORT"/tcp  >/dev/null 2>&1 || true
     ufw allow "$ANYTLS_PORT"/tcp >/dev/null 2>&1 || true
     ufw allow "$HY2_PORT"/udp    >/dev/null 2>&1 || true
+    ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
+    ufw allow "$SS_PORT"/udp     >/dev/null 2>&1 || true
     ok "已在现有 ufw 中放行端口"
   else
-    note "主机防火墙 ufw 未启用, 本脚本未自动开启(避免锁死 SSH)。如需启用: 用 ENABLE_UFW=1 重跑, 或手动 'ufw allow 22,80,$VLESS_PORT,$ANYTLS_PORT/tcp; ufw allow $HY2_PORT/udp; ufw enable'。"
+    note "主机防火墙 ufw 未启用, 本脚本未自动开启(避免锁死 SSH)。如需启用: 用 ENABLE_UFW=1 重跑, 或手动 'ufw allow 22,80,$VLESS_PORT,$ANYTLS_PORT,$SS_PORT/tcp; ufw allow $HY2_PORT/udp; ufw allow $SS_PORT/udp; ufw enable'。"
   fi
 }
 
@@ -645,6 +681,7 @@ print_summary() {
   printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
   [ "$ANYTLS_OK" = 1 ] && printf '    - AnyTLS     (TCP %s)\n' "$ANYTLS_PORT"
   printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
+  printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
   echo
   printf '  管理命令:\n'
   printf '    查看信息:  bash install.sh info\n'

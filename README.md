@@ -1,6 +1,6 @@
-# sing-box 三协议一键部署
+# sing-box 四协议一键部署
 
-一条命令在全新 VPS 上部署 **Hysteria2 + AnyTLS + VLESS-Reality-Vision** 三条自用节点，自动生成一个 **Clash/Mihomo 订阅**（手动 `select` 切换、国内直连国外代理、客户端显示流量、可限流）。
+一条命令在全新 VPS 上部署 **Hysteria2 + AnyTLS + VLESS-Reality-Vision + Shadowsocks-2022** 四条自用节点，自动生成一个 **Clash/Mihomo 订阅**（手动 `select` 切换、国内直连国外代理、客户端显示流量、可限流）。
 
 > 设计目标：自用、单机、直连、零交互、可迁移。脚本源于一份手写部署文档，把里面所有步骤自动化，并对**本机无法自动完成的部分给出明确说明**。
 
@@ -8,7 +8,7 @@
 
 ## 特性
 
-- **三协议**：Hysteria2（UDP，快）、AnyTLS（TCP，兼容好）、VLESS-Reality-Vision（TCP，稳/隐蔽）。
+- **四协议**：Hysteria2（UDP，快）、AnyTLS（TCP，兼容好）、VLESS-Reality-Vision（TCP，稳/隐蔽）、Shadowsocks-2022（TCP+UDP，简单快，指纹不同的备选）。
 - **零交互**：自动装依赖与 sing-box、自动生成全部密钥、自动探测公网 IP 和网卡。
 - **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
@@ -56,7 +56,8 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `DOMAIN` | 空（用 IP） | 订阅域名（仅支持单个）；填了需自己把 DNS A 记录指向本机 IP。脚本只处理一个订阅域名，需要备用域名请手动改 nginx 的 `server_name` 与订阅 `rules`。 |
 | `AIRPORT_NAME` | `MyNode` | 客户端里的订阅显示名 |
 | `PUBLIC_IP` | 自动探测 | 探测失败时手动指定 |
-| `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` | `4433`/`4434`/`443` | 各协议端口 |
+| `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` / `SS_PORT` | `4433`/`4434`/`443`/`4435` | 各协议端口（SS2022 同时用 TCP+UDP） |
+| `SS_METHOD` | `2022-blake3-aes-128-gcm` | SS2022 加密方法（可改 `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`，密钥长度脚本自动适配） |
 | `REALITY_SNI` | `www.microsoft.com` | Reality 伪装域名（服务端 handshake + 客户端 servername，必须一致） |
 | `TLS_SNI` | `www.bing.com` | HY2/AnyTLS 自签证书 SNI |
 | `ENABLE_BBR` | `1` | 开启 BBR（纯 sysctl，安全） |
@@ -139,14 +140,15 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 systemctl is-active sing-box nginx vnstat        # 服务在跑?
 sing-box check -c /etc/sing-box/config.json      # 配置合法?
 nginx -t                                         # nginx 合法?
-ss -lntup | grep -E ':(80|443|4433|4434)\b'      # 本地在监听?(端口为默认值; 改过端口请替换。不代表外部可达)
+ss -lntup | grep -E ':(80|443|4433|4434|4435)\b'  # 本地在监听?(端口为默认值; 改过端口请替换。不代表外部可达)
 curl -I http://<IP或域名>/<订阅路径>             # 订阅 200 且带 Subscription-Userinfo?
 journalctl -t traffic_limit -n 20 --no-pager     # 流量脚本日志
 timedatectl                                      # 时间同步?(Reality 对时钟敏感)
 ```
 
 - **订阅打不开**：先看云安全组是否放行 80/tcp。
-- **HY2 连不上但 Vless 正常**：云安全组没放行 4433/udp。
+- **HY2 / SS2022 连不上但 Vless 正常**：云安全组没放行 UDP（HY2 的 `4433/udp`、SS2022 的 `4435/udp`）。
+- **SS2022 连不上**：确认云安全组放行了 `4435` 的 **TCP 和 UDP**；客户端 mihomo 需较新版本支持 `2022-blake3-*` 加密。
 - **订阅不显示流量**：核对 `/etc/sing-box-node.env` 里的 `INTERFACE`（`ip -br link` 查真实网卡），看 `journalctl -t traffic_limit`。
 - **Vless 连得上但不通**：多半是时间不同步或 SNI 两端不一致。
 

@@ -11,7 +11,8 @@ TMP="${TMPDIR:-/tmp}"
 export SB_DIR="$TMP/sbtest" HY2_PORT=4433 ANYTLS_PORT=4434 VLESS_PORT=443 \
   HY2_PASSWORD=pw1 ANYTLS_PASSWORD=pw2 VLESS_UUID=11111111-1111-1111-1111-111111111111 \
   REALITY_PRIVATE_KEY=PRIVKEY REALITY_PUBLIC_KEY=PUBKEY REALITY_SHORT_ID=abcdef0123456789 \
-  REALITY_SNI=www.microsoft.com TLS_SNI=www.bing.com PUBLIC_IP=1.2.3.4 LIMIT_GB=200
+  REALITY_SNI=www.microsoft.com TLS_SNI=www.bing.com PUBLIC_IP=1.2.3.4 LIMIT_GB=200 \
+  SS_PORT=4435 SS_METHOD=2022-blake3-aes-128-gcm SS_PASSWORD=MTIzNDU2Nzg5MGFiY2RlZg==
 
 # 在干净子shell里 source 脚本(guard 阻止 main 运行)并调用一个渲染函数
 render() { PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; '"$1"; }
@@ -28,12 +29,15 @@ else echo "skip  (未安装 shellcheck)"; fi
 echo
 echo "=== 3) 渲染 sing-box config ==="
 CFG3="$(ANYTLS_OK=1 render render_singbox_config)"
-if printf '%s' "$CFG3" | python -c "import json,sys;d=json.load(sys.stdin);assert [i['tag'] for i in d['inbounds']]==['hy2-in','anytls-in','vless-in']" 2>"$TMP/e"; then
-  echo "PASS  3入站 JSON 合法且顺序正确"; else echo "FAIL  config3"; cat "$TMP/e"; fail=1; fi
+if printf '%s' "$CFG3" | python -c "import json,sys;d=json.load(sys.stdin);assert [i['tag'] for i in d['inbounds']]==['hy2-in','anytls-in','vless-in','ss-in']" 2>"$TMP/e"; then
+  echo "PASS  4入站 JSON 合法且顺序正确(含 ss-in)"; else echo "FAIL  config4"; cat "$TMP/e"; fail=1; fi
 
 CFG2="$(ANYTLS_OK=0 render render_singbox_config)"
-if printf '%s' "$CFG2" | python -c "import json,sys;d=json.load(sys.stdin);assert [i['tag'] for i in d['inbounds']]==['hy2-in','vless-in']" 2>"$TMP/e"; then
-  echo "PASS  跳过anytls=2入站 仍是合法 JSON"; else echo "FAIL  config2"; cat "$TMP/e"; fail=1; fi
+if printf '%s' "$CFG2" | python -c "import json,sys;d=json.load(sys.stdin);assert [i['tag'] for i in d['inbounds']]==['hy2-in','vless-in','ss-in']" 2>"$TMP/e"; then
+  echo "PASS  跳过anytls=3入站 仍是合法 JSON(含 ss-in)"; else echo "FAIL  config3"; cat "$TMP/e"; fail=1; fi
+
+if printf '%s' "$CFG3" | python -c "import json,sys;s=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='ss-in'][0];assert s['type']=='shadowsocks';assert s['method']=='2022-blake3-aes-128-gcm';assert s['password']" 2>"$TMP/e"; then
+  echo "PASS  ss-in 入站方法/密码正确"; else echo "FAIL  ss-in"; cat "$TMP/e"; fail=1; fi
 
 if printf '%s' "$CFG3" | python -c "import json,sys;v=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='vless-in'][0];assert v['tls']['server_name']==v['tls']['reality']['handshake']['server'];assert v['users'][0]['flow']=='xtls-rprx-vision'" 2>"$TMP/e"; then
   echo "PASS  Reality server_name==handshake.server 且 flow 正确"; else echo "FAIL  reality"; cat "$TMP/e"; fail=1; fi
@@ -45,14 +49,17 @@ if python - "$TMP/sub.yaml" <<'PYV' 2>"$TMP/e"
 import yaml,sys
 d=yaml.safe_load(open(sys.argv[1],encoding='utf-8'))
 names=[p['name'] for p in d['proxies']]
-assert names==['Hysteria2','AnyTLS','Vless'], names
+assert names==['Hysteria2','AnyTLS','Vless','SS2022'], names
 g=d['proxy-groups'][0]
 assert g['type']=='select'
 assert all(x in names for x in g['proxies']), g['proxies']
 assert d['rules'][-1].startswith('MATCH,'), d['rules'][-1]
 assert d['proxies'][0]['server']=='1.2.3.4'
 assert any(r.startswith('IP-CIDR,1.2.3.4/32,DIRECT') for r in d['rules'])
-assert d['proxies'][-1]['reality-opts']['public-key']=='PUBKEY'
+v=[p for p in d['proxies'] if p['name']=='Vless'][0]
+assert v['reality-opts']['public-key']=='PUBKEY'
+ss=[p for p in d['proxies'] if p['name']=='SS2022'][0]
+assert ss['type']=='ss' and ss['cipher']=='2022-blake3-aes-128-gcm' and ss['udp'] is True
 PYV
 then echo "PASS  订阅YAML(含anytls/IP) 合法+节点名/组/规则一致"; else echo "FAIL  subA"; cat "$TMP/e"; fail=1; fi
 
@@ -60,7 +67,7 @@ ANYTLS_OK=0 DOMAIN=node.example.com render render_subscription_yaml > "$TMP/sub2
 if python - "$TMP/sub2.yaml" <<'PYV' 2>"$TMP/e"
 import yaml,sys
 d=yaml.safe_load(open(sys.argv[1],encoding='utf-8'))
-assert [p['name'] for p in d['proxies']]==['Hysteria2','Vless']
+assert [p['name'] for p in d['proxies']]==['Hysteria2','Vless','SS2022']
 assert any(r.startswith('DOMAIN,node.example.com,DIRECT') for r in d['rules'])
 PYV
 then echo "PASS  订阅YAML(跳anytls+域名直连规则) 合法"; else echo "FAIL  subB"; cat "$TMP/e"; fail=1; fi
