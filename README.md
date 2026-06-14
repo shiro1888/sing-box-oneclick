@@ -16,7 +16,8 @@
 - **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
 - **安全细节**：`server_tokens off`、密钥文件 600、流量头只挂在订阅路径（不污染首页/404）。
 - **可选第 5 节点**：CF-Vless 大保底（Argo 命名隧道），`install.sh cf` 半自动接入——VPS 侧全自动，只有 CF 后台建 Tunnel 那步要你做。直连 IP 被墙时兜底。
-- **可选**：BBR（默认开）、ufw（默认关，避免锁死 SSH）。
+- **网络优化（自动）**：装前即应用 sysctl 调优——**UDP 收发缓冲 16MB**（Hysteria2/QUIC 关键，否则被限速并刷 quic-go 告警）、跨境高 BDP 链路的 TCP 缓冲、MTU 探测、空闲不重置拥塞窗口、TFO 等；BBR 默认开（`ENABLE_BBR=0` 关）。
+- **可选**：ufw（默认关，避免锁死 SSH）。
 - **不破坏现有节点**：二次运行复用已有密钥（含升级时自动补 SS2022 / 保留 CF-Vless）。
 
 ---
@@ -158,7 +159,7 @@ sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh c
 /etc/nginx/snippets/sub_headers.conf    流量头(只挂订阅路径)
 /usr/local/bin/traffic_limit.py    流量统计/限流
 /etc/cron.d/traffic_limit          每 5 分钟刷新
-/etc/sysctl.d/99-bbr.conf          BBR(若开启)
+/etc/sysctl.d/99-singbox.conf      网络优化(UDP 16MB 大缓冲 / 跨境 TCP 调优 / BBR)
 /usr/local/bin/cloudflared         CF 隧道客户端(仅跑过 cf 后存在; uninstall 停服务但保留二进制)
 ```
 
@@ -235,7 +236,7 @@ sudo sysctl --system
 sysctl net.ipv4.tcp_congestion_control   # 期望: net.ipv4.tcp_congestion_control = bbr
 ```
 
-> 注意：包名里的 `x64v3` 是 **CPU 指令集等级**，不是 BBR 版本——XanMod 任何等级的内核都带 BBRv3。`/etc/sysctl.d/99-bbr.conf`（本脚本已写入 `fq` + `bbr`）在新内核下会自动用上 v3，无需改动。
+> 注意：包名里的 `x64v3` 是 **CPU 指令集等级**，不是 BBR 版本——XanMod 任何等级的内核都带 BBRv3。`/etc/sysctl.d/99-singbox.conf`（本脚本已写入 `fq` + `bbr`）在新内核下会自动用上 v3，无需改动。
 >
 > 你提到的 [byJoey/Actions-bbr-v3](https://github.com/byJoey/Actions-bbr-v3) 是另一条路（自编译 BBRv3 内核 .deb）。能用，但相比 XanMod 维护性和可信度更弱，自担风险。
 

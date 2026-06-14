@@ -68,7 +68,7 @@ NGINX_SNIPPET=/etc/nginx/snippets/sub_headers.conf
 NGINX_CONF=/etc/nginx/conf.d/00-singbox-sub.conf
 TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
-BBR_CONF=/etc/sysctl.d/99-bbr.conf
+SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
 CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
 
 # 运行期填充(写成可被环境覆盖, 既不影响生产, 也便于测试渲染函数)
@@ -713,18 +713,39 @@ EOF
   ok "流量脚本 + 每5分钟定时任务就绪"
 }
 
-config_bbr() {
-  [ "$ENABLE_BBR" = 1 ] || return 0
-  cat >"$BBR_CONF" <<'EOF'
+config_sysctl() {
+  log "应用网络优化(sysctl, 即时生效免重启)..."
+  cat >"$SYSCTL_CONF" <<'EOF'
+# === sing-box 节点网络优化(自用代理) ===
+# UDP/QUIC 大接收缓冲 —— Hysteria2 关键! 不设会被限速并刷 quic-go 缓冲告警(Hysteria 官方推荐 16MB)
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+# TCP 缓冲, 适配高带宽-延迟积(跨境长距离)链路
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+# 大连接/突发队列
+net.core.netdev_max_backlog=10000
+net.core.somaxconn=4096
+# 跨境/隧道 MTU 黑洞探测; 空闲后不重置拥塞窗口(代理常空闲后突发)
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+# TCP Fast Open + TIME_WAIT 复用(代理出站连接多)
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_tw_reuse=1
+EOF
+  if [ "$ENABLE_BBR" = 1 ]; then
+    cat >>"$SYSCTL_CONF" <<'EOF'
+# BBR 拥塞控制 + fq 队列(只作用于 TCP: AnyTLS/Vless; HY2 走 UDP 不受影响)
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
+  fi
   sysctl --system >/dev/null 2>&1 || true
-  if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-    ok "BBR 已开启"
-  else
-    warn "BBR 未生效(内核可能不支持), 不影响使用"
-    note "BBR: 当前内核未启用 BBR, 升级内核后会自动生效(配置已写入 $BBR_CONF)。"
+  local rmem; rmem="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+  if [ "${rmem:-0}" -ge 16777216 ] 2>/dev/null; then ok "UDP 缓冲已调大(rmem_max=$rmem, 利于 HY2)"; else warn "UDP 缓冲未达 16MB(rmem_max=$rmem), HY2 吞吐可能受限"; fi
+  if [ "$ENABLE_BBR" = 1 ]; then
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo)" = bbr ]; then ok "BBR 已开启"
+    else warn "BBR 未生效(内核可能不支持), 不影响使用"; note "BBR: 内核未启用, 升级内核重启后生效(配置已写入 $SYSCTL_CONF)。"; fi
   fi
 }
 
@@ -969,7 +990,7 @@ do_uninstall() {
     warn "未触碰 cloudflared(若你手动搭过 CF, 请自行处理 /etc/cloudflared, 凭证别误删)"
   fi
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
-  ok "已卸载(保留 sing-box 程序与 BBR sysctl; 备份见上)"
+  ok "已卸载(保留 sing-box 程序与网络优化 sysctl; 备份见上)"
 }
 
 # 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
@@ -1061,12 +1082,12 @@ do_install() {
   # shellcheck disable=SC1090
   [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true   # 已接入过 CF-Vless 则重装时保留
   gen_cert
+  config_sysctl   # 在 sing-box 启动前应用, 这样 HY2/QUIC 一启动就拿到大 UDP 缓冲
   write_env
   write_singbox_config
   write_subscription
   config_nginx
   install_traffic
-  config_bbr
   config_firewall
   print_summary
 }
