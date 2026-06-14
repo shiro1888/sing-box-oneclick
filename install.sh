@@ -164,7 +164,7 @@ install_singbox() {
     ANYTLS_OK=1
   else
     ANYTLS_OK=0
-    note "sing-box 版本 ${SB_VER:-未知} < 1.12.0, 不支持 AnyTLS: 已自动跳过 AnyTLS, 仅部署 Hysteria2 + Vless。升级 sing-box 后重跑本脚本即可补上。"
+    note "sing-box 版本 ${SB_VER:-未知} < 1.12.0, 不支持 AnyTLS: 已自动跳过 AnyTLS, 部署 Hysteria2 + Vless + SS2022。升级 sing-box 后重跑本脚本即可补上 AnyTLS。"
     warn "sing-box ${SB_VER:-未知} 过旧, 跳过 AnyTLS"
   fi
   ok "sing-box 版本: ${SB_VER:-unknown} (AnyTLS: $([ "$ANYTLS_OK" = 1 ] && echo 启用 || echo 跳过))"
@@ -828,11 +828,13 @@ do_links() {
   echo "===== 订阅 URL ====="
   printf 'Clash/Mihomo:  http://%s%s\n' "$SUB_HOST" "$SUB_PATH"
   [ -n "${SUB_B64_PATH:-}" ] && printf '通用(base64):  http://%s%s\n' "$SUB_HOST" "$SUB_B64_PATH"
-  if command -v qrencode >/dev/null 2>&1 && [ -n "${SUB_B64_PATH:-}" ]; then
+  if ! command -v qrencode >/dev/null 2>&1; then
+    echo "(装 qrencode 后这里会出二维码: apt install -y qrencode)"
+  elif [ -n "${SUB_B64_PATH:-}" ]; then
     echo; echo "===== 通用订阅二维码(扫码导入 v2rayN/Shadowrocket) ====="
     qrencode -t ANSIUTF8 "http://$SUB_HOST$SUB_B64_PATH"
-  elif ! command -v qrencode >/dev/null 2>&1; then
-    echo "(装 qrencode 后这里会出二维码: apt install -y qrencode)"
+  else
+    echo "(无通用订阅路径, 重跑 install 升级后即可生成二维码)"
   fi
 }
 
@@ -865,12 +867,15 @@ do_set() {
   # shellcheck disable=SC1090
   . "$SECRETS" 2>/dev/null || true
   . "$ENVFILE"
+  # 兼容旧 env(可能无 PUBLIC_IP/SUB_HOST): 回填后再让 write_env 重写, 否则会被清空
+  [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
+  SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
   local a key val
   for a in "$@"; do
     key="${a%%=*}"; val="${a#*=}"
     [ "$key" != "$a" ] || die "参数要写成 KEY=VAL: $a"
     case "$key" in
-      LIMIT_GB)   case "$val" in ''|*[!0-9.]*) die "LIMIT_GB 要是数字: $val";; esac; LIMIT_GB="$val" ;;
+      LIMIT_GB)   case "$val" in ''|.|*.*.*|*[!0-9.]*) die "LIMIT_GB 要是数字(如 200 或 0.5): $val";; esac; LIMIT_GB="$val" ;;
       COUNT_MODE) case "$val" in rx+tx|tx|max) COUNT_MODE="$val" ;; *) die "COUNT_MODE 只能 rx+tx/tx/max";; esac ;;
       INTERFACE)  [ -n "$val" ] || die "INTERFACE 不能空"; INTERFACE="$val" ;;
       EXPIRE_AT)  [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || die "EXPIRE_AT 格式须为 'YYYY-MM-DD HH:MM:SS +0800'"; EXPIRE_AT="$val" ;;
@@ -889,7 +894,7 @@ do_update() {
   command -v sing-box >/dev/null 2>&1 || die "sing-box 安装/更新失败"
   ok "sing-box 版本: $(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
   if sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1; then
-    systemctl restart sing-box && ok "已重启 sing-box"
+    systemctl restart sing-box && ok "已重启 sing-box" || warn "重启失败, 看 systemctl status sing-box"
   else
     warn "更新后配置校验未过, 未重启。请跑 sing-box check -c $SB_DIR/config.json 看详情"
   fi
@@ -913,17 +918,20 @@ do_menu() {
     echo "  9) 卸载                  0) 退出"
     printf '  选择: '
     read -r c || break
+    # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
+    # 不会因 set -e 把整个菜单退出。
     case "$c" in
-      1) do_install ;;
-      2) do_info ;;
-      3) do_links ;;
-      4) do_status ;;
-      5) printf '  输入 KEY=VAL(如 LIMIT_GB=500): '; read -r kv || true; [ -n "${kv:-}" ] && do_set $kv ;;
-      6) do_update ;;
+      1) ( do_install ) || true ;;
+      2) ( do_info ) || true ;;
+      3) ( do_links ) || true ;;
+      4) ( do_status ) || true ;;
+      5) printf '  输入 KEY=VAL(如 LIMIT_GB=500): '; read -r kv || true
+         [ -n "${kv:-}" ] && { ( do_set "$kv" ) || true; } ;;
+      6) ( do_update ) || true ;;
       7) printf '  CF_TOKEN: '; read -r t || true; printf '  CF_HOSTNAME: '; read -r h || true
-         [ -n "${t:-}" ] && [ -n "${h:-}" ] && CF_TOKEN="$t" CF_HOSTNAME="$h" do_cf || echo "  已取消(token/域名为空)" ;;
-      8) do_restart ;;
-      9) do_uninstall ;;
+         if [ -n "${t:-}" ] && [ -n "${h:-}" ]; then ( CF_TOKEN="$t" CF_HOSTNAME="$h" do_cf ) || true; else echo "  已取消(token/域名为空)"; fi ;;
+      8) ( do_restart ) || true ;;
+      9) ( do_uninstall ) || true ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac

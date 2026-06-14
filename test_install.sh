@@ -135,6 +135,11 @@ if PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
 else
   grep -q '^COUNT_MODE=tx$' "$SETD/env" && echo "PASS  set 拒绝非法 COUNT_MODE 且不改 env" || { echo "FAIL  set 非法值污染了 env"; fail=1; }
 fi
+# EXPIRE_AT 带空格作为单个参数(对应菜单 do_set "$kv")应成功
+PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set "EXPIRE_AT=2030-01-02 03:04:05 +0800"' >/dev/null 2>&1
+if grep -q 'EXPIRE_AT="2030-01-02 03:04:05 +0800"' "$SETD/env"; then echo "PASS  set EXPIRE_AT(带空格单参数)成功"; else echo "FAIL  set EXPIRE_AT 空格"; grep EXPIRE_AT "$SETD/env"; fail=1; fi
+# 畸形 LIMIT_GB(多点)应被拒, 不污染 env
+if PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=5.5.5' >/dev/null 2>&1; then echo "FAIL  畸形 LIMIT_GB 应被拒"; fail=1; else echo "PASS  畸形 LIMIT_GB(5.5.5)被拒"; fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
