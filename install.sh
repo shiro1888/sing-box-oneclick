@@ -4,7 +4,7 @@
 #  Hysteria2 + AnyTLS + VLESS-Reality-Vision  ->  Clash/Mihomo 订阅
 #
 #  用法:
-#    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/<你>/<仓库>/main/install.sh)
+#    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
 #    本地:        sudo bash install.sh [install|info|uninstall]
 #
 #  常用环境变量(可选,覆盖默认):
@@ -165,7 +165,10 @@ detect_net() {
     [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(curl -fsSL4 --max-time 8 https://ifconfig.me 2>/dev/null || true)"
     [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
   fi
-  [ -n "$PUBLIC_IP" ] || die "无法探测公网 IP, 请用 PUBLIC_IP=x.x.x.x 重新运行"
+  if [ -z "$PUBLIC_IP" ]; then
+    # SOFT_DETECT=1(info 用)时探测失败不致命, 用占位符; 安装时仍直接报错
+    [ "${SOFT_DETECT:-0}" = 1 ] && PUBLIC_IP="<未探测到IP>" || die "无法探测公网 IP, 请用 PUBLIC_IP=x.x.x.x 重新运行"
+  fi
   INTERFACE="${INTERFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
   INTERFACE="${INTERFACE:-eth0}"
   SUB_HOST="${DOMAIN:-$PUBLIC_IP}"
@@ -224,6 +227,7 @@ LIMIT_GB=$LIMIT_GB
 EXPIRE_AT="$EXPIRE_VALUE"
 INTERFACE=$INTERFACE
 COUNT_MODE=$COUNT_MODE
+SUB_HOST="$SUB_HOST"
 EOF
   chmod 600 "$ENVFILE"
 }
@@ -399,6 +403,7 @@ write_singbox_config() {
 write_subscription() {
   log "生成 Clash/Mihomo 订阅..."
   mkdir -p "$WWW"
+  chmod 755 "$WWW"   # 防止 umask 077 下新建的 web 根变 700, 导致 nginx(www-data) 无法遍历→订阅 403
   render_subscription_yaml >"$WWW$SUB_PATH"
   chmod 644 "$WWW$SUB_PATH"
 }
@@ -664,7 +669,8 @@ do_info() {
   # shellcheck disable=SC1090
   . "$SECRETS"
   [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
-  detect_net
+  # 优先用安装时存下的 SUB_HOST(纯读, 不崩); 老版本无此字段才回退探测且探测失败不致命
+  [ -n "${SUB_HOST:-}" ] || SOFT_DETECT=1 detect_net
   command -v sing-box >/dev/null 2>&1 && SB_VER="$(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
   [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json" && ANYTLS_OK=1 || ANYTLS_OK=0
   print_summary

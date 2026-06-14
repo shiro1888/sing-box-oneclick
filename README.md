@@ -53,7 +53,7 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `LIMIT_GB` | `200` | 每月显示/限流额度（GB） |
 | `COUNT_MODE` | `rx+tx` | 计费方式：`rx+tx` 双向(最保守) / `tx` 只算出站 / `max` 取较大方向 |
 | `EXPIRE_AT` | 安装日 +365 天 | 到期时间，**必须**是 `YYYY-MM-DD HH:MM:SS +0800` 格式（四位时区偏移，不能写 `+08:00` 或省略）。格式不对脚本会在开头直接报错退出，不会装到一半才崩。 |
-| `DOMAIN` | 空（用 IP） | 订阅域名（仅支持单个，对应文档里的 SUB_DOMAIN_1）；填了需自己把 DNS A 记录指向本机 IP。需要备用域名请按《节点搭建文档》手动加规则。 |
+| `DOMAIN` | 空（用 IP） | 订阅域名（仅支持单个）；填了需自己把 DNS A 记录指向本机 IP。脚本只处理一个订阅域名，需要备用域名请手动改 nginx 的 `server_name` 与订阅 `rules`。 |
 | `AIRPORT_NAME` | `MyNode` | 客户端里的订阅显示名 |
 | `PUBLIC_IP` | 自动探测 | 探测失败时手动指定 |
 | `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` | `4433`/`4434`/`443` | 各协议端口 |
@@ -63,6 +63,8 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `ENABLE_UFW` | `0` | 自动配置并**启用** ufw（默认关，避免把自己 SSH 关在外面） |
 
 `COUNT_MODE` 怎么选：Vultr/DigitalOcean/多数大厂云 **只计出站**→`tx`；Hetzner 等**双向计费**→`rx+tx`。不确定就用默认 `rx+tx`（永不少算）。
+
+> 装前会校验输入，不合法会在**开头**直接报错退出（不会装到一半才崩）：端口须为 `1–65535` 的整数；`REALITY_SNI` / `TLS_SNI` / `DOMAIN` 只能含字母、数字、`.`、`-`；`EXPIRE_AT` 须为 `YYYY-MM-DD HH:MM:SS ±0800` 这种**四位**时区偏移（`±0800`，不能写 `+08:00` 或省略；负偏移如 `-0500` 也可以）。
 
 ---
 
@@ -132,7 +134,7 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 systemctl is-active sing-box nginx vnstat        # 服务在跑?
 sing-box check -c /etc/sing-box/config.json      # 配置合法?
 nginx -t                                         # nginx 合法?
-ss -lntup | grep -E ':(80|443|4433|4434)\b'      # 本地在监听?(不代表外部可达)
+ss -lntup | grep -E ':(80|443|4433|4434)\b'      # 本地在监听?(端口为默认值; 改过端口请替换。不代表外部可达)
 curl -I http://<IP或域名>/<订阅路径>             # 订阅 200 且带 Subscription-Userinfo?
 journalctl -t traffic_limit -n 20 --no-pager     # 流量脚本日志
 timedatectl                                      # 时间同步?(Reality 对时钟敏感)
