@@ -17,6 +17,7 @@
 - **安全细节**：`server_tokens off`、密钥文件 600、流量头只挂在订阅路径（不污染首页/404）。
 - **可选第 5 节点**：CF-Vless 大保底（Argo 命名隧道），`install.sh cf` 半自动接入——VPS 侧全自动，只有 CF 后台建 Tunnel 那步要你做。直连 IP 被墙时兜底。
 - **网络优化（自动）**：装前即应用 sysctl 调优——**UDP 收发缓冲 16MB**（Hysteria2/QUIC 关键，否则被限速并刷 quic-go 告警）、跨境高 BDP 链路的 TCP 缓冲、MTU 探测、空闲不重置拥塞窗口、TFO 等；BBR 默认开（`ENABLE_BBR=0` 关）。
+- **HY2 进阶（按需）**：salamander 混淆默认开（抗 QUIC 识别）；`HY2_HOP_RANGE` 端口跳跃抗运营商 UDP 限速；`HY2_UP/HY2_DOWN` brutal 暴力带宽烂线路提速。见环境变量表。
 - **可选**：ufw（默认关，避免锁死 SSH）。
 - **不破坏现有节点**：二次运行复用已有密钥（含升级时自动补 SS2022 / 保留 CF-Vless）。
 
@@ -65,6 +66,9 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `TLS_SNI` | `www.bing.com` | HY2/AnyTLS 自签证书 SNI |
 | `ENABLE_BBR` | `1` | 开启 BBR（纯 sysctl，安全） |
 | `ENABLE_UFW` | `0` | 自动配置并**启用** ufw（默认关，避免把自己 SSH 关在外面） |
+| `ENABLE_OBFS` | `1` | HY2 **salamander 混淆**，让 Hysteria2 不像 QUIC（默认开，抗 QUIC 整体识别/限速；`0` 关） |
+| `HY2_HOP_RANGE` | 空 | HY2 **端口跳跃** UDP 段（如 `20000-50000`），设了即启用（nftables 把整段重定向到 HY2 端口）。**云安全组要放行整段 UDP** |
+| `HY2_UP` / `HY2_DOWN` | 空 | HY2 **brutal 暴力带宽**（Mbps，如 `50`/`200`），设了即开「无视丢包」猛提速。**必须填你真实带宽**，填错反而更差、且抢带宽不公平 |
 
 `COUNT_MODE` 怎么选：Vultr/DigitalOcean/多数大厂云 **只计出站**→`tx`；Hetzner 等**双向计费**→`rx+tx`。不确定就用默认 `rx+tx`（永不少算）。
 
@@ -161,6 +165,7 @@ sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh c
 /etc/cron.d/traffic_limit          每 5 分钟刷新
 /etc/sysctl.d/99-singbox.conf      网络优化(UDP 16MB 大缓冲 / 跨境 TCP 调优 / BBR)
 /usr/local/bin/cloudflared         CF 隧道客户端(仅跑过 cf 后存在; uninstall 停服务但保留二进制)
+/etc/sing-box/porthop.nft + sing-box-porthop.service  HY2 端口跳跃(仅设了 HY2_HOP_RANGE 后存在)
 ```
 
 ---

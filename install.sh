@@ -20,6 +20,9 @@
 #    REALITY_SNI/TLS_SNI     伪装域名(默认 www.microsoft.com / www.bing.com)
 #    ENABLE_BBR=1            开启 BBR(默认开,纯 sysctl,安全)
 #    ENABLE_UFW=0            自动配置并启用 ufw(默认关,避免锁死SSH)
+#    ENABLE_OBFS=1           HY2 salamander 混淆(默认开, 抗 QUIC 识别)
+#    HY2_HOP_RANGE=20000-50000  HY2 端口跳跃 UDP 段(需 nftables + 云安全组放行整段)
+#    HY2_UP=50 HY2_DOWN=200      HY2 brutal 带宽 Mbps(要填你真实带宽, 烂线路提速)
 #
 #  可选第5节点 CF-Vless(大保底, 需先在 CF 后台建 Tunnel 拿 token+域名):
 #    CF_TOKEN=... CF_HOSTNAME=cf.example.com  bash install.sh cf
@@ -58,6 +61,10 @@ REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
+ENABLE_OBFS="${ENABLE_OBFS:-1}"      # HY2 salamander 混淆(默认开, 抗 QUIC 识别; 0 关)
+HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"   # HY2 端口跳跃 UDP 段(如 20000-50000, 空=不启用; 需 nftables+云安全组放行整段)
+HY2_UP="${HY2_UP:-}"                 # HY2 brutal 上行 Mbps(空=自适应; 设了即开暴力模式, 要填你真实带宽)
+HY2_DOWN="${HY2_DOWN:-}"             # HY2 brutal 下行 Mbps(同上)
 
 # 路径
 SB_DIR=/etc/sing-box
@@ -80,6 +87,7 @@ HY2_PASSWORD="${HY2_PASSWORD:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"; VLESS_
 REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"; REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
 SUB_B64_PATH="${SUB_B64_PATH:-}"   # 通用(base64)订阅路径(供 v2rayN 等; gen_secrets 生成)
+OBFS_PASSWORD="${OBFS_PASSWORD:-}" # HY2 obfs 密码(非空=启用 obfs; gen_secrets 生成)
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
 
@@ -104,6 +112,15 @@ validate_inputs() {
     [[ "$EXPIRE_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] \
       || die "EXPIRE_AT 格式必须是 'YYYY-MM-DD HH:MM:SS +0800'(含四位时区偏移, 不能是 +08:00 或省略), 当前: '$EXPIRE_AT'"
   fi
+  if [ -n "$HY2_HOP_RANGE" ]; then
+    [[ "$HY2_HOP_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "HY2_HOP_RANGE 须为 起-止(如 20000-50000): '$HY2_HOP_RANGE'"
+    local hs="${HY2_HOP_RANGE%-*}" he="${HY2_HOP_RANGE#*-}"
+    { [ "$hs" -ge 1 ] && [ "$he" -le 65535 ] && [ "$hs" -lt "$he" ]; } || die "HY2_HOP_RANGE 端口段非法(1-65535 且 起<止): '$HY2_HOP_RANGE'"
+  fi
+  local v
+  for v in "$HY2_UP" "$HY2_DOWN"; do
+    [ -z "$v" ] || case "$v" in *[!0-9]*) die "HY2_UP/HY2_DOWN 要是数字(Mbps): '$v'";; esac
+  done
 }
 
 detect_os() {
@@ -209,6 +226,11 @@ gen_secrets() {
       SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
       printf 'SUB_B64_PATH=%s\n' "$SUB_B64_PATH" >>"$SECRETS"
     fi
+    if [ -z "${OBFS_PASSWORD:-}" ] && [ "$ENABLE_OBFS" = 1 ]; then  # 升级开启 HY2 obfs
+      OBFS_PASSWORD="$(openssl rand -hex 12)"
+      printf 'OBFS_PASSWORD=%s\n' "$OBFS_PASSWORD" >>"$SECRETS"
+      log "已为升级补充 HY2 obfs 密码"
+    fi
     return
   fi
   log "生成密钥与随机参数..."
@@ -222,6 +244,7 @@ gen_secrets() {
   SUB_PATH="/sub-$(openssl rand -hex 8).yaml"
   SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
   SS_PASSWORD="$(gen_ss_password)"
+  [ "$ENABLE_OBFS" = 1 ] && OBFS_PASSWORD="$(openssl rand -hex 12)"
   ( umask 077
     cat >"$SECRETS" <<EOF
 HY2_PASSWORD=$HY2_PASSWORD
@@ -233,6 +256,7 @@ REALITY_SHORT_ID=$REALITY_SHORT_ID
 SUB_PATH=$SUB_PATH
 SUB_B64_PATH=$SUB_B64_PATH
 SS_PASSWORD="$SS_PASSWORD"
+OBFS_PASSWORD=$OBFS_PASSWORD
 EOF
   )
   chmod 600 "$SECRETS"
@@ -260,6 +284,9 @@ INTERFACE=$INTERFACE
 COUNT_MODE=$COUNT_MODE
 SUB_HOST="$SUB_HOST"
 PUBLIC_IP="$PUBLIC_IP"
+HY2_HOP_RANGE=$HY2_HOP_RANGE
+HY2_UP=$HY2_UP
+HY2_DOWN=$HY2_DOWN
 EOF
   chmod 600 "$ENVFILE"
 }
@@ -295,6 +322,8 @@ JSON
 JSON
 )"
   fi
+  local obfs_line=""
+  [ -n "$OBFS_PASSWORD" ] && obfs_line=$'\n      "obfs": { "type": "salamander", "password": "'"$OBFS_PASSWORD"'" },'
   cat <<JSON
 {
   "log": { "disabled": false, "level": "info" },
@@ -304,7 +333,7 @@ JSON
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": $HY2_PORT,
-      "users": [ { "password": "$HY2_PASSWORD" } ],
+      "users": [ { "password": "$HY2_PASSWORD" } ],$obfs_line
       "tls": { "enabled": true, "certificate_path": "$SB_DIR/server.crt", "key_path": "$SB_DIR/server.key" }
     },
 $anytls_block
@@ -347,6 +376,7 @@ render_subscription_yaml() {
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
   CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   "$PY" - <<'PY'
 import os
 ip  = os.environ["PUBLIC_IP"]
@@ -354,15 +384,26 @@ dom = os.environ.get("DOMAIN", "")
 anytls = os.environ["ANYTLS_OK"] == "1"
 
 proxies = []
-proxies.append(f'''  - name: "Hysteria2"
-    type: hysteria2
-    server: {ip}
-    port: {os.environ["HY2_PORT"]}
-    password: {os.environ["HY2_PASSWORD"]}
-    sni: {os.environ["TLS_SNI"]}
-    skip-cert-verify: true
-    alpn:
-      - h3''')
+hy2 = [
+    '  - name: "Hysteria2"',
+    '    type: hysteria2',
+    f'    server: {ip}',
+    f'    port: {os.environ["HY2_PORT"]}',
+    f'    password: {os.environ["HY2_PASSWORD"]}',
+    f'    sni: {os.environ["TLS_SNI"]}',
+    '    skip-cert-verify: true',
+]
+if os.environ.get("HY2_HOP_RANGE", ""):
+    hy2.append(f'    ports: "{os.environ["HY2_HOP_RANGE"]}"')
+if os.environ.get("OBFS_PASSWORD", ""):
+    hy2.append('    obfs: salamander')
+    hy2.append(f'    obfs-password: {os.environ["OBFS_PASSWORD"]}')
+if os.environ.get("HY2_UP", ""):
+    hy2.append(f'    up: "{os.environ["HY2_UP"]} Mbps"')
+if os.environ.get("HY2_DOWN", ""):
+    hy2.append(f'    down: "{os.environ["HY2_DOWN"]} Mbps"')
+hy2 += ['    alpn:', '      - h3']
+proxies.append("\n".join(hy2))
 if anytls:
     proxies.append(f'''  - name: "AnyTLS"
     type: anytls
@@ -472,13 +513,19 @@ render_share_links() {
   REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   "$PY" - <<'PY'
 import os, urllib.parse as u
 def q(s): return u.quote(str(s), safe='')
 ip  = os.environ["PUBLIC_IP"]
 tls = os.environ["TLS_SNI"]
 out = []
-out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{os.environ['HY2_PORT']}/?insecure=1&sni={q(tls)}#{q('Hysteria2')}")
+hy2q = f"insecure=1&sni={q(tls)}"
+if os.environ.get("OBFS_PASSWORD", ""):
+    hy2q += f"&obfs=salamander&obfs-password={q(os.environ['OBFS_PASSWORD'])}"
+if os.environ.get("HY2_HOP_RANGE", ""):
+    hy2q += f"&mport={os.environ['HY2_HOP_RANGE']}"
+out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{os.environ['HY2_PORT']}/?{hy2q}#{q('Hysteria2')}")
 if os.environ["ANYTLS_OK"] == "1":
     out.append(f"anytls://{q(os.environ['ANYTLS_PASSWORD'])}@{ip}:{os.environ['ANYTLS_PORT']}/?insecure=1&sni={q(tls)}#{q('AnyTLS')}")
 vq = u.urlencode({'encryption':'none','flow':'xtls-rprx-vision','security':'reality',
@@ -749,6 +796,49 @@ EOF
   fi
 }
 
+# HY2 端口跳跃: nftables 把一段 UDP 端口重定向到真实 HY2 端口, 抗运营商按端口对 UDP 限速
+config_porthop() {
+  [ -n "$HY2_HOP_RANGE" ] || return 0
+  log "配置 HY2 端口跳跃(UDP $HY2_HOP_RANGE -> $HY2_PORT)..."
+  if ! command -v nft >/dev/null 2>&1; then
+    case "$PKG" in apt) apt-get install -y nftables >/dev/null 2>&1 || true ;; dnf|yum) "$PKG" install -y nftables >/dev/null 2>&1 || true ;; esac
+  fi
+  local nftbin; nftbin="$(command -v nft 2>/dev/null || true)"
+  [ -n "$nftbin" ] || { warn "nftables 未装上, 跳过端口跳跃"; note "端口跳跃: 装不上 nftables, 未启用; 手动装后重跑 install。"; return 0; }
+  local hs="${HY2_HOP_RANGE%-*}" he="${HY2_HOP_RANGE#*-}"
+  local rules="$SB_DIR/porthop.nft"
+  cat >"$rules" <<EOF
+#!/usr/sbin/nft -f
+table inet sb_hophy2
+delete table inet sb_hophy2
+table inet sb_hophy2 {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport ${hs}-${he} redirect to :${HY2_PORT}
+  }
+}
+EOF
+  if ! "$nftbin" -f "$rules" 2>/dev/null; then
+    warn "nft 应用失败, 端口跳跃未生效"; note "端口跳跃: 'nft -f $rules' 报错, 请手动排查。"; return 0
+  fi
+  cat >/etc/systemd/system/sing-box-porthop.service <<EOF
+[Unit]
+Description=sing-box HY2 port hopping (nftables redirect)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$nftbin -f $rules
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sing-box-porthop >/dev/null 2>&1 || true
+  ok "HY2 端口跳跃已开(UDP $HY2_HOP_RANGE 重定向到 $HY2_PORT)"
+  note "端口跳跃: 云安全组必须放行 UDP 整段 $HY2_HOP_RANGE(不只是 $HY2_PORT), 否则跳跃端口连不上。"
+}
+
 config_firewall() {
   note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $SS_PORT/tcp+udp $HY2_PORT/udp —— 尤其 UDP($HY2_PORT、$SS_PORT)。本脚本改不了云端安全组, 这是'HY2/SS 连不上、Vless 却正常'的头号原因。"
   if ! command -v ufw >/dev/null 2>&1; then return 0; fi
@@ -761,6 +851,7 @@ config_firewall() {
     ufw allow "$HY2_PORT"/udp    >/dev/null 2>&1 || true
     ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
     ufw allow "$SS_PORT"/udp     >/dev/null 2>&1 || true
+    [ -n "$HY2_HOP_RANGE" ] && ufw allow "${HY2_HOP_RANGE%-*}":"${HY2_HOP_RANGE#*-}"/udp >/dev/null 2>&1 || true
     # 启用前确认 22 已放行, 否则不启用以免把自己 SSH 关在门外
     if ufw status 2>/dev/null | grep -q '22/tcp'; then
       yes | ufw enable >/dev/null 2>&1 || true
@@ -778,6 +869,7 @@ config_firewall() {
     ufw allow "$HY2_PORT"/udp    >/dev/null 2>&1 || true
     ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
     ufw allow "$SS_PORT"/udp     >/dev/null 2>&1 || true
+    [ -n "$HY2_HOP_RANGE" ] && ufw allow "${HY2_HOP_RANGE%-*}":"${HY2_HOP_RANGE#*-}"/udp >/dev/null 2>&1 || true
     ok "已在现有 ufw 中放行端口"
   else
     note "主机防火墙 ufw 未启用, 本脚本未自动开启(避免锁死 SSH)。如需启用: 用 ENABLE_UFW=1 重跑, 或手动 'ufw allow 22,80,$VLESS_PORT,$ANYTLS_PORT,$SS_PORT/tcp; ufw allow $HY2_PORT/udp; ufw allow $SS_PORT/udp; ufw enable'。"
@@ -989,6 +1081,12 @@ do_uninstall() {
   else
     warn "未触碰 cloudflared(若你手动搭过 CF, 请自行处理 /etc/cloudflared, 凭证别误删)"
   fi
+  if [ -f /etc/systemd/system/sing-box-porthop.service ]; then
+    systemctl disable --now sing-box-porthop >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sing-box-porthop.service "$SB_DIR/porthop.nft" 2>/dev/null || true
+    command -v nft >/dev/null 2>&1 && nft delete table inet sb_hophy2 >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
   ok "已卸载(保留 sing-box 程序与网络优化 sysctl; 备份见上)"
 }
@@ -1089,6 +1187,7 @@ do_install() {
   config_nginx
   install_traffic
   config_firewall
+  config_porthop
   print_summary
 }
 

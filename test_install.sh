@@ -142,6 +142,17 @@ if grep -q 'EXPIRE_AT="2030-01-02 03:04:05 +0800"' "$SETD/env"; then echo "PASS 
 if PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=5.5.5' >/dev/null 2>&1; then echo "FAIL  畸形 LIMIT_GB 应被拒"; fail=1; else echo "PASS  畸形 LIMIT_GB(5.5.5)被拒"; fi
 
 echo
+echo "=== 4e) HY2 obfs / 端口跳跃 / brutal 渲染 ==="
+CFGO="$(ANYTLS_OK=1 OBFS_PASSWORD=obfspw render render_singbox_config)"
+if printf '%s' "$CFGO" | python -c "import json,sys;h=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='hy2-in'][0];assert h['obfs']['type']=='salamander' and h['obfs']['password']=='obfspw'" 2>"$TMP/e"; then echo "PASS  hy2 入站含 obfs salamander"; else echo "FAIL  hy2 obfs"; cat "$TMP/e"; fail=1; fi
+SUBO="$(ANYTLS_OK=1 OBFS_PASSWORD=obfspw HY2_HOP_RANGE=20000-50000 HY2_UP=50 HY2_DOWN=200 render render_subscription_yaml)"
+if printf '%s' "$SUBO" | python -c "import yaml,sys;h=[p for p in yaml.safe_load(sys.stdin)['proxies'] if p['name']=='Hysteria2'][0];assert h['obfs']=='salamander' and h['obfs-password']=='obfspw' and h['ports']=='20000-50000' and h['up']=='50 Mbps' and h['down']=='200 Mbps'" 2>"$TMP/e"; then echo "PASS  Clash HY2 节点含 obfs/ports/up/down"; else echo "FAIL  hy2 订阅选项"; cat "$TMP/e"; fail=1; fi
+LNKO="$(ANYTLS_OK=1 OBFS_PASSWORD=obfspw HY2_HOP_RANGE=20000-50000 render render_share_links)"
+if printf '%s' "$LNKO" | grep -qE '^hysteria2://.*obfs=salamander.*mport=20000-50000'; then echo "PASS  HY2 链接含 obfs+mport"; else echo "FAIL  hy2 链接选项"; fail=1; fi
+NOO="$(ANYTLS_OK=1 render render_subscription_yaml)"
+if printf '%s' "$NOO" | grep -qE 'obfs|ports:| up:'; then echo "FAIL  默认却出现 obfs/ports/up"; fail=1; else echo "PASS  默认无 obfs/端口跳跃/brutal(条件渲染正确)"; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then
