@@ -96,8 +96,8 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 - 要真正的 HTTPS（443 已被 Reality 占用），推荐把订阅路径挂到下面的 Cloudflare Tunnel 上走 HTTPS，而不是在 VPS 上另开 443。
 - 临时缓解：拉取一次后可换 `SUB_PATH`（等于换凭证），或拉完就把订阅文件删掉本地保存。
 
-### 3.（可选）CF-Vless 大保底（IP 被墙时兜底）
-需要 Cloudflare 账号 + 一个托管在 CF 的域名 + Tunnel，**无法在通用脚本里自动完成**。手动步骤：
+### 3.（可选）CF-Vless 大保底 / 「Argo 隧道」（IP 被墙时兜底）
+网上说的 **「Argo 隧道」就是这里的 Cloudflare Tunnel**，下面这个**命名隧道（固定域名）就是稳定版的 Argo**。需要 Cloudflare 账号 + 一个托管在 CF 的域名 + Tunnel，**无法在通用脚本里自动完成**。手动步骤：
 1. `apt install cloudflared`；
 2. 给 sing-box 加一个只监听 `127.0.0.1:28080` 的 VLESS-WS 入站；
 3. 建 Tunnel 把 `cf.example.com` → `http://127.0.0.1:28080`；
@@ -105,6 +105,11 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
 
 详细配置见 sing-box / cloudflared 官方文档。
 > 注意：部分 VPS 商家对 Cloudflare/CDN 流量额外计费或不适合走 CF，这种机器就别开。
+
+> **关于「Argo 隧道加速」**——别被「加速」二字误导：
+> - 所谓加速 = 客户端连一个**优选 Cloudflare 域名/IP**（路由好的边缘），由 CF 骨干回源到你的隧道。它**只在直连路由差/被墙时**可能更快；正常情况多一跳，往往比直连**更慢**。真正的智能路由（Argo Smart Routing）是 **按量付费**的，多数教程其实只是用了免费的「优选 IP」。
+> - 另一种「免域名一键 Argo」用的是**临时快速隧道**（`cloudflared tunnel --url`，给你一个 `*.trycloudflare.com`）：好处是不要账号/域名、能自动化；但**每次 cloudflared 重启都会换一个随机域名** → 订阅里的节点地址立刻失效变死节点，还会被 Cloudflare 限速、随时可能掉。**不适合当你依赖的节点**，所以本脚本**不**自动集成它。
+> - 结论：要稳定就用上面的**命名隧道**（固定域名）；它定位是**保底/兜底**，不是稳定加速。直连的 Hysteria2 / Vless-Reality 仍是主力。
 
 ### 4.（可选，强烈建议）SSH 加固
 脚本**不会**动你的 SSH（避免误锁）。但 VPS 最大的风险是 22 端口被爆破——一旦失守整台机器连同密钥全没。建议手动：改密钥登录、禁用密码登录、可加 `fail2ban`。**先确认密钥能登录，再禁用密码。**
