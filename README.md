@@ -22,13 +22,13 @@
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
 ```
 
 或下载后运行：
 
 ```bash
-wget https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/install.sh
+wget https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh
 sudo bash install.sh
 ```
 
