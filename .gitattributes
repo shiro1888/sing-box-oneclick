@@ -1,0 +1,4 @@
+# 保证 shell 脚本在仓库与检出时始终为 LF,
+# 避免在 Windows 上编辑后被转成 CRLF, 导致 curl|bash 在 Linux 因 \r 报错。
+* text=auto
+*.sh text eol=lf

@@ -1,0 +1,209 @@
+# sing-box 三协议一键部署
+
+一条命令在全新 VPS 上部署 **Hysteria2 + AnyTLS + VLESS-Reality-Vision** 三条自用节点，自动生成一个 **Clash/Mihomo 订阅**（手动 `select` 切换、国内直连国外代理、客户端显示流量、可限流）。
+
+> 设计目标：自用、单机、直连、零交互、可迁移。脚本源于一份手写部署文档，把里面所有步骤自动化，并对**本机无法自动完成的部分给出明确说明**。
+
+---
+
+## 特性
+
+- **三协议**：Hysteria2（UDP，快）、AnyTLS（TCP，兼容好）、VLESS-Reality-Vision（TCP，稳/隐蔽）。
+- **零交互**：自动装依赖与 sing-box、自动生成全部密钥、自动探测公网 IP 和网卡。
+- **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
+- **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
+- **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
+- **安全细节**：`server_tokens off`、密钥文件 600、流量头只挂在订阅路径（不污染首页/404）。
+- **可选**：BBR（默认开）、ufw（默认关，避免锁死 SSH）。
+- **不破坏现有节点**：二次运行复用已有密钥。
+
+---
+
+## 一键安装
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/install.sh)
+```
+
+或下载后运行：
+
+```bash
+wget https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/install.sh
+sudo bash install.sh
+```
+
+装完会打印**订阅 URL**和**需要你手动完成的清单**。把订阅 URL 导入 Clash/Mihomo 即可。
+
+> 系统要求：**需 systemd**（非 systemd 系统如 Alpine/OpenRC 不支持，脚本会直接报错而不会装坏）。Debian/Ubuntu 完整支持；RHEL 系（dnf/yum）尽力支持，会自动尝试启用 EPEL 装 vnstat，nginx 若有其它站点占用可能需手动处理（脚本会给提示）。需以 root 运行。
+>
+> ⚠️ 这是 `curl | bash` 跑一个会以 root 执行的脚本，且脚本内部还会再 `curl | sh` 跑 sing-box 官方安装脚本。**建议先 `wget` 下来读一遍再运行**，不要无脑信任任何一键脚本（包括本脚本）。详见下方「安全须知与取舍」。
+
+---
+
+## 常用环境变量
+
+全部可选，覆盖默认值即可。例：
+
+```bash
+LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
+```
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LIMIT_GB` | `200` | 每月显示/限流额度（GB） |
+| `COUNT_MODE` | `rx+tx` | 计费方式：`rx+tx` 双向(最保守) / `tx` 只算出站 / `max` 取较大方向 |
+| `EXPIRE_AT` | 安装日 +365 天 | 到期时间，**必须**是 `YYYY-MM-DD HH:MM:SS +0800` 格式（四位时区偏移，不能写 `+08:00` 或省略）。格式不对脚本会在开头直接报错退出，不会装到一半才崩。 |
+| `DOMAIN` | 空（用 IP） | 订阅域名（仅支持单个，对应文档里的 SUB_DOMAIN_1）；填了需自己把 DNS A 记录指向本机 IP。需要备用域名请按《节点搭建文档》手动加规则。 |
+| `AIRPORT_NAME` | `MyNode` | 客户端里的订阅显示名 |
+| `PUBLIC_IP` | 自动探测 | 探测失败时手动指定 |
+| `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` | `4433`/`4434`/`443` | 各协议端口 |
+| `REALITY_SNI` | `www.microsoft.com` | Reality 伪装域名（服务端 handshake + 客户端 servername，必须一致） |
+| `TLS_SNI` | `www.bing.com` | HY2/AnyTLS 自签证书 SNI |
+| `ENABLE_BBR` | `1` | 开启 BBR（纯 sysctl，安全） |
+| `ENABLE_UFW` | `0` | 自动配置并**启用** ufw（默认关，避免把自己 SSH 关在外面） |
+
+`COUNT_MODE` 怎么选：Vultr/DigitalOcean/多数大厂云 **只计出站**→`tx`；Hetzner 等**双向计费**→`rx+tx`。不确定就用默认 `rx+tx`（永不少算）。
+
+---
+
+## 管理命令
+
+```bash
+sudo bash install.sh info        # 重新打印订阅 URL 和节点信息
+sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
+```
+
+---
+
+## 本机无法自动完成的部分（脚本会提示，这里是详解）
+
+这些受限于平台/账号，脚本管不了，需你手动处理：
+
+### 1. 云服务商安全组（最常见的坑）
+脚本能配主机内的 ufw，但**改不了云端安全组**（阿里云/腾讯云/Oracle/AWS 等控制台里的入站规则）。云安全组默认拒绝入站、而且经常拦 UDP。请在控制台放行：
+
+```
+22/tcp  80/tcp  443/tcp  4434/tcp  4433/udp     ← 尤其 4433/udp
+```
+
+> 现象：HY2（UDP）连不上、Vless（TCP 443）却正常 = 八成是 UDP 没放行。注意本机 `ss -lntup` 只证明在监听，证明不了外部能连进来。
+
+### 2.（可选，但在不可信网络下强烈建议）域名 + HTTPS 订阅
+默认用 `http://<IP>/<随机路径>` 提供订阅。**订阅 YAML 里含全部节点凭证（密码、UUID、Reality 公钥），HTTP 是明文传输**：随机路径只能防扫描，挡不住在途嗅探——任何能抓到这次订阅请求的人（机房、运营商、出口路由）一次就拿到全套凭证、直接接管你的节点。自用、低频拉取、信任链路时风险尚可，但只要走过不可信网络，就该上 HTTPS：
+- 你自己把域名 DNS A 记录指向本机 IP，安装时加 `DOMAIN=node.example.com`；
+- 要真正的 HTTPS（443 已被 Reality 占用），推荐把订阅路径挂到下面的 Cloudflare Tunnel 上走 HTTPS，而不是在 VPS 上另开 443。
+- 临时缓解：拉取一次后可换 `SUB_PATH`（等于换凭证），或拉完就把订阅文件删掉本地保存。
+
+### 3.（可选）CF-Vless 大保底（IP 被墙时兜底）
+需要 Cloudflare 账号 + 一个托管在 CF 的域名 + Tunnel，**无法在通用脚本里自动完成**。手动步骤：
+1. `apt install cloudflared`；
+2. 给 sing-box 加一个只监听 `127.0.0.1:28080` 的 VLESS-WS 入站；
+3. 建 Tunnel 把 `cf.example.com` → `http://127.0.0.1:28080`；
+4. Tunnel 通了之后，再把 `CF-Vless` 节点加进订阅（没通就别加，否则是死节点）。
+
+详细配置见 sing-box / cloudflared 官方文档。
+> 注意：部分 VPS 商家对 Cloudflare/CDN 流量额外计费或不适合走 CF，这种机器就别开。
+
+### 4.（可选，强烈建议）SSH 加固
+脚本**不会**动你的 SSH（避免误锁）。但 VPS 最大的风险是 22 端口被爆破——一旦失守整台机器连同密钥全没。建议手动：改密钥登录、禁用密码登录、可加 `fail2ban`。**先确认密钥能登录，再禁用密码。**
+
+---
+
+## 它装了哪些文件
+
+```
+/etc/sing-box/config.json          sing-box 服务端配置 (600)
+/etc/sing-box/server.{crt,key}     HY2/AnyTLS 自签证书
+/etc/sing-box/node-secrets.env     密钥与随机路径 (600，复用用)
+/etc/sing-box-node.env             运行参数单一来源 (600)
+/var/www/html/sub-xxxx.yaml        Clash/Mihomo 订阅(644，含凭证，见安全须知)
+/etc/nginx/conf.d/00-singbox-sub.conf   订阅 server 块(仅 server 块；流量头单独在 snippets 内、只对订阅 location include，首页/404 不带头)
+/etc/nginx/snippets/sub_headers.conf    流量头(只挂订阅路径)
+/usr/local/bin/traffic_limit.py    流量统计/限流
+/etc/cron.d/traffic_limit          每 5 分钟刷新
+/etc/sysctl.d/99-bbr.conf          BBR(若开启)
+```
+
+---
+
+## 排查
+
+```bash
+systemctl is-active sing-box nginx vnstat        # 服务在跑?
+sing-box check -c /etc/sing-box/config.json      # 配置合法?
+nginx -t                                         # nginx 合法?
+ss -lntup | grep -E ':(80|443|4433|4434)\b'      # 本地在监听?(不代表外部可达)
+curl -I http://<IP或域名>/<订阅路径>             # 订阅 200 且带 Subscription-Userinfo?
+journalctl -t traffic_limit -n 20 --no-pager     # 流量脚本日志
+timedatectl                                      # 时间同步?(Reality 对时钟敏感)
+```
+
+- **订阅打不开**：先看云安全组是否放行 80/tcp。
+- **HY2 连不上但 Vless 正常**：云安全组没放行 4433/udp。
+- **订阅不显示流量**：核对 `/etc/sing-box-node.env` 里的 `INTERFACE`（`ip -br link` 查真实网卡），看 `journalctl -t traffic_limit`。
+- **Vless 连得上但不通**：多半是时间不同步或 SNI 两端不一致。
+
+---
+
+## 安全须知与取舍
+
+一键脚本图省事，但有几个取舍你应当知情：
+
+- **供应链信任**：本脚本以 root 运行，且内部用 `curl -fsSL https://sing-box.app/install.sh | sh` 安装 sing-box——没有固定版本、没有签名/SHA256 校验。一旦该域名/CDN 被劫持，攻击者可在你机器上以 root 执行任意代码。在意的话：先把本脚本和 sing-box 安装脚本读一遍，或改用发行版包 / 手动下载校验 release 的 SHA256 后再装。
+- **订阅明文凭证**：订阅走明文 HTTP，YAML 含全部节点凭证；链路可被嗅探则节点失守。详见上方「2. 域名 + HTTPS 订阅」，不可信网络务必上 HTTPS。
+- **HY2 / AnyTLS 用自签证书 + `skip-cert-verify: true`**：等于客户端不校验服务端身份，能做在途 MITM 的攻击者可冒充节点、解密/篡改流量且客户端不报警。这是自签方案的固有代价。**Reality（Vless）不受此影响**——对抗审查/在意 MITM 时优先用 Vless；想让 HY2/AnyTLS 也抗 MITM，需改用真实证书（真域名 + Let's Encrypt）并去掉 `skip-cert-verify`。
+- **文件权限**：密钥、私钥、`config.json`、`*-secrets.env`、运行参数 env 均为 600，`/etc/sing-box` 目录 700，脚本运行期 `umask 077`（创建瞬间即限权）。订阅文件为 644（nginx 需要读）——同机若有不可信的本地用户，注意它可读。
+- **防火墙不自动启用**：`ENABLE_UFW` 默认 0，避免把你的 SSH 关在门外；显式开启时脚本会先确认放行 22 再 enable。
+- **卸载会先备份**：`uninstall` 删除前自动把密钥/参数备份到 `/root/sing-box-uninstall-backup-<时间戳>/`，避免一条命令不可逆地销毁全部凭证；它不碰你手动搭的 cloudflared。
+
+最该补的一件事仍是 **SSH 加固**（见上方第 4 条）——host 被爆破，代理调得再好也归零。
+
+---
+
+## 关于 BBR v3（可选，手动，**不在一键流程里**）
+
+脚本默认已开 **BBR v1**（`ENABLE_BBR=1`，纯 `sysctl`、免重启、零风险）。有人会想再上 **BBR v3** 提速——这需要**换内核**，所以**故意不放进一键脚本**，原因如下，建议看完再决定值不值得。
+
+### 为什么不进一键流程
+
+- **会换内核 + 必须重启**。新内核若起不来，VPS 会黑屏失联，得靠服务商**控制台 / 救援模式 / 重装**才能救回——装代理的脚本不该有把机器搞砖的能力。
+- **只对 TCP 节点有用**。BBR 是内核 TCP 拥塞控制，帮的是 **AnyTLS / Vless**；**Hysteria2 走 UDP/QUIC、自带拥塞控制，完全不受影响**。而本套是 HY2 优先，v1→v3 的边际收益本就有限。
+- **兼容面窄**。只适用 KVM + GRUB 的 Debian 12+/Ubuntu 22.04+；**容器型 VPS（OpenVZ/LXC）不能换内核**。
+- **供应链更重**。装第三方编译的内核 = 把机器最底层托付给别人的构建流水线，风险远大于用户态程序。
+
+### 如果某台机器真的想要：手动做，优先 XanMod
+
+XanMod 内核自带 BBRv3，有官方 apt 源、有签名、用的人多，比装某个 GitHub Release 的预编译内核更可信、更好维护。**前提：先确认这台 VPS 有控制台/VNC 或救援模式，再动内核；一台一台来。**
+
+```bash
+# 0) 先查 CPU 支持到哪个等级(输出 x86-64-v2 / v3 / v4)，选不超过它的包，否则可能起不来
+wget -qO - https://dl.xanmod.org/check_x86-64_psabi.sh | bash
+
+# 1) 加 XanMod 官方源
+wget -qO - https://dl.xanmod.org/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg
+echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' \
+  | sudo tee /etc/apt/sources.list.d/xanmod-release.list
+
+# 2) 装内核(按上面查到的等级选 x64v1/v2/v3/v4；不确定就选低一档更稳)
+sudo apt update && sudo apt install -y linux-xanmod-x64v3
+
+# 3) 重启(确认你能从控制台进救援再重启)
+sudo reboot
+
+# 4) 回来后验证：内核换了、CC 是 bbr(XanMod 里就是 BBRv3)
+uname -r
+sudo sysctl --system
+sysctl net.ipv4.tcp_congestion_control   # 期望: net.ipv4.tcp_congestion_control = bbr
+```
+
+> 注意：包名里的 `x64v3` 是 **CPU 指令集等级**，不是 BBR 版本——XanMod 任何等级的内核都带 BBRv3。`/etc/sysctl.d/99-bbr.conf`（本脚本已写入 `fq` + `bbr`）在新内核下会自动用上 v3，无需改动。
+>
+> 你提到的 [byJoey/Actions-bbr-v3](https://github.com/byJoey/Actions-bbr-v3) 是另一条路（自编译 BBRv3 内核 .deb）。能用，但相比 XanMod 维护性和可信度更弱，自担风险。
+
+**一句话**：v1 留着够用；v3 当作一次性的手动内核升级，自己掂量那台机器值不值，且优先 XanMod。
+
+---
+
+## 免责声明
+
+仅供学习与自用网络代理搭建。请遵守你所在地区与 VPS 服务商的法律法规和服务条款，自行承担使用风险。
