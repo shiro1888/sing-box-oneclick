@@ -116,6 +116,27 @@ B64="$(ANYTLS_OK=1 render render_share_links | base64 -w0)"
 if printf '%s' "$B64" | base64 -d 2>/dev/null | grep -q '^hysteria2://'; then echo "PASS  base64 通用订阅可解码且含链接"; else echo "FAIL  base64 往返"; fail=1; fi
 
 echo
+echo "=== 4d) set 改参数(env 更新 + 校验) ==="
+SETD="$TMP/setd"; mkdir -p "$SETD"
+cat > "$SETD/env" <<E
+LIMIT_GB=200
+EXPIRE_AT="2026-12-31 23:59:59 +0800"
+INTERFACE=eth0
+COUNT_MODE=rx+tx
+SUB_HOST=1.2.3.4
+PUBLIC_IP=1.2.3.4
+E
+: > "$SETD/secrets"
+PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=500 COUNT_MODE=tx' >/dev/null 2>&1
+if grep -q '^LIMIT_GB=500$' "$SETD/env" && grep -q '^COUNT_MODE=tx$' "$SETD/env" && grep -q 'EXPIRE_AT=' "$SETD/env" && grep -q '^INTERFACE=eth0$' "$SETD/env"; then
+  echo "PASS  set 更新 LIMIT_GB/COUNT_MODE 并保留其它键"; else echo "FAIL  set 更新"; cat "$SETD/env"; fail=1; fi
+if PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set COUNT_MODE=bogus' >/dev/null 2>&1; then
+  echo "FAIL  set 应拒绝非法 COUNT_MODE"; fail=1
+else
+  grep -q '^COUNT_MODE=tx$' "$SETD/env" && echo "PASS  set 拒绝非法 COUNT_MODE 且不改 env" || { echo "FAIL  set 非法值污染了 env"; fail=1; }
+fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then

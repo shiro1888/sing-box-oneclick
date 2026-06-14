@@ -5,7 +5,8 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|links|cf|uninstall]
+#    本地:        sudo bash install.sh [install|info|links|status|set|update|restart|cf|menu|uninstall]
+#    交互菜单:    sudo bash install.sh menu
 #
 #  常用环境变量(可选,覆盖默认):
 #    LIMIT_GB=200            每月显示/限流额度
@@ -123,14 +124,14 @@ install_deps() {
     apt)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y curl wget tar jq nginx vnstat openssl cron python3 iproute2 ca-certificates ufw
+      apt-get install -y curl wget tar jq nginx vnstat openssl cron python3 iproute2 ca-certificates ufw qrencode
       ;;
     dnf|yum)
       # vnstat / jq 在 RHEL 系常在 EPEL(+CRB), 先尝试启用, 否则流量统计会装不上
       "$PKG" install -y epel-release >/dev/null 2>&1 || true
       dnf config-manager --set-enabled crb >/dev/null 2>&1 || \
         dnf config-manager --set-enabled powertools >/dev/null 2>&1 || true
-      "$PKG" install -y curl wget tar jq nginx vnstat openssl cronie python3 iproute ca-certificates || \
+      "$PKG" install -y curl wget tar jq nginx vnstat openssl cronie python3 iproute ca-certificates qrencode || \
         warn "部分依赖安装失败, 继续(可能需手动补 vnstat/nginx)"
       ;;
   esac
@@ -827,6 +828,106 @@ do_links() {
   echo "===== 订阅 URL ====="
   printf 'Clash/Mihomo:  http://%s%s\n' "$SUB_HOST" "$SUB_PATH"
   [ -n "${SUB_B64_PATH:-}" ] && printf '通用(base64):  http://%s%s\n' "$SUB_HOST" "$SUB_B64_PATH"
+  if command -v qrencode >/dev/null 2>&1 && [ -n "${SUB_B64_PATH:-}" ]; then
+    echo; echo "===== 通用订阅二维码(扫码导入 v2rayN/Shadowrocket) ====="
+    qrencode -t ANSIUTF8 "http://$SUB_HOST$SUB_B64_PATH"
+  elif ! command -v qrencode >/dev/null 2>&1; then
+    echo "(装 qrencode 后这里会出二维码: apt install -y qrencode)"
+  fi
+}
+
+do_status() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  # shellcheck disable=SC1090
+  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true; [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
+  local cf_svc=""; [ -f "$CF_ENV" ] && cf_svc="cloudflared"
+  echo "===== 服务 ====="
+  local s
+  for s in sing-box nginx vnstat cron $cf_svc; do
+    printf '  %-12s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo inactive)"
+  done
+  echo "===== 配置校验 ====="
+  sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1 && echo "  sing-box: OK" || echo "  sing-box: FAIL (跑 sing-box check -c $SB_DIR/config.json 看详情)"
+  nginx -t >/dev/null 2>&1 && echo "  nginx:    OK" || echo "  nginx:    FAIL (跑 nginx -t 看详情)"
+  echo "===== 本地端口监听(不代表外部可达, 云安全组另算) ====="
+  ss -lntup 2>/dev/null | grep -E ":($HY2_PORT|$ANYTLS_PORT|$VLESS_PORT|$SS_PORT|80)\b" || echo "  (无匹配)"
+  echo "===== 其它 ====="
+  printf '  时间同步 NTPSynchronized = %s\n' "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
+  [ -f "$SB_DIR/server.crt" ] && printf '  自签证书 %s\n' "$(openssl x509 -enddate -noout -in "$SB_DIR/server.crt" 2>/dev/null)"
+  printf '  限额 %s GB | 计费 %s | 到期 %s\n' "${LIMIT_GB:-?}" "${COUNT_MODE:-?}" "${EXPIRE_AT:-?}"
+  curl -s -o /dev/null -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
+  echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
+}
+
+do_set() {
+  [ -f "$ENVFILE" ] || die "未检测到安装(缺 $ENVFILE)"
+  [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE)"
+  # shellcheck disable=SC1090
+  . "$SECRETS" 2>/dev/null || true
+  . "$ENVFILE"
+  local a key val
+  for a in "$@"; do
+    key="${a%%=*}"; val="${a#*=}"
+    [ "$key" != "$a" ] || die "参数要写成 KEY=VAL: $a"
+    case "$key" in
+      LIMIT_GB)   case "$val" in ''|*[!0-9.]*) die "LIMIT_GB 要是数字: $val";; esac; LIMIT_GB="$val" ;;
+      COUNT_MODE) case "$val" in rx+tx|tx|max) COUNT_MODE="$val" ;; *) die "COUNT_MODE 只能 rx+tx/tx/max";; esac ;;
+      INTERFACE)  [ -n "$val" ] || die "INTERFACE 不能空"; INTERFACE="$val" ;;
+      EXPIRE_AT)  [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || die "EXPIRE_AT 格式须为 'YYYY-MM-DD HH:MM:SS +0800'"; EXPIRE_AT="$val" ;;
+      *) die "不支持的键: $key (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE)" ;;
+    esac
+    ok "set $key=$val"
+  done
+  write_env   # 用更新后的全局重写 env(SUB_HOST/PUBLIC_IP 已从 env 读到, 一并保留)
+  [ -f "$TRAFFIC_PY" ] && { "$PY" "$TRAFFIC_PY" >/dev/null 2>&1 && ok "已刷新订阅流量头(限额/到期即时生效)" || warn "流量头刷新失败, 5 分钟后 cron 会自动重试"; }
+}
+
+do_update() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  log "更新 sing-box(官方脚本)..."
+  curl -fsSL https://sing-box.app/install.sh | sh || true
+  command -v sing-box >/dev/null 2>&1 || die "sing-box 安装/更新失败"
+  ok "sing-box 版本: $(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
+  if sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1; then
+    systemctl restart sing-box && ok "已重启 sing-box"
+  else
+    warn "更新后配置校验未过, 未重启。请跑 sing-box check -c $SB_DIR/config.json 看详情"
+  fi
+}
+
+do_restart() {
+  systemctl restart sing-box 2>/dev/null && ok "sing-box 已重启" || warn "sing-box 重启失败"
+  systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+  ok "nginx 已重载"
+  if [ -f "$CF_ENV" ]; then systemctl restart cloudflared 2>/dev/null && ok "cloudflared 已重启" || warn "cloudflared 重启失败"; fi
+}
+
+do_menu() {
+  while true; do
+    echo
+    echo "  ===== sing-box 节点管理 ====="
+    echo "  1) 安装 / 重装           2) 查看信息(订阅 URL)"
+    echo "  3) 分享链接 / 二维码     4) 状态体检"
+    echo "  5) 改参数(限额/到期)     6) 更新 sing-box"
+    echo "  7) 加 CF 大保底(第5节点) 8) 重启服务"
+    echo "  9) 卸载                  0) 退出"
+    printf '  选择: '
+    read -r c || break
+    case "$c" in
+      1) do_install ;;
+      2) do_info ;;
+      3) do_links ;;
+      4) do_status ;;
+      5) printf '  输入 KEY=VAL(如 LIMIT_GB=500): '; read -r kv || true; [ -n "${kv:-}" ] && do_set $kv ;;
+      6) do_update ;;
+      7) printf '  CF_TOKEN: '; read -r t || true; printf '  CF_HOSTNAME: '; read -r h || true
+         [ -n "${t:-}" ] && [ -n "${h:-}" ] && CF_TOKEN="$t" CF_HOSTNAME="$h" do_cf || echo "  已取消(token/域名为空)" ;;
+      8) do_restart ;;
+      9) do_uninstall ;;
+      0) break ;;
+      *) echo "  无效选择" ;;
+    esac
+  done
 }
 
 do_uninstall() {
@@ -968,9 +1069,14 @@ main() {
     install)   do_install ;;
     info)      do_info ;;
     links)     do_links ;;
+    status)    do_status ;;
+    set)       shift; do_set "$@" ;;
+    update)    do_update ;;
+    restart)   do_restart ;;
     cf)        do_cf ;;
+    menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|links|cf|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|links|status|set|update|restart|cf|menu|uninstall]"; exit 1 ;;
   esac
 }
 

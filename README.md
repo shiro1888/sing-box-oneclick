@@ -74,11 +74,19 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 ## 管理命令
 
 ```bash
+sudo bash install.sh menu        # 交互菜单(把下面所有功能串起来, 不想记命令就用它)
 sudo bash install.sh info        # 重新打印订阅 URL 和节点信息
-sudo bash install.sh links       # 打印每个节点的分享链接 + 两个订阅 URL
-sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf   # 接入可选第 5 节点 CF-Vless(见第 3 节)
-sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认）
+sudo bash install.sh links       # 打印每个节点分享链接 + 两个订阅 URL(+ 二维码)
+sudo bash install.sh status      # 状态体检: 服务/配置/端口/时间/证书/限额/订阅可达
+sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/网卡, 即时刷新流量头
+sudo bash install.sh update      # 更新 sing-box 到最新版并重启
+sudo bash install.sh restart     # 重启 sing-box / nginx (/ cloudflared)
+sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf    # 接入可选第 5 节点 CF-Vless(见第 3 节)
+sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认；删前自动备份密钥）
 ```
+
+- `set` 可改的键：`LIMIT_GB`（每月额度 GB）、`EXPIRE_AT`（到期，四位时区如 `+0800`）、`COUNT_MODE`（`rx+tx`/`tx`/`max`）、`INTERFACE`（统计网卡）。改完即时重写流量头，客户端下次拉订阅就生效。
+- `links` 若装了 `qrencode`（依赖里已含），会顺带打印通用订阅的二维码，手机扫码即导入。
 
 ### 两种订阅，按客户端选
 - **Clash/Mihomo**：用 `http://<IP>/<随机.yaml>`（默认那条），支持分流规则、显示流量。
