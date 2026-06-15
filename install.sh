@@ -836,9 +836,11 @@ HTML
 write_admin_py() {
   cat >"$ADMIN_PY" <<'PYEOF'
 #!/usr/bin/env python3
-import json, os, re, hmac, subprocess
+import json, os, re, hmac, subprocess, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+LOCK = threading.Lock()   # 串行化改动类动作, 防两个请求同时改 config/env
 
 ADMIN_ENV = "/etc/sing-box/admin.env"
 HTML_PATH = "/etc/sing-box/admin.html"
@@ -951,9 +953,13 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             data = {}
         if path == "/api/set":
-            return self._send(200, json.dumps(do_set(data)))
+            with LOCK:
+                res = do_set(data)
+            return self._send(200, json.dumps(res))
         if path == "/api/action":
-            return self._send(200, json.dumps(do_action(data)))
+            with LOCK:
+                res = do_action(data)
+            return self._send(200, json.dumps(res))
         return self._send(404, '{"error":"not found"}')
     def log_message(self, *a):
         pass
@@ -1586,6 +1592,10 @@ do_status() {
   [ -f "$SB_DIR/server.crt" ] && printf '  自签证书 %s\n' "$(openssl x509 -enddate -noout -in "$SB_DIR/server.crt" 2>/dev/null)"
   printf '  限额 %s GB | 计费 %s | 到期 %s\n' "${LIMIT_GB:-?}" "${COUNT_MODE:-?}" "${EXPIRE_AT:-?}"
   [ -n "$WARP_PRIVATE_KEY" ] && printf '  WARP 解锁分流: 已开 (OpenAI/Netflix/Disney 走 WARP; 关闭: install.sh warp off)\n'
+  if [ -f /etc/systemd/system/singbox-admin.service ]; then
+    local ap=8088; [ -f "$ADMIN_ENV" ] && ap="$(. "$ADMIN_ENV" 2>/dev/null; echo "${ADMIN_PORT:-8088}")"
+    printf '  网页管理面板: %s (127.0.0.1:%s; 取访问方式: install.sh admin)\n' "$(systemctl is-active singbox-admin 2>/dev/null || echo inactive)" "$ap"
+  fi
   curl -s -o /dev/null -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
   echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
 }
@@ -1649,6 +1659,9 @@ do_doctor() {
     { command -v nft >/dev/null 2>&1 && nft list table inet sb_hophy2 >/dev/null 2>&1 && P "端口跳跃 nftables 表在位"; } || W "端口跳跃服务装了但 nft 表缺失: systemctl restart sing-box-porthop"
   fi
   [ -n "${WARP_PRIVATE_KEY:-}" ] && P "WARP 解锁分流已配置(站点: ${WARP_SITES:-openai,netflix,disney})"
+  if [ -f /etc/systemd/system/singbox-admin.service ]; then
+    { [ "$(systemctl is-active singbox-admin 2>/dev/null)" = active ] && P "网页管理面板运行中(仅 127.0.0.1)"; } || W "网页管理面板服务未运行: journalctl -u singbox-admin"
+  fi
   echo "======================================="
   { [ "$issues" = 0 ] && ok "全部检查通过 ✓"; } || warn "$issues 项需关注(见上面 ! / ✗)"
 }
