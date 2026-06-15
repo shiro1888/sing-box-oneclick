@@ -658,12 +658,18 @@ render_panel_html() {
     qr_clash="$(qrencode -t PNG -o - "$clash_url" 2>/dev/null | base64 -w0 || true)"
     qr_b64="$(qrencode -t PNG -o - "$b64_url" 2>/dev/null | base64 -w0 || true)"
   fi
-  local nodes="Hysteria2"
-  [ "$ANYTLS_OK" = 1 ] && nodes="$nodes,AnyTLS"
-  nodes="$nodes,Vless,SS2022"
-  [ -n "$CF_HOSTNAME" ] && nodes="$nodes,CF-Vless"
+  # 每节点分享链接 + 各自二维码(服务端 qrencode 生成); 用 \t 分隔 名字\t链接\t二维码base64, \n 分隔多节点
+  # 进程替换 < <(...) 而非管道: 管道会开子shell 导致 node_data 丢失
+  local node_data="" link nm qr1
+  while IFS= read -r link; do
+    [ -n "$link" ] || continue
+    nm="${link##*#}"          # # 后是 URL 编码的节点名
+    qr1=""
+    command -v qrencode >/dev/null 2>&1 && qr1="$(printf '%s' "$link" | qrencode -t PNG -o - 2>/dev/null | base64 -w0 || true)"
+    node_data="${node_data}${nm}"$'\t'"${link}"$'\t'"${qr1}"$'\n'
+  done < <(render_share_links)
   AIRPORT_NAME="$AIRPORT_NAME" CLASH_URL="$clash_url" B64_URL="$b64_url" \
-  QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODES="$nodes" \
+  QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODE_DATA="$node_data" \
   LIMIT_GB="$LIMIT_GB" EXP="${EXPIRE_VALUE:-${EXPIRE_AT:-}}" \
   "$PY" - <<'PY'
 import os, html, sys, urllib.parse, base64, json, datetime
@@ -683,41 +689,70 @@ try:
 except Exception:
     exp_disp = "—"
 def qr(data): return f'<img class="qr" alt="QR" src="data:image/png;base64,{data}">' if data else '<span class="muted">(装 qrencode 可显示二维码)</span>'
-chips = "".join(f"<span>{e(n)}</span>" for n in os.environ["NODES"].split(","))
+# 每节点一张卡片: 名字 + 单条分享链接(复制) + 各自二维码
+node_cards = []
+for ln in os.environ.get("NODE_DATA", "").split("\n"):
+    if not ln.strip():
+        continue
+    parts = ln.split("\t")
+    if len(parts) < 2:
+        continue
+    nm_disp = e(urllib.parse.unquote(parts[0]))
+    link_e = e(parts[1])
+    qr1 = parts[2] if len(parts) > 2 else ""
+    qr_html = f'<img class="qr" alt="QR" src="data:image/png;base64,{qr1}">' if qr1 else ''
+    node_cards.append(
+        f'<div class="card"><b>{nm_disp}</b>'
+        f'<div class="row"><code>{link_e}</code><button onclick="cpx(this)">复制</button></div>'
+        f'{qr_html}</div>')
+nodes_html = "\n".join(node_cards)
 out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{name} 订阅</title><style>
-:root{{color-scheme:dark}}
-body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0e1116;color:#e6e6e6;margin:0;padding:24px;line-height:1.6}}
+:root{{color-scheme:light dark}}
+body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0e1116;color:#e6e6e6;margin:0;padding:24px;line-height:1.6;transition:background .2s,color .2s}}
 .wrap{{max-width:760px;margin:0 auto}} h1{{font-size:1.4rem;margin:.2em 0}}
 .muted{{color:#8b949e;font-size:.9rem}}
 .card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:14px 0}}
 .row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
 code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;word-break:break-all;flex:1;min-width:200px;font-size:.82rem}}
 button{{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:.85rem}} button:active{{opacity:.7}}
+button.ghost{{background:transparent;border:1px solid #30363d;color:inherit}}
 a.btn{{display:inline-block;background:#1f6feb;color:#fff;text-decoration:none;border-radius:6px;padding:8px 14px;font-size:.85rem;margin-top:8px}} a.btn:active{{opacity:.7}}
 img.qr{{background:#fff;padding:8px;border-radius:8px;width:170px;height:170px;margin-top:12px}}
-.nodes span{{display:inline-block;background:#21262d;border:1px solid #30363d;border-radius:20px;padding:4px 12px;margin:3px;font-size:.85rem}}
 .warn{{background:#3d1c1c;border-color:#5c2626;color:#ffb4b4}}
+body.light{{background:#f6f8fa;color:#1f2328}}
+body.light .card{{background:#fff;border-color:#d0d7de}}
+body.light code{{background:#f6f8fa;border-color:#d0d7de;color:#1f2328}}
+body.light .muted{{color:#656d76}}
+body.light .warn{{background:#fff5f5;border-color:#ffc1c1;color:#a40e26}}
 </style></head><body><div class="wrap">
-<h1>{name} 节点订阅</h1>
-<p class="muted">导入下面任一订阅；手机可直接扫码。</p>
+<div class="row" style="justify-content:space-between"><h1>{name} 节点订阅</h1><button class="ghost" onclick="tg()">🌓 主题</button></div>
+<p class="muted">导入下面任一订阅；手机可直接扫码。整段订阅含全部节点；下方“单节点”可逐条导入。</p>
 <div class="card"><b>Clash / Mihomo 订阅</b>
-<div class="row"><code id="u1">{clash}</code><button onclick="cp('u1')">复制</button></div>
+<div class="row"><code>{clash}</code><button onclick="cpx(this)">复制</button></div>
 <div class="row"><a class="btn" href="{clash_deep}">⚡ 一键导入 Clash / Mihomo</a></div>
 {qr(os.environ.get("QR_CLASH",""))}</div>
 <div class="card"><b>通用订阅（v2rayN / Shadowrocket / NekoBox）</b>
-<div class="row"><code id="u2">{b64}</code><button onclick="cp('u2')">复制</button></div>
+<div class="row"><code>{b64}</code><button onclick="cpx(this)">复制</button></div>
 <div class="row"><a class="btn" href="{sr_deep}">⚡ 一键导入 Shadowrocket</a></div>
 {qr(os.environ.get("QR_B64",""))}</div>
-<div class="card"><b>节点</b><div class="nodes">{chips}</div></div>
 <div class="card"><b>流量 / 到期</b>
 <div class="row"><span>限额 <b>{limit_gb} GB</b></span><span class="muted">·</span><span>到期 <b>{exp_disp}</b></span><span class="muted">·</span><span>已用 <b id="used">查询中…</b></span></div>
 <p class="muted">已用为实时拉取订阅响应头（每 5 分钟由服务器刷新）。</p></div>
+<div class="card"><b>延迟自测</b>
+<div class="row"><button onclick="lat()">测一下</button><span id="lat" class="muted">到本机 HTTP 往返(参考，浏览器测不了各协议实测)</span></div></div>
+<h3 style="margin:18px 0 0">单节点（逐条导入 / 扫码）</h3>
+{nodes_html}
 <div class="card warn">⚠️ 此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</div>
 <p class="muted">管理（改限额 / 更新 / 加节点）请用 SSH：<code>bash install.sh menu</code></p>
 </div><script>
-function cp(i){{navigator.clipboard.writeText(document.getElementById(i).textContent)}}
+function cpx(b){{navigator.clipboard.writeText(b.parentElement.querySelector('code').textContent)}}
+function tg(){{document.body.classList.toggle('light');try{{localStorage.setItem('sbtheme',document.body.classList.contains('light')?'light':'dark')}}catch(e){{}}}}
+try{{if(localStorage.getItem('sbtheme')==='light')document.body.classList.add('light')}}catch(e){{}}
+function lat(){{var o=document.getElementById('lat');o.textContent='测试中…';var t=[],n=5,i=0;
+function one(){{var s=performance.now();fetch({clash_js},{{method:'HEAD',cache:'no-store'}}).then(function(){{t.push(performance.now()-s);i++;if(i<n)one();else{{t.sort(function(a,b){{return a-b}});o.textContent=Math.round(t[Math.floor(t.length/2)])+' ms · 到本机HTTP往返(参考)';}}}}).catch(function(){{o.textContent='测不到(订阅不可达?)';}});}}
+one();}}
 (function(){{var el=document.getElementById('used');if(!el)return;
 fetch({clash_js},{{method:'HEAD'}}).then(function(r){{
 var u=r.headers.get('Subscription-Userinfo')||'';

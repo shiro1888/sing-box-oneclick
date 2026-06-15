@@ -175,6 +175,13 @@ chkp 'shadowrocket://add/sub://aHR0cDovLzEuMi4zLjQvc3ViLWI2NC14LnR4dA==' 'Shadow
 chkp '流量 / 到期'         '流量/到期卡'
 chkp '限额 <b>200 GB</b>'  '限额(从环境 LIMIT_GB=200)'
 chkp 'download=(\d+)'      '实时已用解析JS(同源拉订阅头)'
+chkp '单节点'              '单节点分区'
+chkp 'hysteria2://'        '单节点分享链接(HY2 逐条导入)'
+chkp 'anytls://'           '单节点分享链接(AnyTLS)'
+chkp 'onclick="cpx(this)"' '复制按钮(免逐个id)'
+chkp 'onclick="tg()"'      '明暗主题切换'
+chkp 'body.light'          '浅色主题样式'
+chkp 'onclick="lat()"'     '延迟自测按钮'
 if printf '%s' "$PANEL" | grep -qF 'CF-Vless'; then echo "FAIL  未开CF看板却有CF-Vless"; fail=1; else echo "PASS  未开CF看板无CF-Vless(条件渲染)"; fi
 PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=u render render_panel_html)"
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
