@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|links|status|set|update|restart|cf|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|links|status|set|backup|restore <file>|update|restart|cf|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -23,6 +23,8 @@
 #    ENABLE_BBR=1            开启 BBR(默认开,纯 sysctl,安全)
 #    ENABLE_UFW=0            自动配置并启用 ufw(默认关,避免锁死SSH)
 #    ENABLE_OBFS=1           HY2 salamander 混淆(默认开, 抗 QUIC 识别)
+#    ENABLE_BLOCK_BT=1       拦截 BT/PT(默认开, 防被商家封机收滥用投诉)
+#    ENABLE_BLOCK_ADS=1      geosite 拦广告(默认开, 远程 rule_set)
 #    HY2_HOP_RANGE=20000-50000  HY2 端口跳跃 UDP 段(需 nftables + 云安全组放行整段)
 #    HY2_UP=50 HY2_DOWN=200      HY2 brutal 带宽 Mbps(要填你真实带宽, 烂线路提速)
 #
@@ -64,6 +66,8 @@ TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
 ENABLE_OBFS="${ENABLE_OBFS:-1}"      # HY2 salamander 混淆(默认开, 抗 QUIC 识别; 0 关)
+ENABLE_BLOCK_BT="${ENABLE_BLOCK_BT:-1}"    # 拦截 BT/PT(默认开, 防被商家封机收滥用投诉; 0 关)
+ENABLE_BLOCK_ADS="${ENABLE_BLOCK_ADS:-1}"  # geosite 拦广告(默认开; 用远程 rule_set; 0 关)
 KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"  # Komari 探针面板地址(install.sh komari 用)
 KOMARI_TOKEN="${KOMARI_TOKEN:-}"        # Komari 节点 token
 HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"   # HY2 端口跳跃 UDP 段(如 20000-50000, 空=不启用; 需 nftables+云安全组放行整段)
@@ -340,6 +344,31 @@ JSON
   fi
   local obfs_line=""
   [ -n "$OBFS_PASSWORD" ] && obfs_line=$'\n      "obfs": { "type": "salamander", "password": "'"$OBFS_PASSWORD"'" },'
+  local route_json=""
+  if [ "$ENABLE_BLOCK_BT" = 1 ] || [ "$ENABLE_BLOCK_ADS" = 1 ]; then
+    local bt_rule="" ads_rule="" ads_set=""
+    [ "$ENABLE_BLOCK_BT" = 1 ] && bt_rule='
+      { "protocol": "bittorrent", "action": "reject" },'
+    if [ "$ENABLE_BLOCK_ADS" = 1 ]; then
+      ads_rule='
+      { "rule_set": ["geosite-ads"], "action": "reject" },'
+      ads_set='
+    "rule_set": [
+      { "tag": "geosite-ads", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct" }
+    ],'
+    fi
+    route_json="$(cat <<JSON
+
+  "route": {
+    "rules": [
+      { "action": "sniff" },$bt_rule$ads_rule
+      { "action": "route", "outbound": "direct" }
+    ],$ads_set
+    "final": "direct"
+  },
+JSON
+)"
+  fi
   cat <<JSON
 {
   "log": { "disabled": false, "level": "info" },
@@ -378,7 +407,7 @@ $anytls_block
       "method": "$SS_METHOD",
       "password": "$SS_PASSWORD"
     }$cf_block
-  ],
+  ],$route_json
   "outbounds": [ { "type": "direct", "tag": "direct" } ]
 }
 JSON
@@ -980,6 +1009,7 @@ print_summary() {
   printf '    查看信息:    bash install.sh info\n'
   printf '    看板页地址:  bash install.sh panel\n'
   printf '    分享链接:    bash install.sh links\n'
+  printf '    备份/迁移:   bash install.sh backup   (新机: bash install.sh restore <文件>)\n'
   printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
   printf '    装探针:      KOMARI_ENDPOINT=.. KOMARI_TOKEN=.. bash install.sh komari\n'
   printf '    卸载:        bash install.sh uninstall\n'
@@ -1065,6 +1095,38 @@ EOF
   systemctl is-active komari-agent >/dev/null 2>&1 && ok "komari-agent 运行中, 去面板看应该上线了" || warn "komari-agent 未在运行, 看 'systemctl status komari-agent'"
 }
 
+do_backup() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  local bf="${BACKUP_DIR:-/root}/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz" f files=""
+  for f in "$SECRETS" "$ENVFILE" "$CF_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key"; do
+    [ -f "$f" ] && files="$files $f"
+  done
+  # shellcheck disable=SC2086
+  ( umask 077; tar czf "$bf" $files 2>/dev/null ) || die "打包失败"
+  chmod 600 "$bf"
+  ok "备份已生成: $bf"
+  echo "  含: 密钥 / 运行参数 / CF状态 / 自签证书 —— 足以在新机重建同一套节点(凭证不变)。"
+  echo "  迁移到新 VPS:  1) scp 过去   2) 新机上 bash install.sh restore $bf"
+  warn "此文件含全部凭证, 妥善保管、别外传。"
+}
+
+do_restore() {
+  local bf="${1:-}"
+  [ -n "$bf" ] || die "用法: install.sh restore <备份文件.tar.gz>"
+  [ -f "$bf" ] || die "找不到备份文件: $bf"
+  command -v tar >/dev/null 2>&1 || die "缺 tar(先 apt install -y tar)"
+  log "恢复备份(解包到 /)..."
+  mkdir -p "$SB_DIR"
+  tar xzf "$bf" -C / 2>/dev/null || die "解包失败(文件损坏?)"
+  [ -f "$SECRETS" ] || die "备份里没有密钥文件, 无法恢复"
+  # 载入用户偏好(限额/到期/计费/HY2 进阶); 机器相关(IP/网卡/订阅host)清空让新机重新探测
+  # shellcheck disable=SC1090
+  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  INTERFACE=""; PUBLIC_IP=""; SUB_HOST=""
+  ok "凭证已就位, 按新机重建(IP/网卡自动适配; 用域名的话加 DOMAIN= 重跑或重指 DNS)..."
+  do_install
+}
+
 do_status() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   # shellcheck disable=SC1090
@@ -1144,6 +1206,7 @@ do_menu() {
     echo "  7) 加 CF 大保底(第5节点) 8) 重启服务"
     echo "  9) 卸载                  0) 退出"
     echo "  p) 看板页地址            k) 装 Komari 探针"
+    echo "  b) 备份                  r) 恢复(迁移)"
     printf '  选择: '
     read -r c || break
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
@@ -1163,6 +1226,8 @@ do_menu() {
       p|P) ( do_panel ) || true ;;
       k|K) printf '  KOMARI_ENDPOINT: '; read -r ke || true; printf '  KOMARI_TOKEN: '; read -r kt || true
            if [ -n "${ke:-}" ] && [ -n "${kt:-}" ]; then ( KOMARI_ENDPOINT="$ke" KOMARI_TOKEN="$kt" do_komari ) || true; else echo "  已取消"; fi ;;
+      b|B) ( do_backup ) || true ;;
+      r|R) printf '  备份文件路径: '; read -r rf || true; [ -n "${rf:-}" ] && { ( do_restore "$rf" ) || true; } ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -1319,13 +1384,15 @@ main() {
     links)     do_links ;;
     status)    do_status ;;
     set)       shift; do_set "$@" ;;
+    backup)    do_backup ;;
+    restore)   shift; do_restore "$@" ;;
     update)    do_update ;;
     restart)   do_restart ;;
     cf)        do_cf ;;
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|links|status|set|update|restart|cf|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|links|status|set|backup|restore <file>|update|restart|cf|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 

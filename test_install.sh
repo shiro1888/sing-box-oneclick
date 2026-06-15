@@ -43,6 +43,12 @@ if printf '%s' "$CFG3" | python -c "import json,sys;s=[i for i in json.load(sys.
 
 if printf '%s' "$CFG3" | python -c "import json,sys;v=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='vless-in'][0];assert v['tls']['server_name']==v['tls']['reality']['handshake']['server'];assert v['users'][0]['flow']=='xtls-rprx-vision'" 2>"$TMP/e"; then
   echo "PASS  Reality server_name==handshake.server 且 flow 正确"; else echo "FAIL  reality"; cat "$TMP/e"; fail=1; fi
+# 路由: 默认禁BT+拦广告
+if printf '%s' "$CFG3" | python -c "import json,sys;r=json.load(sys.stdin)['route'];assert any(x.get('protocol')=='bittorrent' and x.get('action')=='reject' for x in r['rules']);assert any('geosite-ads' in (x.get('rule_set') or []) for x in r['rules']);assert [s['tag'] for s in r['rule_set']]==['geosite-ads'];assert r['final']=='direct'" 2>"$TMP/e"; then
+  echo "PASS  路由含 禁BT + 拦广告 rule_set + final direct"; else echo "FAIL  route"; cat "$TMP/e"; fail=1; fi
+CFGNR="$(ANYTLS_OK=1 ENABLE_BLOCK_BT=0 ENABLE_BLOCK_ADS=0 render render_singbox_config)"
+if printf '%s' "$CFGNR" | python -c "import json,sys;assert 'route' not in json.load(sys.stdin)" 2>"$TMP/e"; then
+  echo "PASS  关闭 BT/ads 后无 route 段(仍合法 JSON)"; else echo "FAIL  route off"; cat "$TMP/e"; fail=1; fi
 
 echo
 echo "=== 4) 渲染 Clash 订阅 ==="
@@ -169,6 +175,17 @@ PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
 # 安装上下文是 set -euo pipefail, 看板渲染不能中断(qrencode 失败/缺失都该优雅降级)
 if PYTHON=python bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
+
+echo
+echo "=== 4g) backup 打包 ==="
+BK="$TMP/bktest"; rm -rf "$BK"; mkdir -p "$BK/sb" "$BK/out"
+echo 'HY2_PASSWORD=x' > "$BK/sb/secrets"; echo 'LIMIT_GB=200' > "$BK/env"; echo cert > "$BK/sb/server.crt"; echo key > "$BK/sb/server.key"
+PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="'"$BK"'/sb"; SECRETS="'"$BK"'/sb/secrets"; ENVFILE="'"$BK"'/env"; CF_ENV="'"$BK"'/sb/cf.env"; BACKUP_DIR="'"$BK"'/out"
+  do_backup >/dev/null 2>&1'
+bf="$(ls "$BK"/out/sing-box-backup-*.tar.gz 2>/dev/null | head -1)"
+if [ -n "$bf" ] && tar tzf "$bf" 2>/dev/null | grep -q 'secrets' && tar tzf "$bf" 2>/dev/null | grep -q 'server.key'; then
+  echo "PASS  backup 生成 tar.gz 且含 密钥/证书/参数"; else echo "FAIL  backup"; ls -la "$BK/out" 2>/dev/null; fail=1; fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
