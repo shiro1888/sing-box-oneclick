@@ -247,6 +247,45 @@ assert [s['tag'] for s in r['rule_set']]==['geosite-tiktok','geosite-spotify','g
   echo "PASS  WARP_SITES 自定义+清洗(去空格/大写/引号注入)"; else echo "FAIL  warp sites"; cat "$TMP/e"; fail=1; fi
 
 echo
+echo "=== 4i) 管理面板 admin(后端 + 面板页) ==="
+APY="./_sbadmin_test.py"
+PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ADMIN_PY="'"$APY"'" write_admin_py'
+if python -m py_compile "$APY" 2>"$TMP/e"; then echo "PASS  admin 后端 py_compile"; else echo "FAIL  admin py_compile"; cat "$TMP/e"; fail=1; fi
+if python - "$APY" <<'PYA' 2>"$TMP/e"
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("sbadmin",sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+calls=[]; m.run=lambda a,timeout=120:(calls.append(a) or (0,"ok"))
+# 校验拦截非法输入 + 命令注入尝试
+assert m.do_set({"limit_gb":"5.5.5"})["ok"] is False
+assert m.do_set({"count_mode":"x"})["ok"] is False
+assert m.do_set({"expire_at":"bad"})["ok"] is False
+assert m.do_set({})["ok"] is False
+assert m.do_set({"limit_gb":"200; rm -rf /"})["ok"] is False
+assert m.do_set({"limit_gb":"$(id)"})["ok"] is False
+# 合法 -> subprocess 参数数组(无 shell, 空格也是单参数)
+calls.clear()
+assert m.do_set({"limit_gb":"200","count_mode":"tx","expire_at":"2026-12-31 23:59:59 +0800"})["ok"] is True
+assert calls[0]==["bash","/etc/sing-box/install.sh","set","LIMIT_GB=200","COUNT_MODE=tx","EXPIRE_AT=2026-12-31 23:59:59 +0800"], calls
+# 动作白名单
+assert m.do_action({"action":"evil; rm -rf /"})["ok"] is False
+calls.clear(); assert m.do_action({"action":"restart"})["ok"] is True
+assert calls[0]==["bash","/etc/sing-box/install.sh","restart"], calls
+# 无 admin.env -> 空 token -> 鉴权一律拒绝
+assert m.TOKEN==""
+PYA
+then echo "PASS  admin 后端 校验/注入拦截/参数数组/白名单/空token拒绝"; else echo "FAIL  admin backend logic"; cat "$TMP/e"; fail=1; fi
+rm -f "$APY"; rm -rf ./__pycache__ 2>/dev/null
+ADMINHTML="$(render render_admin_html)"
+adm(){ if printf '%s' "$ADMINHTML" | grep -qF "$1"; then echo "PASS  面板含 $2"; else echo "FAIL  面板缺 $2"; fail=1; fi; }
+adm '__TOKEN__'   'token 占位(后端注入)'
+adm 'id="limit"'  '限额输入框'
+adm 'id="expire"' '到期输入框'
+adm '/api/set'    'set API 端点'
+adm 'X-Token'     'token 鉴权头'
+adm '127.0.0.1'   '仅本机访问说明'
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then

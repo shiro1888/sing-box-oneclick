@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -86,6 +86,13 @@ CRON=/etc/cron.d/traffic_limit
 SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
 CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
 WARP_ENV="$SB_DIR/warp.env"   # WARP 解锁状态(存在=已接入; 由 warp 子命令写入)
+# 管理面板(admin 子命令; 仅监听 127.0.0.1, 经 SSH 隧道访问, Token 鉴权)
+ADMIN_ENV="$SB_DIR/admin.env"           # ADMIN_TOKEN / ADMIN_PORT
+ADMIN_HTML="$SB_DIR/admin.html"          # 面板页(服务端注入 token 后下发)
+ADMIN_PY=/usr/local/bin/singbox-admin.py # 后端(python stdlib, 无 pip)
+ADMIN_INSTALL="$SB_DIR/install.sh"       # 供后端调用的 install.sh 副本
+ADMIN_PORT="${ADMIN_PORT:-8088}"
+ADMIN_RAW_URL="https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh"
 
 # 运行期填充(写成可被环境覆盖, 既不影响生产, 也便于测试渲染函数)
 PKG="${PKG:-}"; OS_ID="${OS_ID:-}"; PUBLIC_IP="${PUBLIC_IP:-}"; SUB_HOST="${SUB_HOST:-}"
@@ -766,6 +773,197 @@ sys.stdout.write(out)
 PY
 }
 
+# 管理面板页(可写: 改限额/到期/计费 + 重启/备份); __TOKEN__ 由后端注入。仅经 127.0.0.1+SSH隧道访问。
+render_admin_html() {
+  cat <<'HTML'
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>节点管理</title><style>
+:root{color-scheme:light dark}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0e1116;color:#e6e6e6;margin:0;padding:24px;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto}h1{font-size:1.4rem;margin:.2em 0}
+.muted{color:#8b949e;font-size:.9rem}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:14px 0}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0}
+label{min-width:70px;font-size:.9rem;color:#8b949e}
+input,select{background:#0d1117;color:#e6e6e6;border:1px solid #30363d;border-radius:6px;padding:7px 10px;font-size:.9rem}
+input[type=text]{min-width:260px}
+button{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:.9rem}
+button.sec{background:#21262d;border:1px solid #30363d;color:#e6e6e6}
+button:active{opacity:.7}
+.k{color:#8b949e;display:inline-block;min-width:84px}
+.warn{background:#3d1c1c;border-color:#5c2626;color:#ffb4b4}
+#msg{white-space:pre-wrap;font-size:.82rem;font-family:ui-monospace,monospace}
+.ok{color:#3fb950}.bad{color:#f85149}
+</style></head><body><div class="wrap">
+<h1>节点管理</h1>
+<p class="muted">仅本机 127.0.0.1，经 SSH 隧道访问；所有改动复用 <code>install.sh</code>。</p>
+<div class="card"><b>状态</b><div id="status" class="muted">加载中…</div></div>
+<div class="card"><b>改限额 / 到期 / 计费</b>
+<div class="row"><label>限额(GB)</label><input id="limit" type="number" min="0" step="0.5" placeholder="如 200"></div>
+<div class="row"><label>计费</label><select id="mode"><option value="">（不改）</option><option value="rx+tx">rx+tx（双向）</option><option value="tx">tx（仅出站）</option><option value="max">max（取大）</option></select></div>
+<div class="row"><label>到期</label><input id="expire" type="text" placeholder="YYYY-MM-DD HH:MM:SS +0800（留空不改）"></div>
+<div class="row"><button onclick="save()">保存并刷新流量头</button></div></div>
+<div class="card"><b>操作</b>
+<div class="row"><button class="sec" onclick="act('restart')">重启 sing-box / nginx</button>
+<button class="sec" onclick="act('backup')">立即备份（打包凭证）</button></div></div>
+<div class="card"><b>输出</b><div id="msg" class="muted">—</div></div>
+<div class="card warn">⚠️ 此页可改服务器配置。只应通过 SSH 隧道在你本机访问；Token 别外泄；这个端口已绑 127.0.0.1，<b>绝不要</b>暴露到公网。</div>
+</div><script>
+var TOKEN="__TOKEN__";
+function msg(t,cls){var m=document.getElementById('msg');m.textContent=t;m.className=cls||'muted';}
+function api(p,m,b){return fetch(p,{method:m||'GET',headers:{'X-Token':TOKEN,'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined}).then(function(r){return r.json();});}
+function fmtGB(b){return b==null?'—':(b/1073741824).toFixed(2)+' GB';}
+function loadStatus(){api('/api/status').then(function(s){
+var h='';
+h+='<div><span class="k">sing-box</span> '+(s.singbox?'<span class=ok>运行中</span>':'<span class=bad>已停</span>')+'</div>';
+h+='<div><span class="k">nginx</span> '+(s.nginx?'<span class=ok>运行中</span>':'<span class=bad>已停</span>')+'</div>';
+h+='<div><span class="k">限额</span> '+(s.limit_gb||'?')+' GB &nbsp;<span class="k">已用</span> '+fmtGB(s.used_bytes)+'</div>';
+h+='<div><span class="k">计费</span> '+(s.count_mode||'?')+' &nbsp;<span class="k">到期</span> '+(s.expire||'?')+'</div>';
+document.getElementById('status').innerHTML=h;
+if(s.limit_gb&&!document.getElementById('limit').value)document.getElementById('limit').value=s.limit_gb;
+}).catch(function(){document.getElementById('status').textContent='状态读取失败';});}
+function save(){var b={limit_gb:document.getElementById('limit').value.trim(),count_mode:document.getElementById('mode').value,expire_at:document.getElementById('expire').value.trim()};
+msg('保存中…');api('/api/set','POST',b).then(function(r){msg(r.msg||(r.ok?'已保存':'失败'),r.ok?'ok':'bad');if(r.ok)loadStatus();}).catch(function(){msg('请求失败','bad');});}
+function act(a){if(a==='restart'&&!confirm('确定重启服务?'))return;msg(a+' 执行中…');
+api('/api/action','POST',{action:a}).then(function(r){msg(r.msg||(r.ok?'完成':'失败'),r.ok?'ok':'bad');loadStatus();}).catch(function(){msg('请求失败','bad');});}
+loadStatus();
+</script></body></html>
+HTML
+}
+
+# 写管理面板后端(python stdlib, 无 pip): 仅绑 127.0.0.1, Token 鉴权, 白名单动作, subprocess 用参数数组(无 shell 注入)
+write_admin_py() {
+  cat >"$ADMIN_PY" <<'PYEOF'
+#!/usr/bin/env python3
+import json, os, re, hmac, subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+ADMIN_ENV = "/etc/sing-box/admin.env"
+HTML_PATH = "/etc/sing-box/admin.html"
+NODE_ENV  = "/etc/sing-box-node.env"
+HDR       = "/etc/nginx/snippets/sub_headers.conf"
+INSTALL   = "/etc/sing-box/install.sh"
+
+def load_env(p):
+    d = {}
+    try:
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                d[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return d
+
+CFG   = load_env(ADMIN_ENV)
+TOKEN = CFG.get("ADMIN_TOKEN", "")
+PORT  = int(CFG.get("ADMIN_PORT", "8088"))
+
+def run(args, timeout=120):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return 1, str(e)
+
+def svc(name):
+    return subprocess.run(["systemctl", "is-active", "--quiet", name]).returncode == 0
+
+def status():
+    env = load_env(NODE_ENV)
+    used = None
+    try:
+        m = re.search(r"download=(\d+)", open(HDR).read())
+        used = int(m.group(1)) if m else None
+    except Exception:
+        pass
+    return {"singbox": svc("sing-box"), "nginx": svc("nginx"),
+            "limit_gb": env.get("LIMIT_GB"), "expire": env.get("EXPIRE_AT"),
+            "count_mode": env.get("COUNT_MODE"), "used_bytes": used}
+
+def do_set(data):
+    args = []
+    lg = str(data.get("limit_gb", "")).strip()
+    cm = str(data.get("count_mode", "")).strip()
+    ex = str(data.get("expire_at", "")).strip()
+    if lg:
+        if not re.fullmatch(r"\d+(\.\d+)?", lg):
+            return {"ok": False, "msg": "限额必须是数字(如 200 或 0.5)"}
+        args.append("LIMIT_GB=" + lg)
+    if cm:
+        if cm not in ("rx+tx", "tx", "max"):
+            return {"ok": False, "msg": "计费只能 rx+tx / tx / max"}
+        args.append("COUNT_MODE=" + cm)
+    if ex:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}", ex):
+            return {"ok": False, "msg": "到期格式应为 'YYYY-MM-DD HH:MM:SS +0800'"}
+        args.append("EXPIRE_AT=" + ex)
+    if not args:
+        return {"ok": False, "msg": "没有要改的项"}
+    rc, out = run(["bash", INSTALL, "set"] + args)
+    return {"ok": rc == 0, "msg": out[-1200:] or ("已保存" if rc == 0 else "失败")}
+
+def do_action(data):
+    a = data.get("action", "")
+    if a in ("restart", "backup"):
+        rc, out = run(["bash", INSTALL, a])
+        return {"ok": rc == 0, "msg": out[-1200:] or ("完成" if rc == 0 else "失败")}
+    return {"ok": False, "msg": "未知操作"}
+
+class H(BaseHTTPRequestHandler):
+    def _auth(self):
+        q = parse_qs(urlparse(self.path).query)
+        tok = (q.get("token", [""])[0]) or self.headers.get("X-Token", "")
+        return bool(TOKEN) and hmac.compare_digest(tok, TOKEN)
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        b = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def do_GET(self):
+        if not self._auth():
+            return self._send(401, '{"error":"unauthorized"}')
+        path = urlparse(self.path).path
+        if path == "/":
+            try:
+                page = open(HTML_PATH, encoding="utf-8").read().replace("__TOKEN__", TOKEN)
+            except Exception:
+                return self._send(500, '{"error":"no admin.html"}')
+            return self._send(200, page, "text/html; charset=utf-8")
+        if path == "/api/status":
+            return self._send(200, json.dumps(status()))
+        return self._send(404, '{"error":"not found"}')
+    def do_POST(self):
+        if not self._auth():
+            return self._send(401, '{"error":"unauthorized"}')
+        path = urlparse(self.path).path
+        ln = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(ln) if ln else b""
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            data = {}
+        if path == "/api/set":
+            return self._send(200, json.dumps(do_set(data)))
+        if path == "/api/action":
+            return self._send(200, json.dumps(do_action(data)))
+        return self._send(404, '{"error":"not found"}')
+    def log_message(self, *a):
+        pass
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PYEOF
+  chmod 700 "$ADMIN_PY"
+}
+
 render_header() {
   LIMIT_GB="$LIMIT_GB" EXPIRE_AT_VAL="$1" "$PY" - <<'PY'
 import os, datetime
@@ -1134,6 +1332,7 @@ print_summary() {
   printf '    备份/迁移:   bash install.sh backup   (新机: bash install.sh restore <文件>)\n'
   printf '    SSH 加固:    bash install.sh harden   (密钥登录+禁密码+fail2ban)\n'
   printf '    WARP 解锁:   bash install.sh warp      (关闭: warp off)\n'
+  printf '    网页管理:    bash install.sh admin     (仅本机, SSH隧道访问)\n'
   printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
   printf '    装探针:      KOMARI_ENDPOINT=.. KOMARI_TOKEN=.. bash install.sh komari\n'
   printf '    卸载:        bash install.sh uninstall\n'
@@ -1225,6 +1424,62 @@ EOF
   curl -fsSL https://raw.githubusercontent.com/komari-monitor/komari-agent/main/install.sh \
     | bash -s -- -e "$KOMARI_ENDPOINT" -t "$KOMARI_TOKEN" || die "Komari agent 安装失败(检查面板地址/token/网络)"
   systemctl is-active komari-agent >/dev/null 2>&1 && ok "komari-agent 运行中, 去面板看应该上线了" || warn "komari-agent 未在运行, 看 'systemctl status komari-agent'"
+}
+
+do_admin() {
+  [ -f "$SECRETS" ] || die "请先安装(bash install.sh)再开管理面板"
+  command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
+  command -v python3   >/dev/null 2>&1 || die "需要 python3"
+  # shellcheck disable=SC1090
+  . "$SECRETS" 2>/dev/null || true; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+
+  if [ "${1:-}" = "off" ]; then
+    systemctl disable --now singbox-admin >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/singbox-admin.service "$ADMIN_PY" "$ADMIN_HTML" "$ADMIN_ENV" "$ADMIN_INSTALL" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "管理面板已停止并移除(install.sh 副本、token、服务都清掉了)"
+    return 0
+  fi
+
+  [ -n "${SUB_HOST:-}" ] || { SOFT_DETECT=1 detect_net; SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"; }
+  # token + 端口(复用已有 token, 避免每次换)
+  [ -f "$ADMIN_ENV" ] && . "$ADMIN_ENV" 2>/dev/null || true
+  local token; token="${ADMIN_TOKEN:-$(openssl rand -hex 24)}"
+  ( umask 077; printf 'ADMIN_TOKEN=%s\nADMIN_PORT=%s\n' "$token" "$ADMIN_PORT" >"$ADMIN_ENV" )
+
+  # 后端要调用的 install.sh 副本: 优先复制自身, 管道运行(curl|bash)则从仓库下载
+  local self; self="$(readlink -f "$0" 2>/dev/null || true)"
+  if [ -n "$self" ] && [ -f "$self" ]; then cp -f "$self" "$ADMIN_INSTALL"
+  else log "当前是管道运行, 从仓库拉一份 install.sh 给后端用..."; curl -fsSL "$ADMIN_RAW_URL" -o "$ADMIN_INSTALL" || die "无法获取 install.sh 副本"; fi
+  chmod 700 "$ADMIN_INSTALL"
+
+  render_admin_html >"$ADMIN_HTML"; chmod 600 "$ADMIN_HTML"
+  write_admin_py
+  "$PY" -m py_compile "$ADMIN_PY" || die "管理后端 python 语法错误(不应发生, 请反馈)"
+
+  cat >/etc/systemd/system/singbox-admin.service <<EOF
+[Unit]
+Description=sing-box admin panel (localhost only, token auth)
+After=network.target
+[Service]
+ExecStart=$(command -v python3) $ADMIN_PY
+Restart=on-failure
+NoNewPrivileges=no
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now singbox-admin >/dev/null 2>&1 || die "管理面板服务启动失败(看 journalctl -u singbox-admin)"
+  systemctl is-active singbox-admin >/dev/null 2>&1 || die "管理面板未在运行(看 journalctl -u singbox-admin)"
+
+  ok "管理面板已启动(仅监听 127.0.0.1:$ADMIN_PORT, 不暴露公网)"
+  echo
+  echo "  ① 在你【本机电脑】开 SSH 隧道:"
+  echo "       ssh -L $ADMIN_PORT:127.0.0.1:$ADMIN_PORT root@${SUB_HOST:-你的服务器IP}"
+  echo "  ② 浏览器打开(带 token):"
+  echo "       http://127.0.0.1:$ADMIN_PORT/?token=$token"
+  echo
+  warn "Token 等于管理密码, 别外泄。这个端口已绑 127.0.0.1, 绝不要改成 0.0.0.0 暴露公网。关闭: bash install.sh admin off"
 }
 
 do_backup() {
@@ -1456,7 +1711,7 @@ do_menu() {
     echo "  p) 看板页地址            k) 装 Komari 探针"
     echo "  b) 备份                  r) 恢复(迁移)"
     echo "  h) SSH 加固(密钥登录)    w) WARP 解锁分流"
-    echo "  d) doctor 自检(常见坑)"
+    echo "  d) doctor 自检(常见坑)   a) 管理面板(localhost)"
     printf '  选择: '
     read -r c || break
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
@@ -1481,6 +1736,7 @@ do_menu() {
       h|H) ( do_harden ) || true ;;
       w|W) ( do_warp ) || true ;;
       d|D) ( do_doctor ) || true ;;
+      a|A) ( do_admin ) || true ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -1512,6 +1768,11 @@ do_uninstall() {
   rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt "$WWW"/panel-*.html 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅/看板文件
   rm -f /run/sing-box-quota-stopped 2>/dev/null || true
   rm -f "$WARP_ENV" 2>/dev/null || true   # WARP 分流状态(wgcf 二进制保留, 无害)
+  if [ -f /etc/systemd/system/singbox-admin.service ]; then   # 管理面板
+    systemctl disable --now singbox-admin >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/singbox-admin.service "$ADMIN_PY" "$ADMIN_HTML" "$ADMIN_ENV" "$ADMIN_INSTALL" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   if [ -f "$CF_ENV" ]; then
     cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
     rm -f "$CF_ENV" 2>/dev/null || true
@@ -1759,10 +2020,11 @@ main() {
     restart)   do_restart ;;
     cf)        do_cf ;;
     warp)      shift; do_warp "$@" ;;
+    admin)     shift; do_admin "$@" ;;
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 
