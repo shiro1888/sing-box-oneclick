@@ -116,11 +116,16 @@ validate_inputs() {
     [[ "$HY2_HOP_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "HY2_HOP_RANGE 须为 起-止(如 20000-50000): '$HY2_HOP_RANGE'"
     local hs="${HY2_HOP_RANGE%-*}" he="${HY2_HOP_RANGE#*-}"
     { [ "$hs" -ge 1 ] && [ "$he" -le 65535 ] && [ "$hs" -lt "$he" ]; } || die "HY2_HOP_RANGE 端口段非法(1-65535 且 起<止): '$HY2_HOP_RANGE'"
+    local op   # 端口段不能盖住正在监听的 UDP 端口(HY2/SS), 否则会把它也重定向到 HY2
+    for op in "$HY2_PORT" "$SS_PORT"; do
+      { [ "$op" -ge "$hs" ] && [ "$op" -le "$he" ]; } && die "HY2_HOP_RANGE($HY2_HOP_RANGE) 覆盖了 UDP 端口 $op, 会把它也重定向到 HY2; 请让端口段避开 HY2_PORT/SS_PORT"
+    done
   fi
   local v
   for v in "$HY2_UP" "$HY2_DOWN"; do
     [ -z "$v" ] || case "$v" in *[!0-9]*) die "HY2_UP/HY2_DOWN 要是数字(Mbps): '$v'";; esac
   done
+  [ -z "$OBFS_PASSWORD" ] || case "$OBFS_PASSWORD" in *[!A-Za-z0-9]*) die "OBFS_PASSWORD 只能含字母数字: '$OBFS_PASSWORD'";; esac
 }
 
 detect_os() {
@@ -523,9 +528,12 @@ out = []
 hy2q = f"insecure=1&sni={q(tls)}"
 if os.environ.get("OBFS_PASSWORD", ""):
     hy2q += f"&obfs=salamander&obfs-password={q(os.environ['OBFS_PASSWORD'])}"
-if os.environ.get("HY2_HOP_RANGE", ""):
-    hy2q += f"&mport={os.environ['HY2_HOP_RANGE']}"
-out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{os.environ['HY2_PORT']}/?{hy2q}#{q('Hysteria2')}")
+hop = os.environ.get("HY2_HOP_RANGE", "")
+# 端口跳跃: 端口段写进 authority(官方 URI 规范, mihomo/标准解析认), 再附 mport 兼容 NekoBox 系
+hy2_port = hop if hop else os.environ["HY2_PORT"]
+if hop:
+    hy2q += f"&mport={hop}"
+out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{hy2_port}/?{hy2q}#{q('Hysteria2')}")
 if os.environ["ANYTLS_OK"] == "1":
     out.append(f"anytls://{q(os.environ['ANYTLS_PASSWORD'])}@{ip}:{os.environ['ANYTLS_PORT']}/?insecure=1&sni={q(tls)}#{q('AnyTLS')}")
 vq = u.urlencode({'encryption':'none','flow':'xtls-rprx-vision','security':'reality',
@@ -776,7 +784,7 @@ net.core.somaxconn=4096
 # 跨境/隧道 MTU 黑洞探测; 空闲后不重置拥塞窗口(代理常空闲后突发)
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
-# TCP Fast Open + TIME_WAIT 复用(代理出站连接多)
+# TCP Fast Open + TIME_WAIT 复用(代理出站连接多; 若在 CGNAT/有状态NAT后偶发出站卡顿, 去掉 tw_reuse 这行)
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
 EOF
@@ -814,7 +822,7 @@ delete table inet sb_hophy2
 table inet sb_hophy2 {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
-    udp dport ${hs}-${he} redirect to :${HY2_PORT}
+    iifname "${INTERFACE:-eth0}" udp dport ${hs}-${he} redirect to :${HY2_PORT}
   }
 }
 EOF

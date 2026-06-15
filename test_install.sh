@@ -148,7 +148,9 @@ if printf '%s' "$CFGO" | python -c "import json,sys;h=[i for i in json.load(sys.
 SUBO="$(ANYTLS_OK=1 OBFS_PASSWORD=obfspw HY2_HOP_RANGE=20000-50000 HY2_UP=50 HY2_DOWN=200 render render_subscription_yaml)"
 if printf '%s' "$SUBO" | python -c "import yaml,sys;h=[p for p in yaml.safe_load(sys.stdin)['proxies'] if p['name']=='Hysteria2'][0];assert h['obfs']=='salamander' and h['obfs-password']=='obfspw' and h['ports']=='20000-50000' and h['up']=='50 Mbps' and h['down']=='200 Mbps'" 2>"$TMP/e"; then echo "PASS  Clash HY2 节点含 obfs/ports/up/down"; else echo "FAIL  hy2 订阅选项"; cat "$TMP/e"; fail=1; fi
 LNKO="$(ANYTLS_OK=1 OBFS_PASSWORD=obfspw HY2_HOP_RANGE=20000-50000 render render_share_links)"
-if printf '%s' "$LNKO" | grep -qE '^hysteria2://.*obfs=salamander.*mport=20000-50000'; then echo "PASS  HY2 链接含 obfs+mport"; else echo "FAIL  hy2 链接选项"; fail=1; fi
+if printf '%s' "$LNKO" | grep -qE '^hysteria2://[^@]+@1\.2\.3\.4:20000-50000/\?.*obfs=salamander.*mport=20000-50000'; then echo "PASS  HY2 链接: 端口段进 authority + obfs + mport"; else echo "FAIL  hy2 链接选项"; printf '%s\n' "$LNKO" | grep hysteria2; fail=1; fi
+# 端口段覆盖正在监听的 UDP 端口(SS_PORT=4435 / HY2_PORT=4433)应被 validate 拒绝
+if env HY2_HOP_RANGE=4000-5000 PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; validate_inputs' >/dev/null 2>&1; then echo "FAIL  端口段覆盖 UDP 端口应被拒"; fail=1; else echo "PASS  端口段覆盖 HY2/SS 端口被拒"; fi
 NOO="$(ANYTLS_OK=1 render render_subscription_yaml)"
 if printf '%s' "$NOO" | grep -qE 'obfs|ports:| up:'; then echo "FAIL  默认却出现 obfs/ports/up"; fail=1; else echo "PASS  默认无 obfs/端口跳跃/brutal(条件渲染正确)"; fi
 
