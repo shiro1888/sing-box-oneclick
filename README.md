@@ -38,9 +38,39 @@ sudo bash install.sh
 
 装完会打印**订阅 URL**和**需要你手动完成的清单**。把订阅 URL 导入 Clash/Mihomo 即可。
 
-> 系统要求：**需 systemd**（非 systemd 系统如 Alpine/OpenRC 不支持，脚本会直接报错而不会装坏）。Debian/Ubuntu 完整支持；RHEL 系（dnf/yum）尽力支持，会自动尝试启用 EPEL 装 vnstat，nginx 若有其它站点占用可能需手动处理（脚本会给提示）。需以 root 运行。
+> 机器/系统要求见下方「机器要求」一节（一句话：**1 核 / 512MB / KVM / Debian 12 或 Ubuntu 22** 就够用且满血）。
 >
 > ⚠️ 这是 `curl | bash` 跑一个会以 root 执行的脚本，且脚本内部还会再 `curl | sh` 跑 sing-box 官方安装脚本。**建议先 `wget` 下来读一遍再运行**，不要无脑信任任何一键脚本（包括本脚本）。详见下方「安全须知与取舍」。
+
+---
+
+## 机器要求
+
+proxy 的瓶颈是带宽，不是 CPU/内存，所以对机器要求很低。
+
+**硬性要求（不满足装不了/用不了）**
+- **systemd**：脚本开头检查 `systemctl`，没有直接报错退出 → **Alpine/OpenRC 不支持**。
+- **root** 权限。
+- **架构**：`x86_64`（amd64）或 `aarch64`（arm64）。
+- **公网 IPv4**（直连节点需要）；纯 IPv6 机子要手动传 `PUBLIC_IP=` 且有坑。
+- 能联网（下载 sing-box、geo 数据）。
+
+**系统**
+- **最佳**：Debian 12+ / Ubuntu 22.04+（完整支持）。
+- RHEL 系（CentOS/Alma/Rocky，dnf/yum）尽力支持：自动启用 EPEL 装 vnstat，nginx 若有其它站点占用可能需手动处理（脚本会提示）。
+
+**配置**
+| | 最低能跑 | 推荐 |
+|---|---|---|
+| CPU | 1 vCPU | 1 vCPU |
+| 内存 | 256MB | 512MB+ |
+| 磁盘 | ~2GB 空闲 | 5GB+ |
+
+sing-box 本体才占 ~20–50MB 内存。一台 **1 核 / 512MB / 10GB 的最便宜小鸡绰绰有余**，256MB 也能跑。
+
+**虚拟化（影响「网络优化」，不影响能不能用）**
+- **KVM**：完整支持，BBR / 16MB UDP 大缓冲 / 端口跳跃全部生效。
+- **容器型（OpenVZ/LXC）**：核心 4 协议能跑，但共享宿主内核 → BBR 可能改不了、`net.core.rmem_max` 等 sysctl 可能被限制（HY2 大缓冲提速用不上）、端口跳跃（nftables NAT）可能不被允许。这些都做了**非致命处理**（失败只告警、不影响装和直连），但想要满血网络优化请选 **KVM**。
 
 ---
 
