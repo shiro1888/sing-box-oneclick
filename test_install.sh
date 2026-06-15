@@ -155,6 +155,20 @@ NOO="$(ANYTLS_OK=1 render render_subscription_yaml)"
 if printf '%s' "$NOO" | grep -qE 'obfs|ports:| up:'; then echo "FAIL  默认却出现 obfs/ports/up"; fail=1; else echo "PASS  默认无 obfs/端口跳跃/brutal(条件渲染正确)"; fi
 
 echo
+echo "=== 4f) 可视化看板页渲染 ==="
+PANEL="$(SUB_HOST=1.2.3.4 SUB_PATH=/sub-x.yaml SUB_B64_PATH=/sub-b64-x.txt ANYTLS_OK=1 AIRPORT_NAME=MyNode render render_panel_html)"
+chkp() { if printf '%s' "$PANEL" | grep -qF "$1"; then echo "PASS  看板含 $2"; else echo "FAIL  看板缺 $2"; fail=1; fi; }
+chkp '<!doctype html>'    'HTML 结构'
+chkp '1.2.3.4/sub-x.yaml' 'Clash 订阅 URL'
+chkp 'sub-b64-x.txt'      '通用订阅 URL'
+chkp 'SS2022'             'SS2022 节点'
+chkp '含全部节点凭证'      '明文安全警告'
+chkp 'navigator.clipboard' '复制 JS'
+if printf '%s' "$PANEL" | grep -qF 'CF-Vless'; then echo "FAIL  未开CF看板却有CF-Vless"; fail=1; else echo "PASS  未开CF看板无CF-Vless(条件渲染)"; fi
+PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=u render render_panel_html)"
+if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then

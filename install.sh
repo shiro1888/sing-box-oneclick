@@ -5,8 +5,10 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|links|status|set|update|restart|cf|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|links|status|set|update|restart|cf|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
+#    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
+#    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
 #
 #  常用环境变量(可选,覆盖默认):
 #    LIMIT_GB=200            每月显示/限流额度
@@ -62,6 +64,8 @@ TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
 ENABLE_OBFS="${ENABLE_OBFS:-1}"      # HY2 salamander 混淆(默认开, 抗 QUIC 识别; 0 关)
+KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"  # Komari 探针面板地址(install.sh komari 用)
+KOMARI_TOKEN="${KOMARI_TOKEN:-}"        # Komari 节点 token
 HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"   # HY2 端口跳跃 UDP 段(如 20000-50000, 空=不启用; 需 nftables+云安全组放行整段)
 HY2_UP="${HY2_UP:-}"                 # HY2 brutal 上行 Mbps(空=自适应; 设了即开暴力模式, 要填你真实带宽)
 HY2_DOWN="${HY2_DOWN:-}"             # HY2 brutal 下行 Mbps(同上)
@@ -88,6 +92,7 @@ REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"; REALITY_PUBLIC_KEY="${REALITY_PU
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
 SUB_B64_PATH="${SUB_B64_PATH:-}"   # 通用(base64)订阅路径(供 v2rayN 等; gen_secrets 生成)
 OBFS_PASSWORD="${OBFS_PASSWORD:-}" # HY2 obfs 密码(非空=启用 obfs; gen_secrets 生成)
+PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secrets 生成)
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
 
@@ -231,6 +236,10 @@ gen_secrets() {
       SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
       printf 'SUB_B64_PATH=%s\n' "$SUB_B64_PATH" >>"$SECRETS"
     fi
+    if [ -z "${PANEL_PATH:-}" ]; then    # 旧版无看板页, 升级时补一个
+      PANEL_PATH="/panel-$(openssl rand -hex 8).html"
+      printf 'PANEL_PATH=%s\n' "$PANEL_PATH" >>"$SECRETS"
+    fi
     if [ -z "${OBFS_PASSWORD:-}" ] && [ "$ENABLE_OBFS" = 1 ]; then  # 升级开启 HY2 obfs
       OBFS_PASSWORD="$(openssl rand -hex 12)"
       printf 'OBFS_PASSWORD=%s\n' "$OBFS_PASSWORD" >>"$SECRETS"
@@ -248,6 +257,7 @@ gen_secrets() {
   REALITY_SHORT_ID="$(openssl rand -hex 8)"
   SUB_PATH="/sub-$(openssl rand -hex 8).yaml"
   SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
+  PANEL_PATH="/panel-$(openssl rand -hex 8).html"
   SS_PASSWORD="$(gen_ss_password)"
   [ "$ENABLE_OBFS" = 1 ] && OBFS_PASSWORD="$(openssl rand -hex 12)"
   ( umask 077
@@ -260,6 +270,7 @@ REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
 REALITY_SHORT_ID=$REALITY_SHORT_ID
 SUB_PATH=$SUB_PATH
 SUB_B64_PATH=$SUB_B64_PATH
+PANEL_PATH=$PANEL_PATH
 SS_PASSWORD="$SS_PASSWORD"
 OBFS_PASSWORD=$OBFS_PASSWORD
 EOF
@@ -552,6 +563,59 @@ sys.stdout.write("\n".join(out) + "\n")
 PY
 }
 
+# 自包含可视化看板页(只读: 看订阅/扫码/复制; 服务器管理仍走 SSH)
+render_panel_html() {
+  local clash_url="http://$SUB_HOST$SUB_PATH" b64_url="http://$SUB_HOST$SUB_B64_PATH"
+  local qr_clash="" qr_b64=""
+  if command -v qrencode >/dev/null 2>&1; then
+    qr_clash="$(qrencode -t PNG -o - "$clash_url" 2>/dev/null | base64 -w0)"
+    qr_b64="$(qrencode -t PNG -o - "$b64_url" 2>/dev/null | base64 -w0)"
+  fi
+  local nodes="Hysteria2"
+  [ "$ANYTLS_OK" = 1 ] && nodes="$nodes,AnyTLS"
+  nodes="$nodes,Vless,SS2022"
+  [ -n "$CF_HOSTNAME" ] && nodes="$nodes,CF-Vless"
+  AIRPORT_NAME="$AIRPORT_NAME" CLASH_URL="$clash_url" B64_URL="$b64_url" \
+  QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODES="$nodes" \
+  "$PY" - <<'PY'
+import os, html, sys
+e = html.escape
+name = e(os.environ.get("AIRPORT_NAME", "Node"))
+clash = e(os.environ["CLASH_URL"]); b64 = e(os.environ["B64_URL"])
+def qr(data): return f'<img class="qr" alt="QR" src="data:image/png;base64,{data}">' if data else '<span class="muted">(装 qrencode 可显示二维码)</span>'
+chips = "".join(f"<span>{e(n)}</span>" for n in os.environ["NODES"].split(","))
+out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name} 订阅</title><style>
+:root{{color-scheme:dark}}
+body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0e1116;color:#e6e6e6;margin:0;padding:24px;line-height:1.6}}
+.wrap{{max-width:760px;margin:0 auto}} h1{{font-size:1.4rem;margin:.2em 0}}
+.muted{{color:#8b949e;font-size:.9rem}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:14px 0}}
+.row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
+code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;word-break:break-all;flex:1;min-width:200px;font-size:.82rem}}
+button{{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:.85rem}} button:active{{opacity:.7}}
+img.qr{{background:#fff;padding:8px;border-radius:8px;width:170px;height:170px;margin-top:12px}}
+.nodes span{{display:inline-block;background:#21262d;border:1px solid #30363d;border-radius:20px;padding:4px 12px;margin:3px;font-size:.85rem}}
+.warn{{background:#3d1c1c;border-color:#5c2626;color:#ffb4b4}}
+</style></head><body><div class="wrap">
+<h1>{name} 节点订阅</h1>
+<p class="muted">导入下面任一订阅；手机可直接扫码。</p>
+<div class="card"><b>Clash / Mihomo 订阅</b>
+<div class="row"><code id="u1">{clash}</code><button onclick="cp('u1')">复制</button></div>
+{qr(os.environ.get("QR_CLASH",""))}</div>
+<div class="card"><b>通用订阅（v2rayN / Shadowrocket / NekoBox）</b>
+<div class="row"><code id="u2">{b64}</code><button onclick="cp('u2')">复制</button></div>
+{qr(os.environ.get("QR_B64",""))}</div>
+<div class="card"><b>节点</b><div class="nodes">{chips}</div></div>
+<div class="card warn">⚠️ 此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</div>
+<p class="muted">管理（改限额 / 更新 / 加节点）请用 SSH：<code>bash install.sh menu</code></p>
+</div><script>function cp(i){{navigator.clipboard.writeText(document.getElementById(i).textContent)}}</script>
+</body></html>'''
+sys.stdout.write(out)
+PY
+}
+
 render_header() {
   LIMIT_GB="$LIMIT_GB" EXPIRE_AT_VAL="$1" "$PY" - <<'PY'
 import os, datetime
@@ -581,6 +645,10 @@ write_subscription() {
   if [ -n "${SUB_B64_PATH:-}" ]; then   # 通用订阅: 各节点分享链接的 base64, 供 v2rayN/Shadowrocket/NekoBox 等
     render_share_links | base64 -w0 >"$WWW$SUB_B64_PATH"
     chmod 644 "$WWW$SUB_B64_PATH"
+  fi
+  if [ -n "${PANEL_PATH:-}" ]; then     # 可视化看板页(订阅+二维码+节点)
+    render_panel_html >"$WWW$PANEL_PATH"
+    chmod 644 "$WWW$PANEL_PATH"
   fi
 }
 
@@ -612,6 +680,11 @@ server {
     location = $SUB_B64_PATH {
         include $NGINX_SNIPPET;
         default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location = $PANEL_PATH {
+        default_type text/html;
         try_files \$uri =404;
     }
 
@@ -893,6 +966,7 @@ print_summary() {
   printf '  订阅名称:         %s\n' "$AIRPORT_NAME"
   printf '  Clash/Mihomo 订阅: %s\n' "$sub_url"
   [ -n "${SUB_B64_PATH:-}" ] && printf '  通用(base64)订阅:  http://%s%s   (v2rayN/Shadowrocket/NekoBox)\n' "$SUB_HOST" "$SUB_B64_PATH"
+  [ -n "${PANEL_PATH:-}" ]   && printf '  可视化看板页:      http://%s%s   (浏览器打开, 看订阅+扫码+复制)\n' "$SUB_HOST" "$PANEL_PATH"
   echo
   printf '  节点(客户端里显示名):\n'
   printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
@@ -903,8 +977,10 @@ print_summary() {
   echo
   printf '  管理命令:\n'
   printf '    查看信息:    bash install.sh info\n'
+  printf '    看板页地址:  bash install.sh panel\n'
   printf '    分享链接:    bash install.sh links\n'
   printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
+  printf '    装探针:      KOMARI_ENDPOINT=.. KOMARI_TOKEN=.. bash install.sh komari\n'
   printf '    卸载:        bash install.sh uninstall\n'
 
   echo
@@ -957,6 +1033,35 @@ do_links() {
   else
     echo "(无通用订阅路径, 重跑 install 升级后即可生成二维码)"
   fi
+}
+
+do_panel() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  # shellcheck disable=SC1090
+  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true; [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
+  [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
+  SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
+  [ -n "${PANEL_PATH:-}" ] || die "本安装无看板页, 重跑 install 升级后生成"
+  mkdir -p "$WWW"; chmod 755 "$WWW"
+  render_panel_html >"$WWW$PANEL_PATH"; chmod 644 "$WWW$PANEL_PATH"
+  ok "可视化看板页: http://$SUB_HOST$PANEL_PATH"
+  echo "  浏览器打开即可看两种订阅 + 扫码导入 + 一键复制; 手机扫码最方便。"
+}
+
+do_komari() {
+  if [ -z "${KOMARI_ENDPOINT:-}" ] || [ -z "${KOMARI_TOKEN:-}" ]; then
+    cat <<EOF
+安装 Komari 探针 agent 需要面板地址 + 节点 token(在你的 Komari 面板「添加服务器」时给出):
+  KOMARI_ENDPOINT='https://你的komari面板' KOMARI_TOKEN='节点token' bash install.sh komari
+EOF
+    die "缺少 KOMARI_ENDPOINT 或 KOMARI_TOKEN"
+  fi
+  case "$KOMARI_ENDPOINT" in http://*|https://*) ;; *) die "KOMARI_ENDPOINT 要带 http:// 或 https://: $KOMARI_ENDPOINT";; esac
+  log "安装 Komari 探针 agent(官方 install.sh, 透传 -e 端点 / -t token)..."
+  curl -fsSL https://raw.githubusercontent.com/komari-monitor/komari-agent/main/install.sh \
+    | bash -s -- -e "$KOMARI_ENDPOINT" -t "$KOMARI_TOKEN" || die "Komari agent 安装失败(检查面板地址/token/网络)"
+  systemctl is-active komari-agent >/dev/null 2>&1 && ok "komari-agent 运行中, 去面板看应该上线了" || warn "komari-agent 未在运行, 看 'systemctl status komari-agent'"
 }
 
 do_status() {
@@ -1037,6 +1142,7 @@ do_menu() {
     echo "  5) 改参数(限额/到期)     6) 更新 sing-box"
     echo "  7) 加 CF 大保底(第5节点) 8) 重启服务"
     echo "  9) 卸载                  0) 退出"
+    echo "  p) 看板页地址            k) 装 Komari 探针"
     printf '  选择: '
     read -r c || break
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
@@ -1053,6 +1159,9 @@ do_menu() {
          if [ -n "${t:-}" ] && [ -n "${h:-}" ]; then ( CF_TOKEN="$t" CF_HOSTNAME="$h" do_cf ) || true; else echo "  已取消(token/域名为空)"; fi ;;
       8) ( do_restart ) || true ;;
       9) ( do_uninstall ) || true ;;
+      p|P) ( do_panel ) || true ;;
+      k|K) printf '  KOMARI_ENDPOINT: '; read -r ke || true; printf '  KOMARI_TOKEN: '; read -r kt || true
+           if [ -n "${ke:-}" ] && [ -n "${kt:-}" ]; then ( KOMARI_ENDPOINT="$ke" KOMARI_TOKEN="$kt" do_komari ) || true; else echo "  已取消"; fi ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -1080,7 +1189,8 @@ do_uninstall() {
   rm -f "$ENVFILE" "$TRAFFIC_PY" "$CRON" "$NGINX_SNIPPET" "$NGINX_CONF" 2>/dev/null || true
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
   [ -n "${SUB_B64_PATH:-}" ] && rm -f "$WWW$SUB_B64_PATH" 2>/dev/null || true
-  rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅文件
+  [ -n "${PANEL_PATH:-}" ] && rm -f "$WWW$PANEL_PATH" 2>/dev/null || true
+  rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt "$WWW"/panel-*.html 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅/看板文件
   rm -f /run/sing-box-quota-stopped 2>/dev/null || true
   if [ -f "$CF_ENV" ]; then
     cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
@@ -1204,15 +1314,17 @@ main() {
   case "${1:-install}" in
     install)   do_install ;;
     info)      do_info ;;
+    panel)     do_panel ;;
     links)     do_links ;;
     status)    do_status ;;
     set)       shift; do_set "$@" ;;
     update)    do_update ;;
     restart)   do_restart ;;
     cf)        do_cf ;;
+    komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|links|status|set|update|restart|cf|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|links|status|set|update|restart|cf|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 

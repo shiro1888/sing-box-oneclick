@@ -11,6 +11,8 @@
 - **四协议**：Hysteria2（UDP，快）、AnyTLS（TCP，兼容好）、VLESS-Reality-Vision（TCP，稳/隐蔽）、Shadowsocks-2022（TCP+UDP，简单快，指纹不同的备选）。
 - **零交互**：自动装依赖与 sing-box、自动生成全部密钥、自动探测公网 IP 和网卡。
 - **多格式订阅**：Clash/Mihomo（YAML）+ 通用 base64 订阅（v2rayN / Shadowrocket / NekoBox 等）两个 URL；`install.sh links` 还能单独打印每个节点的分享链接（`vless://` / `hysteria2://` / `anytls://` / `ss://`）。
+- **可视化看板页**：装完给一个 `http://<IP>/panel-xxxx.html`，浏览器打开看两种订阅 + 二维码 + 节点列表，一键复制、手机扫码导入；只读（服务器管理走 SSH）。
+- **Komari 探针**：`install.sh komari` 傻瓜式装 [Komari](https://github.com/komari-monitor/komari) 监控 agent（可选，与代理无关）。
 - **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
 - **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
@@ -113,14 +115,27 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 ```bash
 sudo bash install.sh menu        # 交互菜单(把下面所有功能串起来, 不想记命令就用它)
 sudo bash install.sh info        # 重新打印订阅 URL 和节点信息
+sudo bash install.sh panel       # 打印可视化看板页地址(浏览器看订阅+扫码+复制)
 sudo bash install.sh links       # 打印每个节点分享链接 + 两个订阅 URL(+ 二维码)
 sudo bash install.sh status      # 状态体检: 服务/配置/端口/时间/证书/限额/订阅可达
 sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/网卡, 即时刷新流量头
 sudo bash install.sh update      # 更新 sing-box 到最新版并重启
 sudo bash install.sh restart     # 重启 sing-box / nginx (/ cloudflared)
 sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf    # 接入可选第 5 节点 CF-Vless(见第 3 节)
+sudo KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token bash install.sh komari   # 装 Komari 探针 agent
 sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认；删前自动备份密钥）
 ```
+
+### 可视化看板页
+装完会多打印一个**看板页地址** `http://<IP>/panel-xxxx.html`，浏览器打开就是一个自包含页面：两种订阅 URL（一键复制）+ 二维码（手机扫码直接导入）+ 节点列表。随时 `install.sh panel` 重新拿地址。
+> 它是**只读**的（看/复制/扫码），**不在网页上操作服务器**——管理（改限额/更新/加节点）一律走 SSH 的 `install.sh menu`，因为把 root 级操作暴露在 HTTP 网页上是安全红线。看板页**含全部节点凭证、走明文 HTTP**，和订阅一样：随机路径、别外传、不可信网络上 HTTPS。
+
+### Komari 探针 agent（可选，服务器监控）
+和代理无关，是给你的 [Komari](https://github.com/komari-monitor/komari) 监控面板上报本机状态的。在 Komari 面板「添加服务器」拿到**面板地址 + 节点 token** 后：
+```bash
+sudo KOMARI_ENDPOINT='https://你的komari面板' KOMARI_TOKEN='节点token' bash install.sh komari
+```
+脚本调用 Komari 官方 `install.sh`（透传 `-e` 端点 / `-t` token）装好 agent 并起 systemd 服务。卸载本脚本**不会**动 komari-agent（独立工具，用它自己的方式卸）。
 
 - `set` 可改的键：`LIMIT_GB`（每月额度 GB）、`EXPIRE_AT`（到期，四位时区如 `+0800`）、`COUNT_MODE`（`rx+tx`/`tx`/`max`）、`INTERFACE`（统计网卡）。改完即时重写流量头，客户端下次拉订阅就生效。
 - `links` 若装了 `qrencode`（依赖里已含），会顺带打印通用订阅的二维码，手机扫码即导入。
@@ -189,6 +204,7 @@ sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh c
 /etc/sing-box-node.env             运行参数单一来源 (600)
 /var/www/html/sub-xxxx.yaml        Clash/Mihomo 订阅(644，含凭证，见安全须知)
 /var/www/html/sub-b64-xxxx.txt     通用(base64)订阅(644，含凭证，供 v2rayN 等)
+/var/www/html/panel-xxxx.html      可视化看板页(644，含凭证)
 /etc/nginx/conf.d/00-singbox-sub.conf   订阅 server 块(仅 server 块；流量头单独在 snippets 内、只对订阅 location include，首页/404 不带头)
 /etc/nginx/snippets/sub_headers.conf    流量头(只挂订阅路径)
 /usr/local/bin/traffic_limit.py    流量统计/限流
