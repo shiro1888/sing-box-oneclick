@@ -5,7 +5,7 @@
 cd "$(dirname "$0")" || exit 1
 # MSYS2_ENV_CONV_EXCL: 阻止 Git Bash 把 /cf-abc 这种斜杠开头的环境变量值转成 Windows 路径
 # (纯 Windows 测试环境问题; Linux VPS 上不存在路径转换)
-export PYTHON=python PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH'
+export PYTHON=python PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6'
 fail=0
 TMP="${TMPDIR:-/tmp}"
 
@@ -186,6 +186,42 @@ PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
 bf="$(ls "$BK"/out/sing-box-backup-*.tar.gz 2>/dev/null | head -1)"
 if [ -n "$bf" ] && tar tzf "$bf" 2>/dev/null | grep -q 'secrets' && tar tzf "$bf" 2>/dev/null | grep -q 'server.key'; then
   echo "PASS  backup 生成 tar.gz 且含 密钥/证书/参数"; else echo "FAIL  backup"; ls -la "$BK/out" 2>/dev/null; fail=1; fi
+
+echo
+echo "=== 4h) WARP 解锁分流渲染 ==="
+CFGW="$(ANYTLS_OK=1 WARP_PRIVATE_KEY=cHJpdmtleTEyMw== WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606:4700:110:8a36::2/128 render render_singbox_config)"
+if printf '%s' "$CFGW" | python -c "
+import json,sys
+d=json.load(sys.stdin)
+ep=d['endpoints'][0]
+assert ep['type']=='wireguard' and ep['tag']=='warp', ep
+assert ep['private_key']=='cHJpdmtleTEyMw=='
+assert ep['address']==['172.16.0.2/32','2606:4700:110:8a36::2/128'], ep['address']
+p=ep['peers'][0]
+assert p['public_key']=='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=', p
+assert p['port']==2408 and p['allowed_ips']==['0.0.0.0/0','::/0']
+assert 'reserved' not in p
+r=d['route']
+assert any(x.get('outbound')=='warp' and set(['geosite-openai','geosite-netflix','geosite-disney'])<=set(x.get('rule_set') or []) for x in r['rules']), r['rules']
+tags=[s['tag'] for s in r['rule_set']]
+assert all(t in tags for t in ['geosite-ads','geosite-openai','geosite-netflix','geosite-disney']), tags
+" 2>"$TMP/e"; then
+  echo "PASS  WARP endpoint + 解锁路由 + rule_set 正确(与BT/ads共存)"; else echo "FAIL  warp"; cat "$TMP/e"; fail=1; fi
+
+CFGWR="$(ANYTLS_OK=1 WARP_PRIVATE_KEY=k WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606::2/128 WARP_RESERVED='1,2,3' render render_singbox_config)"
+if printf '%s' "$CFGWR" | python -c "import json,sys;p=json.load(sys.stdin)['endpoints'][0]['peers'][0];assert p['reserved']==[1,2,3],p" 2>"$TMP/e"; then
+  echo "PASS  WARP_RESERVED 渲染成 reserved 数组"; else echo "FAIL  warp reserved"; cat "$TMP/e"; fail=1; fi
+
+CFGWO="$(ANYTLS_OK=1 ENABLE_BLOCK_BT=0 ENABLE_BLOCK_ADS=0 WARP_PRIVATE_KEY=k WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606::2/128 render render_singbox_config)"
+if printf '%s' "$CFGWO" | python -c "
+import json,sys
+d=json.load(sys.stdin)
+assert d['endpoints'][0]['tag']=='warp'
+r=d['route']
+assert not any(x.get('protocol')=='bittorrent' for x in r['rules'])
+assert [s['tag'] for s in r['rule_set']]==['geosite-openai','geosite-netflix','geosite-disney'], [s['tag'] for s in r['rule_set']]
+" 2>"$TMP/e"; then
+  echo "PASS  WARP开+BT/ads关: 有endpoints, route仅warp规则"; else echo "FAIL  warp-only"; cat "$TMP/e"; fail=1; fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="

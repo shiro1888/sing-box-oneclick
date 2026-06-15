@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -85,6 +85,7 @@ TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
 SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
 CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
+WARP_ENV="$SB_DIR/warp.env"   # WARP 解锁状态(存在=已接入; 由 warp 子命令写入)
 
 # 运行期填充(写成可被环境覆盖, 既不影响生产, 也便于测试渲染函数)
 PKG="${PKG:-}"; OS_ID="${OS_ID:-}"; PUBLIC_IP="${PUBLIC_IP:-}"; SUB_HOST="${SUB_HOST:-}"
@@ -99,6 +100,8 @@ OBFS_PASSWORD="${OBFS_PASSWORD:-}" # HY2 obfs 密码(非空=启用 obfs; gen_sec
 PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secrets 生成)
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
+# WARP 解锁分流(warp.env 提供; WARP_PRIVATE_KEY 非空=启用)
+WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"; WARP_ADDR_V4="${WARP_ADDR_V4:-}"; WARP_ADDR_V6="${WARP_ADDR_V6:-}"; WARP_RESERVED="${WARP_RESERVED:-}"
 
 # ----------------------------------------------------------------- 工具
 need_root() { [ "$(id -u)" = 0 ] || die "请用 root 运行(sudo bash install.sh)"; }
@@ -307,6 +310,8 @@ PUBLIC_IP="$PUBLIC_IP"
 HY2_HOP_RANGE=$HY2_HOP_RANGE
 HY2_UP=$HY2_UP
 HY2_DOWN=$HY2_DOWN
+ENABLE_BLOCK_BT=$ENABLE_BLOCK_BT
+ENABLE_BLOCK_ADS=$ENABLE_BLOCK_ADS
 EOF
   chmod 600 "$ENVFILE"
 }
@@ -344,26 +349,51 @@ JSON
   fi
   local obfs_line=""
   [ -n "$OBFS_PASSWORD" ] && obfs_line=$'\n      "obfs": { "type": "salamander", "password": "'"$OBFS_PASSWORD"'" },'
-  local route_json=""
-  if [ "$ENABLE_BLOCK_BT" = 1 ] || [ "$ENABLE_BLOCK_ADS" = 1 ]; then
-    local bt_rule="" ads_rule="" ads_set=""
-    [ "$ENABLE_BLOCK_BT" = 1 ] && bt_rule='
+  local route_json="" warp_ep=""
+  if [ "$ENABLE_BLOCK_BT" = 1 ] || [ "$ENABLE_BLOCK_ADS" = 1 ] || [ -n "$WARP_PRIVATE_KEY" ]; then
+    local rules="" rsets=""
+    [ "$ENABLE_BLOCK_BT" = 1 ] && rules="$rules"'
       { "protocol": "bittorrent", "action": "reject" },'
     if [ "$ENABLE_BLOCK_ADS" = 1 ]; then
-      ads_rule='
+      rules="$rules"'
       { "rule_set": ["geosite-ads"], "action": "reject" },'
-      ads_set='
-    "rule_set": [
-      { "tag": "geosite-ads", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct" }
-    ],'
+      rsets="$rsets"'
+      { "tag": "geosite-ads", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct" },'
     fi
+    if [ -n "$WARP_PRIVATE_KEY" ]; then
+      rules="$rules"'
+      { "rule_set": ["geosite-openai","geosite-netflix","geosite-disney"], "action": "route", "outbound": "warp" },'
+      rsets="$rsets"'
+      { "tag": "geosite-openai", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs", "download_detour": "direct" },
+      { "tag": "geosite-netflix", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-netflix.srs", "download_detour": "direct" },
+      { "tag": "geosite-disney", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-disney.srs", "download_detour": "direct" },'
+      local reserved=""
+      [ -n "$WARP_RESERVED" ] && reserved=", \"reserved\": [$WARP_RESERVED]"
+      warp_ep="$(cat <<JSON
+,
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "warp",
+      "address": ["$WARP_ADDR_V4", "$WARP_ADDR_V6"],
+      "private_key": "$WARP_PRIVATE_KEY",
+      "peers": [ { "address": "162.159.192.1", "port": 2408, "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", "allowed_ips": ["0.0.0.0/0", "::/0"]$reserved } ]
+    }
+  ]
+JSON
+)"
+    fi
+    local rsblock=""
+    [ -n "$rsets" ] && rsblock="
+    \"rule_set\": [${rsets%,}
+    ],"
     route_json="$(cat <<JSON
 
   "route": {
     "rules": [
-      { "action": "sniff" },$bt_rule$ads_rule
+      { "action": "sniff" },$rules
       { "action": "route", "outbound": "direct" }
-    ],$ads_set
+    ],$rsblock
     "final": "direct"
   },
 JSON
@@ -408,7 +438,7 @@ $anytls_block
       "password": "$SS_PASSWORD"
     }$cf_block
   ],$route_json
-  "outbounds": [ { "type": "direct", "tag": "direct" } ]
+  "outbounds": [ { "type": "direct", "tag": "direct" } ]$warp_ep
 }
 JSON
 }
@@ -1004,12 +1034,15 @@ print_summary() {
   printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
   printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
   [ -n "$CF_HOSTNAME" ] && printf '    - CF-Vless   (WS via %s, Argo 大保底)\n' "$CF_HOSTNAME"
+  [ -n "$WARP_PRIVATE_KEY" ] && printf '    * WARP 解锁分流已开 (OpenAI/Netflix/Disney 走 WARP)\n'
   echo
   printf '  管理命令:\n'
   printf '    查看信息:    bash install.sh info\n'
   printf '    看板页地址:  bash install.sh panel\n'
   printf '    分享链接:    bash install.sh links\n'
   printf '    备份/迁移:   bash install.sh backup   (新机: bash install.sh restore <文件>)\n'
+  printf '    SSH 加固:    bash install.sh harden   (密钥登录+禁密码+fail2ban)\n'
+  printf '    WARP 解锁:   bash install.sh warp      (关闭: warp off)\n'
   printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
   printf '    装探针:      KOMARI_ENDPOINT=.. KOMARI_TOKEN=.. bash install.sh komari\n'
   printf '    卸载:        bash install.sh uninstall\n'
@@ -1098,7 +1131,7 @@ EOF
 do_backup() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   local bf="${BACKUP_DIR:-/root}/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz" f files=""
-  for f in "$SECRETS" "$ENVFILE" "$CF_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key"; do
+  for f in "$SECRETS" "$ENVFILE" "$CF_ENV" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key"; do
     [ -f "$f" ] && files="$files $f"
   done
   # shellcheck disable=SC2086
@@ -1178,7 +1211,7 @@ EOF
 do_status() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   # shellcheck disable=SC1090
-  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true; [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
+  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true; [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true; [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true
   local cf_svc=""; [ -f "$CF_ENV" ] && cf_svc="cloudflared"
   echo "===== 服务 ====="
   local s
@@ -1194,6 +1227,7 @@ do_status() {
   printf '  时间同步 NTPSynchronized = %s\n' "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
   [ -f "$SB_DIR/server.crt" ] && printf '  自签证书 %s\n' "$(openssl x509 -enddate -noout -in "$SB_DIR/server.crt" 2>/dev/null)"
   printf '  限额 %s GB | 计费 %s | 到期 %s\n' "${LIMIT_GB:-?}" "${COUNT_MODE:-?}" "${EXPIRE_AT:-?}"
+  [ -n "$WARP_PRIVATE_KEY" ] && printf '  WARP 解锁分流: 已开 (OpenAI/Netflix/Disney 走 WARP; 关闭: install.sh warp off)\n'
   curl -s -o /dev/null -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
   echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
 }
@@ -1255,7 +1289,7 @@ do_menu() {
     echo "  9) 卸载                  0) 退出"
     echo "  p) 看板页地址            k) 装 Komari 探针"
     echo "  b) 备份                  r) 恢复(迁移)"
-    echo "  h) SSH 加固(密钥登录)"
+    echo "  h) SSH 加固(密钥登录)    w) WARP 解锁分流"
     printf '  选择: '
     read -r c || break
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
@@ -1278,6 +1312,7 @@ do_menu() {
       b|B) ( do_backup ) || true ;;
       r|R) printf '  备份文件路径: '; read -r rf || true; [ -n "${rf:-}" ] && { ( do_restore "$rf" ) || true; } ;;
       h|H) ( do_harden ) || true ;;
+      w|W) ( do_warp ) || true ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -1308,6 +1343,7 @@ do_uninstall() {
   [ -n "${PANEL_PATH:-}" ] && rm -f "$WWW$PANEL_PATH" 2>/dev/null || true
   rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt "$WWW"/panel-*.html 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅/看板文件
   rm -f /run/sing-box-quota-stopped 2>/dev/null || true
+  rm -f "$WARP_ENV" 2>/dev/null || true   # WARP 分流状态(wgcf 二进制保留, 无害)
   if [ -f "$CF_ENV" ]; then
     cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
     rm -f "$CF_ENV" 2>/dev/null || true
@@ -1402,6 +1438,110 @@ EOF
   fi
 }
 
+install_wgcf() {
+  command -v wgcf >/dev/null 2>&1 && return
+  log "下载 wgcf(WARP 注册工具)..."
+  local arch ver
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    armv7l)        arch=armv7 ;;
+    *) die "wgcf 不支持架构 $(uname -m)" ;;
+  esac
+  # 跟随 releases/latest 重定向拿版本号(免 API 限流), 资产名形如 wgcf_2.2.22_linux_amd64
+  ver="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/ViRb3/wgcf/releases/latest 2>/dev/null | sed -E 's#.*/tag/v?##' || true)"
+  [ -n "$ver" ] || die "无法获取 wgcf 最新版本号"
+  curl -fsSL -o /usr/local/bin/wgcf \
+    "https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}" \
+    || die "wgcf 下载失败"
+  chmod 755 /usr/local/bin/wgcf
+}
+
+do_warp() {
+  [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再开 WARP 分流"
+  # shellcheck disable=SC1090
+  . "$SECRETS"
+  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true   # 保留已接入的 CF-Vless 节点
+  CF_PORT="${CF_PORT:-28080}"
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
+  detect_net
+
+  # 关闭分流: 删状态 + 重渲染(护栏校验)
+  if [ "${1:-}" = "off" ]; then
+    [ -f "$WARP_ENV" ] || { ok "未启用 WARP 分流, 无需关闭"; return 0; }
+    rm -f "$WARP_ENV"
+    WARP_PRIVATE_KEY=""; WARP_ADDR_V4=""; WARP_ADDR_V6=""; WARP_RESERVED=""
+    local tmpc; tmpc="$(mktemp)"
+    render_singbox_config >"$tmpc"
+    if sing-box check -c "$tmpc" >/dev/null 2>&1; then
+      install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
+      systemctl restart sing-box && ok "已关闭 WARP 分流(OpenAI/Netflix/Disney 恢复走 VPS 直连出口)" || warn "sing-box 重启失败"
+    else
+      rm -f "$tmpc"; warn "关闭后配置校验异常, 已保留原配置不动"
+    fi
+    return 0
+  fi
+
+  command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
+  detect_os
+
+  if [ -f "$WARP_ENV" ]; then
+    log "复用已注册的 WARP 账号(避免重复注册被 Cloudflare 限流)..."
+    # shellcheck disable=SC1090
+    . "$WARP_ENV"
+  else
+    install_wgcf
+    log "注册 Cloudflare WARP 账号(wgcf)..."
+    local wd; wd="$(mktemp -d)"
+    if ! ( cd "$wd" && wgcf register --accept-tos >/dev/null 2>&1 ); then
+      rm -rf "$wd"; die "wgcf 注册失败(Cloudflare 可能对该 IP 临时限流, 稍后重试)"
+    fi
+    if ! ( cd "$wd" && wgcf generate >/dev/null 2>&1 ); then
+      rm -rf "$wd"; die "wgcf 生成 WireGuard 配置失败"
+    fi
+    local prof="$wd/wgcf-profile.conf"
+    [ -f "$prof" ] || { rm -rf "$wd"; die "未生成 wgcf-profile.conf"; }
+    # base64 私钥可能以 '=' 结尾, 不能用 -F= 切; 用 sed 去前缀
+    WARP_PRIVATE_KEY="$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$prof" | tr -d ' \r' | head -n1 || true)"
+    WARP_ADDR_V4="$(sed -n 's#^Address[[:space:]]*=[[:space:]]*##p' "$prof" | grep -E '^[0-9]+\.' | head -n1 | tr -d ' \r' || true)"
+    WARP_ADDR_V6="$(sed -n 's#^Address[[:space:]]*=[[:space:]]*##p' "$prof" | grep ':' | head -n1 | tr -d ' \r' || true)"
+    [ -n "$WARP_ADDR_V4" ] || WARP_ADDR_V4="172.16.0.2/32"
+    [ -n "$WARP_ADDR_V6" ] || WARP_ADDR_V6="2606:4700:110:8a36:df92:102a:9602:fa18/128"
+    WARP_RESERVED=""   # 单账号专用默认不带; 如解锁不生效再手动填
+    rm -rf "$wd"
+    ( umask 077; cat >"$WARP_ENV" <<EOF
+WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
+WARP_ADDR_V4='$WARP_ADDR_V4'
+WARP_ADDR_V6='$WARP_ADDR_V6'
+WARP_RESERVED='$WARP_RESERVED'
+EOF
+    )
+    ok "WARP 账号已注册, 保存到 $WARP_ENV"
+  fi
+  [ -n "$WARP_PRIVATE_KEY" ] || die "WARP 私钥为空, 删 $WARP_ENV 后重试注册"
+
+  # 安全护栏: 渲染到临时文件 -> sing-box check 通过才替换正式 config, 失败保留原配置(节点不受影响)
+  log "生成带 WARP 分流的配置并校验..."
+  local tmpc; tmpc="$(mktemp)"
+  render_singbox_config >"$tmpc"
+  if sing-box check -c "$tmpc" >/dev/null 2>&1; then
+    install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
+    if systemctl restart sing-box; then
+      ok "WARP 解锁分流已开启 —— OpenAI/ChatGPT、Netflix、Disney+ 走 WARP 出口"
+      echo "  关闭: bash install.sh warp off"
+      echo "  若能连但仍被拦(解锁没生效), 多半是缺 reserved: 编辑 $WARP_ENV 设 WARP_RESERVED='a,b,c' 后重跑 warp"
+    else
+      warn "sing-box 重启失败, 看 systemctl status sing-box"
+    fi
+  else
+    rm -f "$tmpc"
+    warn "带 WARP 的配置 sing-box check 未通过, 已保留原配置(现有节点不受影响)。"
+    echo "  最可能原因: sing-box < 1.12(wireguard endpoint 需 1.12+) —— 先升级: bash install.sh update 再重跑 warp"
+    return 1
+  fi
+}
+
 do_install() {
   umask 077          # 所有新建文件默认 600/700, 消除"先写后 chmod"的可读时间窗
   validate_inputs    # 端口/SNI/到期时间不合法立即报错, 不装到一半才崩
@@ -1413,6 +1553,7 @@ do_install() {
   gen_secrets
   # shellcheck disable=SC1090
   [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true   # 已接入过 CF-Vless 则重装时保留
+  [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true   # 已接入过 WARP 则重装/更新时保留分流
   gen_cert
   config_sysctl   # 在 sing-box 启动前应用, 这样 HY2/QUIC 一启动就拿到大 UDP 缓冲
   write_env
@@ -1440,10 +1581,11 @@ main() {
     update)    do_update ;;
     restart)   do_restart ;;
     cf)        do_cf ;;
+    warp)      shift; do_warp "$@" ;;
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 

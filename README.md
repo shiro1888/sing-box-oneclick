@@ -15,6 +15,8 @@
 - **Komari 探针**：`install.sh komari` 傻瓜式装 [Komari](https://github.com/komari-monitor/komari) 监控 agent（可选，与代理无关）。
 - **路由防护**：服务端默认**拦 BT/PT**（防被商家封机收滥用投诉）+ **geosite 拦广告**（`ENABLE_BLOCK_BT=0` / `ENABLE_BLOCK_ADS=0` 可关）。
 - **备份迁移**：`install.sh backup` 把密钥+配置+证书打成一个包，新 VPS 上 `restore <文件>` 一条命令重建——**凭证/订阅路径不变，客户端不用换密码**（换机器只需把订阅 URL 的 IP 改成新 IP，或用域名直接重指 DNS）。
+- **SSH 加固**：`install.sh harden` 一键密钥登录+禁密码+fail2ban，强护栏防锁死（见下方第 4 节）。
+- **WARP 解锁分流**：`install.sh warp` 把 ChatGPT/Netflix/Disney+ 走 Cloudflare WARP 出口（机房 IP 被拉黑时解锁），其余直连；带「校验不过自动回滚」护栏，不会弄坏现有节点。
 - **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
 - **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
@@ -126,6 +128,7 @@ sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/
 sudo bash install.sh backup      # 打包密钥+配置 -> /root/sing-box-backup-时间.tar.gz
 sudo bash install.sh restore <文件>   # 新 VPS 上恢复(同一套凭证, 客户端不用换密码)
 sudo bash install.sh harden      # SSH 加固: 密钥登录+禁密码+fail2ban(必须先有授权公钥)
+sudo bash install.sh warp        # WARP 解锁分流: ChatGPT/Netflix/Disney 走 WARP(关闭: warp off)
 sudo bash install.sh update      # 更新 sing-box 到最新版并重启
 sudo bash install.sh restart     # 重启 sing-box / nginx (/ cloudflared)
 sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf    # 接入可选第 5 节点 CF-Vless(见第 3 节)
@@ -204,6 +207,17 @@ VPS 最大的风险是 22 端口被爆破——一旦失守整台机器连同密
 sudo bash install.sh harden    # 仅密钥登录 + 禁密码 + fail2ban
 ```
 护栏：**必须先检测到 `/root/.ssh/authorized_keys` 里有公钥才动手**（否则拒绝，防把你锁在门外）；用 `00-` 开头的 drop-in 覆盖 cloud-init 默认的 `PasswordAuthentication yes`；`sshd -t` 校验不过自动回滚。**改完务必另开一个新终端用密钥登录确认能进，再关掉旧会话。**
+
+### 5.（可选）WARP 解锁分流（ChatGPT / Netflix / Disney+）
+很多机房 IP 被 OpenAI/流媒体拉黑，直连这些服务会报「不可用/地区限制」。一条命令把这些站点的流量改走 Cloudflare WARP 出口（其余流量仍走 VPS 直连，不影响速度）：
+```bash
+sudo bash install.sh warp        # 自动: 装 wgcf → 注册免费 WARP 账号 → 加 WireGuard 出站 + 分流规则
+sudo bash install.sh warp off    # 关闭, 恢复全部直连
+```
+- 默认把 `geosite-openai / netflix / disney` 走 WARP，其它直连。WARP 账号保存在 `/etc/sing-box/warp.env`，`backup` 会一并打包，迁移到新机免重新注册。
+- **安全护栏**：新配置先渲染到临时文件、`sing-box check` 通过才替换正式配置——**校验不过就回滚，绝不弄坏现有节点**。需要 sing-box ≥ 1.12（wireguard endpoint）；脚本装的是最新版，正常满足。
+- 若「能连但仍被拦」（解锁没生效），多半是缺 WARP 的 `reserved`：编辑 `warp.env` 设 `WARP_RESERVED='a,b,c'`（三个数字）后重跑 `warp`。这是少数机器才需要的微调。
+- 这是本仓库里唯一在 Windows 上无法离线验证运行时的功能（只校验了配置渲染合法性），真机上 `sing-box check` 与 `warp` 的回滚护栏是最终关卡。
 
 ---
 
