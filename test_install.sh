@@ -167,6 +167,8 @@ chkp 'navigator.clipboard' '复制 JS'
 if printf '%s' "$PANEL" | grep -qF 'CF-Vless'; then echo "FAIL  未开CF看板却有CF-Vless"; fail=1; else echo "PASS  未开CF看板无CF-Vless(条件渲染)"; fi
 PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=u render render_panel_html)"
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
+# 安装上下文是 set -euo pipefail, 看板渲染不能中断(qrencode 失败/缺失都该优雅降级)
+if PYTHON=python bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="

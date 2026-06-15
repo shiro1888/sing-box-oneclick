@@ -568,8 +568,9 @@ render_panel_html() {
   local clash_url="http://$SUB_HOST$SUB_PATH" b64_url="http://$SUB_HOST$SUB_B64_PATH"
   local qr_clash="" qr_b64=""
   if command -v qrencode >/dev/null 2>&1; then
-    qr_clash="$(qrencode -t PNG -o - "$clash_url" 2>/dev/null | base64 -w0)"
-    qr_b64="$(qrencode -t PNG -o - "$b64_url" 2>/dev/null | base64 -w0)"
+    # || true: qrencode 运行时失败也只是没二维码, 不能因 set -e/pipefail 中断整个安装
+    qr_clash="$(qrencode -t PNG -o - "$clash_url" 2>/dev/null | base64 -w0 || true)"
+    qr_b64="$(qrencode -t PNG -o - "$b64_url" 2>/dev/null | base64 -w0 || true)"
   fi
   local nodes="Hysteria2"
   [ "$ANYTLS_OK" = 1 ] && nodes="$nodes,AnyTLS"
