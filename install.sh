@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|links|status|set|backup|restore <file>|update|restart|cf|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -1127,6 +1127,54 @@ do_restore() {
   do_install
 }
 
+do_harden() {
+  command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
+  detect_os   # 设 PKG, 装 fail2ban 用
+  local akeys=/root/.ssh/authorized_keys
+  if ! { [ -s "$akeys" ] && grep -qE '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-)' "$akeys"; }; then
+    err "未在 $akeys 找到有效 SSH 公钥! 为防止把你锁在门外, 拒绝禁用密码登录。"
+    echo "  先在你本地电脑: ssh-copy-id root@<本机IP>  (或手动把公钥粘进 $akeys),"
+    echo "  用密钥登录确认能进之后, 再跑: bash install.sh harden"
+    die "无授权公钥, 已中止(没动任何 SSH 配置)"
+  fi
+  log "安装 fail2ban + 加固 SSH(仅密钥登录、禁密码)..."
+  case "$PKG" in
+    apt) export DEBIAN_FRONTEND=noninteractive; apt-get install -y fail2ban >/dev/null 2>&1 || warn "fail2ban 装失败, 跳过" ;;
+    dnf|yum) "$PKG" install -y epel-release >/dev/null 2>&1 || true; "$PKG" install -y fail2ban >/dev/null 2>&1 || warn "fail2ban 装失败, 跳过" ;;
+  esac
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  mkdir -p /etc/ssh/sshd_config.d
+  local dropin=/etc/ssh/sshd_config.d/00-singbox-harden.conf
+  cat >"$dropin" <<'EOF'
+# sing-box-oneclick SSH 加固(文件名 00- 排最前, 覆盖 50-cloud-init 的 PasswordAuthentication yes)
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+EOF
+  if ! grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+    warn "sshd_config 无 Include sshd_config.d/, drop-in 可能不生效; 直接改主文件兜底..."
+    local bak="/etc/ssh/sshd_config.singbox-bak.$(date +%s)" kv key; cp -a /etc/ssh/sshd_config "$bak"
+    for kv in "PasswordAuthentication no" "PubkeyAuthentication yes" "KbdInteractiveAuthentication no"; do
+      key="${kv%% *}"
+      if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}\b" /etc/ssh/sshd_config; then
+        sed -i "s|^[[:space:]]*#\?[[:space:]]*${key}\b.*|${kv}|I" /etc/ssh/sshd_config
+      else
+        printf '%s\n' "$kv" >> /etc/ssh/sshd_config
+      fi
+    done
+    ok "已备份原 sshd_config 到 $bak"
+  fi
+  if sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    ok "SSH 已加固(仅密钥、禁密码) + fail2ban 已开。"
+    warn "⚠️ 现在请【另开一个新终端】用密钥登录确认能进, 再关掉当前会话! 进不去就: rm $dropin && systemctl reload sshd 回滚。"
+  else
+    rm -f "$dropin"
+    die "sshd 配置校验(sshd -t)未过, 已删 drop-in 回滚, 未改动 SSH"
+  fi
+}
+
 do_status() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   # shellcheck disable=SC1090
@@ -1207,6 +1255,7 @@ do_menu() {
     echo "  9) 卸载                  0) 退出"
     echo "  p) 看板页地址            k) 装 Komari 探针"
     echo "  b) 备份                  r) 恢复(迁移)"
+    echo "  h) SSH 加固(密钥登录)"
     printf '  选择: '
     read -r c || break
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
@@ -1228,6 +1277,7 @@ do_menu() {
            if [ -n "${ke:-}" ] && [ -n "${kt:-}" ]; then ( KOMARI_ENDPOINT="$ke" KOMARI_TOKEN="$kt" do_komari ) || true; else echo "  已取消"; fi ;;
       b|B) ( do_backup ) || true ;;
       r|R) printf '  备份文件路径: '; read -r rf || true; [ -n "${rf:-}" ] && { ( do_restore "$rf" ) || true; } ;;
+      h|H) ( do_harden ) || true ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -1386,13 +1436,14 @@ main() {
     set)       shift; do_set "$@" ;;
     backup)    do_backup ;;
     restore)   shift; do_restore "$@" ;;
+    harden)    do_harden ;;
     update)    do_update ;;
     restart)   do_restart ;;
     cf)        do_cf ;;
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|links|status|set|backup|restore <file>|update|restart|cf|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 

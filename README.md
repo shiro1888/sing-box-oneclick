@@ -125,6 +125,7 @@ sudo bash install.sh status      # 状态体检: 服务/配置/端口/时间/证
 sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/网卡, 即时刷新流量头
 sudo bash install.sh backup      # 打包密钥+配置 -> /root/sing-box-backup-时间.tar.gz
 sudo bash install.sh restore <文件>   # 新 VPS 上恢复(同一套凭证, 客户端不用换密码)
+sudo bash install.sh harden      # SSH 加固: 密钥登录+禁密码+fail2ban(必须先有授权公钥)
 sudo bash install.sh update      # 更新 sing-box 到最新版并重启
 sudo bash install.sh restart     # 重启 sing-box / nginx (/ cloudflared)
 sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf    # 接入可选第 5 节点 CF-Vless(见第 3 节)
@@ -197,7 +198,12 @@ sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh c
 > - 结论：要稳定就用上面的**命名隧道**（固定域名）；它定位是**保底/兜底**，不是稳定加速。直连的 Hysteria2 / Vless-Reality 仍是主力。
 
 ### 4.（可选，强烈建议）SSH 加固
-脚本**不会**动你的 SSH（避免误锁）。但 VPS 最大的风险是 22 端口被爆破——一旦失守整台机器连同密钥全没。建议手动：改密钥登录、禁用密码登录、可加 `fail2ban`。**先确认密钥能登录，再禁用密码。**
+VPS 最大的风险是 22 端口被爆破——一旦失守整台机器连同密钥全没。现在有一键加固：
+```bash
+# 第一步(在你本地电脑)：ssh-copy-id root@<IP>，并确认能用密钥登录
+sudo bash install.sh harden    # 仅密钥登录 + 禁密码 + fail2ban
+```
+护栏：**必须先检测到 `/root/.ssh/authorized_keys` 里有公钥才动手**（否则拒绝，防把你锁在门外）；用 `00-` 开头的 drop-in 覆盖 cloud-init 默认的 `PasswordAuthentication yes`；`sshd -t` 校验不过自动回滚。**改完务必另开一个新终端用密钥登录确认能进，再关掉旧会话。**
 
 ---
 
