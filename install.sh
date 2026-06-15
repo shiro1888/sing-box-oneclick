@@ -1220,6 +1220,8 @@ do_restore() {
   # shellcheck disable=SC1090
   [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
   INTERFACE=""; PUBLIC_IP=""; SUB_HOST=""
+  # CF-Vless 隧道是跟机器走的(cloudflared+token), 备份只带了节点参数, 新机要重接
+  [ -f "$CF_ENV" ] && note "CF-Vless 第5节点: 新机需重跑 'CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf' 重装 cloudflared 并接隧道, 否则该节点连不上。"
   ok "凭证已就位, 按新机重建(IP/网卡自动适配; 用域名的话加 DOMAIN= 重跑或重指 DNS)..."
   do_install
 }
@@ -1249,9 +1251,10 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 EOF
+  local bak=""
   if ! grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
     warn "sshd_config 无 Include sshd_config.d/, drop-in 可能不生效; 直接改主文件兜底..."
-    local bak="/etc/ssh/sshd_config.singbox-bak.$(date +%s)" kv key; cp -a /etc/ssh/sshd_config "$bak"
+    local kv key; bak="/etc/ssh/sshd_config.singbox-bak.$(date +%s)"; cp -a /etc/ssh/sshd_config "$bak"
     for kv in "PasswordAuthentication no" "PubkeyAuthentication yes" "KbdInteractiveAuthentication no"; do
       key="${kv%% *}"
       if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}\b" /etc/ssh/sshd_config; then
@@ -1268,7 +1271,8 @@ EOF
     warn "⚠️ 现在请【另开一个新终端】用密钥登录确认能进, 再关掉当前会话! 进不去就: rm $dropin && systemctl reload sshd 回滚。"
   else
     rm -f "$dropin"
-    die "sshd 配置校验(sshd -t)未过, 已删 drop-in 回滚, 未改动 SSH"
+    [ -n "$bak" ] && cp -a "$bak" /etc/ssh/sshd_config   # 兜底分支改过主文件, 校验不过要一并还原
+    die "sshd 配置校验(sshd -t)未过, 已回滚(drop-in + 主文件), 未改动 SSH"
   fi
 }
 
@@ -1645,6 +1649,9 @@ do_warp() {
   [ -n "$WARP_PRIVATE_KEY" ] || die "WARP 私钥为空, 删 $WARP_ENV 后重试注册"
   # 站点优先级: 本次显式传入 > warp.env 记录 > 默认; 统一在此回写 warp.env(支持改站点后重跑)
   WARP_SITES="${req_sites:-${WARP_SITES:-openai,netflix,disney}}"
+  # 落盘前清洗成安全字符集(只留 小写字母/数字/逗号/连字符), 防引号等破坏 warp.env 的 source
+  WARP_SITES="$(printf '%s' "$WARP_SITES" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9,-')"
+  [ -n "$WARP_SITES" ] || WARP_SITES="openai,netflix,disney"
   ( umask 077; cat >"$WARP_ENV" <<EOF
 WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
 WARP_ADDR_V4='$WARP_ADDR_V4'
