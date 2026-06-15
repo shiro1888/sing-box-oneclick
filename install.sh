@@ -102,6 +102,7 @@ PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secret
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
 # WARP 解锁分流(warp.env 提供; WARP_PRIVATE_KEY 非空=启用)
 WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"; WARP_ADDR_V4="${WARP_ADDR_V4:-}"; WARP_ADDR_V6="${WARP_ADDR_V6:-}"; WARP_RESERVED="${WARP_RESERVED:-}"
+WARP_SITES="${WARP_SITES:-}"   # 走 WARP 的 geosite 列表(逗号分隔, 可自定义; 空=render 用默认 openai,netflix,disney)
 
 # ----------------------------------------------------------------- 工具
 need_root() { [ "$(id -u)" = 0 ] || die "请用 root 运行(sudo bash install.sh)"; }
@@ -296,6 +297,27 @@ gen_cert() {
   chmod 600 "$SB_DIR/server.key"; chmod 644 "$SB_DIR/server.crt"
 }
 
+# 校验 Reality 偷证书目标(REALITY_SNI): 需支持 TLS1.3(硬性), 建议 H2。best-effort, 失败只提示不中断。
+check_reality_sni() {
+  command -v openssl >/dev/null 2>&1 || return 0
+  local host="$REALITY_SNI" out
+  log "校验 Reality 偷证书目标 $host (需 TLS1.3, 建议 H2)..."
+  out="$( { echo | timeout 8 openssl s_client -connect "$host:443" -servername "$host" -alpn h2; } 2>/dev/null )" || true
+  if ! printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
+    note "Reality 偷证书目标 $host:443 连不上(网络/被墙?), 没能校验。确认它在 VPS 上能直连且支持 TLS1.3(默认 www.microsoft.com 一般没问题)。"
+    return 0
+  fi
+  if printf '%s' "$out" | grep -q 'TLSv1.3'; then
+    if printf '%s' "$out" | grep -qE 'ALPN protocol: *h2$'; then
+      ok "Reality SNI $host: TLS1.3 + H2 ✓"
+    else
+      note "Reality SNI $host 支持 TLS1.3 但未协商出 H2: 能用, 但建议换个支持 HTTP/2 的目标更隐蔽(如 www.microsoft.com)。"
+    fi
+  else
+    note "Reality SNI $host 不支持 TLS1.3 ✗(偷证书目标的硬性要求, 握手会有问题): 换成确定支持 TLS1.3 的大站, 如 www.microsoft.com / www.cloudflare.com / www.apple.com。"
+  fi
+}
+
 write_env() {
   local expire_default; expire_default="$(date -d '+365 days' '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo '2099-12-31 23:59:59 +0800')"
   EXPIRE_VALUE="${EXPIRE_AT:-$expire_default}"   # 单一来源, config_nginx 复用, 不再二次 grep
@@ -361,12 +383,17 @@ JSON
       { "tag": "geosite-ads", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct" },'
     fi
     if [ -n "$WARP_PRIVATE_KEY" ]; then
+      # WARP_SITES 可配置(逗号分隔的 geosite 名), 默认 openai/netflix/disney
+      local site tags=""
+      for site in $(printf '%s' "${WARP_SITES:-openai,netflix,disney}" | tr ',' ' '); do
+        site="$(printf '%s' "$site" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"   # 清洗防注入
+        [ -n "$site" ] || continue
+        tags="$tags\"geosite-$site\","
+        rsets="$rsets"'
+      { "tag": "geosite-'"$site"'", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-'"$site"'.srs", "download_detour": "direct" },'
+      done
       rules="$rules"'
-      { "rule_set": ["geosite-openai","geosite-netflix","geosite-disney"], "action": "route", "outbound": "warp" },'
-      rsets="$rsets"'
-      { "tag": "geosite-openai", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs", "download_detour": "direct" },
-      { "tag": "geosite-netflix", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-netflix.srs", "download_detour": "direct" },
-      { "tag": "geosite-disney", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-disney.srs", "download_detour": "direct" },'
+      { "rule_set": ['"${tags%,}"'], "action": "route", "outbound": "warp" },'
       local reserved=""
       [ -n "$WARP_RESERVED" ] && reserved=", \"reserved\": [$WARP_RESERVED]"
       warp_ep="$(cat <<JSON
@@ -1476,7 +1503,7 @@ do_warp() {
     render_singbox_config >"$tmpc"
     if sing-box check -c "$tmpc" >/dev/null 2>&1; then
       install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
-      systemctl restart sing-box && ok "已关闭 WARP 分流(OpenAI/Netflix/Disney 恢复走 VPS 直连出口)" || warn "sing-box 重启失败"
+      systemctl restart sing-box && ok "已关闭 WARP 分流(原解锁站点恢复走 VPS 直连出口)" || warn "sing-box 重启失败"
     else
       rm -f "$tmpc"; warn "关闭后配置校验异常, 已保留原配置不动"
     fi
@@ -1485,6 +1512,7 @@ do_warp() {
 
   command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
   detect_os
+  local req_sites="$WARP_SITES"   # 本次显式传入的 WARP_SITES(在 source warp.env 覆盖前先记下)
 
   if [ -f "$WARP_ENV" ]; then
     log "复用已注册的 WARP 账号(避免重复注册被 Cloudflare 限流)..."
@@ -1510,16 +1538,19 @@ do_warp() {
     [ -n "$WARP_ADDR_V6" ] || WARP_ADDR_V6="2606:4700:110:8a36:df92:102a:9602:fa18/128"
     WARP_RESERVED=""   # 单账号专用默认不带; 如解锁不生效再手动填
     rm -rf "$wd"
-    ( umask 077; cat >"$WARP_ENV" <<EOF
+    ok "WARP 账号已注册"
+  fi
+  [ -n "$WARP_PRIVATE_KEY" ] || die "WARP 私钥为空, 删 $WARP_ENV 后重试注册"
+  # 站点优先级: 本次显式传入 > warp.env 记录 > 默认; 统一在此回写 warp.env(支持改站点后重跑)
+  WARP_SITES="${req_sites:-${WARP_SITES:-openai,netflix,disney}}"
+  ( umask 077; cat >"$WARP_ENV" <<EOF
 WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
 WARP_ADDR_V4='$WARP_ADDR_V4'
 WARP_ADDR_V6='$WARP_ADDR_V6'
 WARP_RESERVED='$WARP_RESERVED'
+WARP_SITES='$WARP_SITES'
 EOF
-    )
-    ok "WARP 账号已注册, 保存到 $WARP_ENV"
-  fi
-  [ -n "$WARP_PRIVATE_KEY" ] || die "WARP 私钥为空, 删 $WARP_ENV 后重试注册"
+  )
 
   # 安全护栏: 渲染到临时文件 -> sing-box check 通过才替换正式 config, 失败保留原配置(节点不受影响)
   log "生成带 WARP 分流的配置并校验..."
@@ -1528,8 +1559,8 @@ EOF
   if sing-box check -c "$tmpc" >/dev/null 2>&1; then
     install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
     if systemctl restart sing-box; then
-      ok "WARP 解锁分流已开启 —— OpenAI/ChatGPT、Netflix、Disney+ 走 WARP 出口"
-      echo "  关闭: bash install.sh warp off"
+      ok "WARP 解锁分流已开启 —— 这些站点走 WARP 出口: $WARP_SITES"
+      echo "  改站点: WARP_SITES='openai,netflix,tiktok' bash install.sh warp   |  关闭: bash install.sh warp off"
       echo "  若能连但仍被拦(解锁没生效), 多半是缺 reserved: 编辑 $WARP_ENV 设 WARP_RESERVED='a,b,c' 后重跑 warp"
     else
       warn "sing-box 重启失败, 看 systemctl status sing-box"
@@ -1550,6 +1581,7 @@ do_install() {
   time_sync
   install_singbox
   detect_net
+  check_reality_sni   # best-effort 探测偷证书目标是否支持 TLS1.3+H2, 填错只提示
   gen_secrets
   # shellcheck disable=SC1090
   [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true   # 已接入过 CF-Vless 则重装时保留

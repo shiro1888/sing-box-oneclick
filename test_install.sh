@@ -223,6 +223,17 @@ assert [s['tag'] for s in r['rule_set']]==['geosite-openai','geosite-netflix','g
 " 2>"$TMP/e"; then
   echo "PASS  WARP开+BT/ads关: 有endpoints, route仅warp规则"; else echo "FAIL  warp-only"; cat "$TMP/e"; fail=1; fi
 
+CFGWS="$(ANYTLS_OK=1 ENABLE_BLOCK_BT=0 ENABLE_BLOCK_ADS=0 WARP_PRIVATE_KEY=k WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606::2/128 WARP_SITES='tiktok, spotify ,Open"AI' render render_singbox_config)"
+if printf '%s' "$CFGWS" | python -c "
+import json,sys
+d=json.load(sys.stdin)
+r=d['route']
+rule=[x for x in r['rules'] if x.get('outbound')=='warp'][0]
+assert rule['rule_set']==['geosite-tiktok','geosite-spotify','geosite-openai'], rule['rule_set']
+assert [s['tag'] for s in r['rule_set']]==['geosite-tiktok','geosite-spotify','geosite-openai'], [s['tag'] for s in r['rule_set']]
+" 2>"$TMP/e"; then
+  echo "PASS  WARP_SITES 自定义+清洗(去空格/大写/引号注入)"; else echo "FAIL  warp sites"; cat "$TMP/e"; fail=1; fi
+
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"

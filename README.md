@@ -16,7 +16,8 @@
 - **路由防护**：服务端默认**拦 BT/PT**（防被商家封机收滥用投诉）+ **geosite 拦广告**（`ENABLE_BLOCK_BT=0` / `ENABLE_BLOCK_ADS=0` 可关）。
 - **备份迁移**：`install.sh backup` 把密钥+配置+证书打成一个包，新 VPS 上 `restore <文件>` 一条命令重建——**凭证/订阅路径不变，客户端不用换密码**（换机器只需把订阅 URL 的 IP 改成新 IP，或用域名直接重指 DNS）。
 - **SSH 加固**：`install.sh harden` 一键密钥登录+禁密码+fail2ban，强护栏防锁死（见下方第 4 节）。
-- **WARP 解锁分流**：`install.sh warp` 把 ChatGPT/Netflix/Disney+ 走 Cloudflare WARP 出口（机房 IP 被拉黑时解锁），其余直连；带「校验不过自动回滚」护栏，不会弄坏现有节点。
+- **WARP 解锁分流**：`install.sh warp` 把 ChatGPT/Netflix/Disney+ 走 Cloudflare WARP 出口（机房 IP 被拉黑时解锁），其余直连；走 WARP 的站点用 `WARP_SITES` 可自定义；带「校验不过自动回滚」护栏，不会弄坏现有节点。
+- **Reality SNI 自检**：安装时自动探测你填的偷证书目标（`REALITY_SNI`）是否真的支持 TLS1.3+H2，填错会在结尾提示换站点（防 Reality 静默失效/易被识别）。
 - **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
 - **流量统计/限流**：vnstat + 定时任务，订阅头显示已用/额度/到期；超额自动停、月初自动恢复；**默认按双向(rx+tx)计费**避免超量；手动停机不会被定时任务拉起。
@@ -214,7 +215,11 @@ sudo bash install.sh harden    # 仅密钥登录 + 禁密码 + fail2ban
 sudo bash install.sh warp        # 自动: 装 wgcf → 注册免费 WARP 账号 → 加 WireGuard 出站 + 分流规则
 sudo bash install.sh warp off    # 关闭, 恢复全部直连
 ```
-- 默认把 `geosite-openai / netflix / disney` 走 WARP，其它直连。WARP 账号保存在 `/etc/sing-box/warp.env`，`backup` 会一并打包，迁移到新机免重新注册。
+- 默认把 `geosite-openai / netflix / disney` 走 WARP，其它直连。**自定义走 WARP 的站点**（逗号分隔的 geosite 名，会自动去空格/转小写/过滤非法字符）：
+  ```bash
+  sudo WARP_SITES='openai,netflix,tiktok,spotify' bash install.sh warp   # 改完即生效, 已记进 warp.env
+  ```
+- WARP 账号保存在 `/etc/sing-box/warp.env`，`backup` 会一并打包，迁移到新机免重新注册。
 - **安全护栏**：新配置先渲染到临时文件、`sing-box check` 通过才替换正式配置——**校验不过就回滚，绝不弄坏现有节点**。需要 sing-box ≥ 1.12（wireguard endpoint）；脚本装的是最新版，正常满足。
 - 若「能连但仍被拦」（解锁没生效），多半是缺 WARP 的 `reserved`：编辑 `warp.env` 设 `WARP_RESERVED='a,b,c'`（三个数字）后重跑 `warp`。这是少数机器才需要的微调。
 - 这是本仓库里唯一在 Windows 上无法离线验证运行时的功能（只校验了配置渲染合法性），真机上 `sing-box check` 与 `warp` 的回滚护栏是最终关卡。
