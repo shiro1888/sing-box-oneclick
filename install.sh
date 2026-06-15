@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -664,8 +664,9 @@ render_panel_html() {
   [ -n "$CF_HOSTNAME" ] && nodes="$nodes,CF-Vless"
   AIRPORT_NAME="$AIRPORT_NAME" CLASH_URL="$clash_url" B64_URL="$b64_url" \
   QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODES="$nodes" \
+  LIMIT_GB="$LIMIT_GB" EXP="${EXPIRE_VALUE:-${EXPIRE_AT:-}}" \
   "$PY" - <<'PY'
-import os, html, sys, urllib.parse, base64
+import os, html, sys, urllib.parse, base64, json, datetime
 e = html.escape
 name_raw = os.environ.get("AIRPORT_NAME", "Node")
 name = e(name_raw)
@@ -674,6 +675,13 @@ clash = e(clash_raw); b64 = e(b64_raw)
 # 一键导入深链: Clash 系吃 clash://install-config; Shadowrocket 吃 shadowrocket://add/sub://<base64(订阅URL)>
 clash_deep = e("clash://install-config?url=" + urllib.parse.quote(clash_raw, safe="") + "&name=" + urllib.parse.quote(name_raw, safe=""))
 sr_deep = e("shadowrocket://add/sub://" + base64.b64encode(b64_raw.encode()).decode())
+clash_js = json.dumps(clash_raw)   # 安全的 JS 字符串字面量, 供 fetch 用
+limit_gb = e(os.environ.get("LIMIT_GB", "") or "—")
+try:
+    _exp = os.environ.get("EXP", "")
+    exp_disp = e(datetime.datetime.strptime(_exp, "%Y-%m-%d %H:%M:%S %z").strftime("%Y-%m-%d")) if _exp else "—"
+except Exception:
+    exp_disp = "—"
 def qr(data): return f'<img class="qr" alt="QR" src="data:image/png;base64,{data}">' if data else '<span class="muted">(装 qrencode 可显示二维码)</span>'
 chips = "".join(f"<span>{e(n)}</span>" for n in os.environ["NODES"].split(","))
 out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -703,9 +711,21 @@ img.qr{{background:#fff;padding:8px;border-radius:8px;width:170px;height:170px;m
 <div class="row"><a class="btn" href="{sr_deep}">⚡ 一键导入 Shadowrocket</a></div>
 {qr(os.environ.get("QR_B64",""))}</div>
 <div class="card"><b>节点</b><div class="nodes">{chips}</div></div>
+<div class="card"><b>流量 / 到期</b>
+<div class="row"><span>限额 <b>{limit_gb} GB</b></span><span class="muted">·</span><span>到期 <b>{exp_disp}</b></span><span class="muted">·</span><span>已用 <b id="used">查询中…</b></span></div>
+<p class="muted">已用为实时拉取订阅响应头（每 5 分钟由服务器刷新）。</p></div>
 <div class="card warn">⚠️ 此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</div>
 <p class="muted">管理（改限额 / 更新 / 加节点）请用 SSH：<code>bash install.sh menu</code></p>
-</div><script>function cp(i){{navigator.clipboard.writeText(document.getElementById(i).textContent)}}</script>
+</div><script>
+function cp(i){{navigator.clipboard.writeText(document.getElementById(i).textContent)}}
+(function(){{var el=document.getElementById('used');if(!el)return;
+fetch({clash_js},{{method:'HEAD'}}).then(function(r){{
+var u=r.headers.get('Subscription-Userinfo')||'';
+var d=/download=(\\d+)/.exec(u),t=/total=(\\d+)/.exec(u);
+if(d){{var g=(+d[1]/1073741824).toFixed(2);el.textContent=g+' GB'+(t&&+t[1]>0?(' / '+(+t[1]/1073741824).toFixed(0)+' GB'):'');}}
+else{{el.textContent='—';}}
+}}).catch(function(){{el.textContent='—';}});}})();
+</script>
 </body></html>'''
 sys.stdout.write(out)
 PY
@@ -1073,6 +1093,7 @@ print_summary() {
   echo
   printf '  管理命令:\n'
   printf '    查看信息:    bash install.sh info\n'
+  printf '    一键自检:    bash install.sh doctor   (排查不通先跑它)\n'
   printf '    看板页地址:  bash install.sh panel\n'
   printf '    分享链接:    bash install.sh links\n'
   printf '    备份/迁移:   bash install.sh backup   (新机: bash install.sh restore <文件>)\n'
@@ -1275,6 +1296,69 @@ do_status() {
   echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
 }
 
+do_doctor() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  # shellcheck disable=SC1090
+  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true; [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true
+  [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
+  SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
+  local issues=0
+  P(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
+  W(){ printf '  \033[33m!\033[0m %s\n' "$1"; issues=$((issues+1)); }
+  F(){ printf '  \033[31m✗\033[0m %s\n' "$1"; issues=$((issues+1)); }
+
+  echo "===== sing-box doctor 自检(常见坑) ====="
+  # 1) 服务
+  local s
+  for s in sing-box nginx; do
+    [ "$(systemctl is-active "$s" 2>/dev/null)" = active ] && P "$s 运行中" || F "$s 未运行: systemctl status $s"
+  done
+  # 2) 配置校验
+  sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1 && P "sing-box 配置校验通过" || F "sing-box 配置无效: sing-box check -c $SB_DIR/config.json"
+  nginx -t >/dev/null 2>&1 && P "nginx 配置校验通过" || F "nginx 配置无效: nginx -t"
+  # 3) 网络优化(HY2/QUIC 关键)
+  local rmem cc; rmem="$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)"
+  { [ "${rmem:-0}" -ge 16777216 ] 2>/dev/null && P "UDP 缓冲 rmem_max=$rmem (≥16MB, 利于 HY2)"; } || W "UDP 缓冲 rmem_max=$rmem <16MB: HY2 吞吐受限, 重跑 install 或 sysctl --system"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo)"
+  [ "$cc" = bbr ] && P "拥塞控制 = bbr" || W "拥塞控制 = ${cc:-未知}(非 bbr): 重跑 install 开 BBR"
+  # 4) 端口本地监听
+  local p miss=0
+  for p in "$HY2_PORT" "$VLESS_PORT" "$SS_PORT" 80; do
+    ss -lntuH 2>/dev/null | grep -qE "[:.]$p\b" || { W "端口 $p 本地未监听"; miss=1; }
+  done
+  [ "$miss" = 0 ] && P "节点端口本地监听正常 ($HY2_PORT/$VLESS_PORT/$SS_PORT/80)"
+  # 5) 防火墙 / 安全组(头号坑)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    W "ufw 已启用: 确认放行 $HY2_PORT/udp、$VLESS_PORT/tcp、$SS_PORT、80/tcp"
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    W "firewalld 已启用: 确认放行对应端口(含 UDP)"
+  else
+    P "未检测到本机防火墙(ufw/firewalld)启用"
+  fi
+  W "云厂商安全组要在控制台单独放行——HY2 是 UDP, 最容易漏放 UDP 端口!"
+  # 6) 时间同步(Reality/TLS 敏感)
+  [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && P "系统时间已同步" || W "系统时间未同步: timedatectl set-ntp true"
+  # 7) 证书到期
+  if [ -f "$SB_DIR/server.crt" ]; then
+    openssl x509 -checkend $((30*86400)) -noout -in "$SB_DIR/server.crt" >/dev/null 2>&1 && P "自签证书 30 天内不过期" || W "自签证书 30 天内将过期: 重跑 install 重新生成"
+  fi
+  # 8) 订阅可达
+  curl -fsS -o /dev/null -m 5 "http://127.0.0.1$SUB_PATH" 2>/dev/null && P "订阅本机可达" || F "订阅本机不可达: 看 nginx -t / $WWW 权限"
+  if [ -n "${PUBLIC_IP:-}" ]; then
+    curl -fsS -o /dev/null -m 6 "http://$PUBLIC_IP$SUB_PATH" 2>/dev/null && P "订阅经公网 IP 可达" \
+      || W "订阅经公网 IP 不可达(可能是 hairpin 不支持, 不一定是真问题): 用手机流量/外部网络测 http://$SUB_HOST$SUB_PATH"
+  fi
+  # 9) 可选组件
+  [ -f "$CF_ENV" ] && { [ "$(systemctl is-active cloudflared 2>/dev/null)" = active ] && P "cloudflared(CF-Vless) 运行中" || W "cloudflared 未运行: systemctl status cloudflared"; }
+  if [ -f /etc/systemd/system/sing-box-porthop.service ]; then
+    { command -v nft >/dev/null 2>&1 && nft list table inet sb_hophy2 >/dev/null 2>&1 && P "端口跳跃 nftables 表在位"; } || W "端口跳跃服务装了但 nft 表缺失: systemctl restart sing-box-porthop"
+  fi
+  [ -n "${WARP_PRIVATE_KEY:-}" ] && P "WARP 解锁分流已配置(站点: ${WARP_SITES:-openai,netflix,disney})"
+  echo "======================================="
+  { [ "$issues" = 0 ] && ok "全部检查通过 ✓"; } || warn "$issues 项需关注(见上面 ! / ✗)"
+}
+
 do_set() {
   [ -f "$ENVFILE" ] || die "未检测到安装(缺 $ENVFILE)"
   [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE)"
@@ -1333,6 +1417,7 @@ do_menu() {
     echo "  p) 看板页地址            k) 装 Komari 探针"
     echo "  b) 备份                  r) 恢复(迁移)"
     echo "  h) SSH 加固(密钥登录)    w) WARP 解锁分流"
+    echo "  d) doctor 自检(常见坑)"
     printf '  选择: '
     read -r c || break
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
@@ -1356,6 +1441,7 @@ do_menu() {
       r|R) printf '  备份文件路径: '; read -r rf || true; [ -n "${rf:-}" ] && { ( do_restore "$rf" ) || true; } ;;
       h|H) ( do_harden ) || true ;;
       w|W) ( do_warp ) || true ;;
+      d|D) ( do_doctor ) || true ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -1622,6 +1708,7 @@ main() {
     panel)     do_panel ;;
     links)     do_links ;;
     status)    do_status ;;
+    doctor)    do_doctor ;;
     set)       shift; do_set "$@" ;;
     backup)    do_backup ;;
     restore)   shift; do_restore "$@" ;;
@@ -1633,7 +1720,7 @@ main() {
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|links|status|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 

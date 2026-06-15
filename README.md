@@ -125,6 +125,7 @@ sudo bash install.sh info        # 重新打印订阅 URL 和节点信息
 sudo bash install.sh panel       # 打印可视化看板页地址(浏览器看订阅+扫码+复制)
 sudo bash install.sh links       # 打印每个节点分享链接 + 两个订阅 URL(+ 二维码)
 sudo bash install.sh status      # 状态体检: 服务/配置/端口/时间/证书/限额/订阅可达
+sudo bash install.sh doctor      # 一键自检常见坑: sysctl调优/防火墙+安全组/证书到期/外部可达/端口跳跃, 带修复提示
 sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/网卡, 即时刷新流量头
 sudo bash install.sh backup      # 打包密钥+配置 -> /root/sing-box-backup-时间.tar.gz
 sudo bash install.sh restore <文件>   # 新 VPS 上恢复(同一套凭证, 客户端不用换密码)
@@ -249,6 +250,8 @@ sudo bash install.sh warp off    # 关闭, 恢复全部直连
 ---
 
 ## 排查
+
+**连不上先跑 `sudo bash install.sh doctor`**——它会一次性核对服务/配置/端口/sysctl 调优/防火墙/安全组/时间/证书/订阅内外可达，并给出每一项的修复命令。下面是手动逐项排查：
 
 ```bash
 systemctl is-active sing-box nginx vnstat        # 服务在跑?
