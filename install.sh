@@ -665,10 +665,15 @@ render_panel_html() {
   AIRPORT_NAME="$AIRPORT_NAME" CLASH_URL="$clash_url" B64_URL="$b64_url" \
   QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODES="$nodes" \
   "$PY" - <<'PY'
-import os, html, sys
+import os, html, sys, urllib.parse, base64
 e = html.escape
-name = e(os.environ.get("AIRPORT_NAME", "Node"))
-clash = e(os.environ["CLASH_URL"]); b64 = e(os.environ["B64_URL"])
+name_raw = os.environ.get("AIRPORT_NAME", "Node")
+name = e(name_raw)
+clash_raw = os.environ["CLASH_URL"]; b64_raw = os.environ["B64_URL"]
+clash = e(clash_raw); b64 = e(b64_raw)
+# 一键导入深链: Clash 系吃 clash://install-config; Shadowrocket 吃 shadowrocket://add/sub://<base64(订阅URL)>
+clash_deep = e("clash://install-config?url=" + urllib.parse.quote(clash_raw, safe="") + "&name=" + urllib.parse.quote(name_raw, safe=""))
+sr_deep = e("shadowrocket://add/sub://" + base64.b64encode(b64_raw.encode()).decode())
 def qr(data): return f'<img class="qr" alt="QR" src="data:image/png;base64,{data}">' if data else '<span class="muted">(装 qrencode 可显示二维码)</span>'
 chips = "".join(f"<span>{e(n)}</span>" for n in os.environ["NODES"].split(","))
 out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -682,6 +687,7 @@ body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0e11
 .row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
 code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;word-break:break-all;flex:1;min-width:200px;font-size:.82rem}}
 button{{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:.85rem}} button:active{{opacity:.7}}
+a.btn{{display:inline-block;background:#1f6feb;color:#fff;text-decoration:none;border-radius:6px;padding:8px 14px;font-size:.85rem;margin-top:8px}} a.btn:active{{opacity:.7}}
 img.qr{{background:#fff;padding:8px;border-radius:8px;width:170px;height:170px;margin-top:12px}}
 .nodes span{{display:inline-block;background:#21262d;border:1px solid #30363d;border-radius:20px;padding:4px 12px;margin:3px;font-size:.85rem}}
 .warn{{background:#3d1c1c;border-color:#5c2626;color:#ffb4b4}}
@@ -690,9 +696,11 @@ img.qr{{background:#fff;padding:8px;border-radius:8px;width:170px;height:170px;m
 <p class="muted">导入下面任一订阅；手机可直接扫码。</p>
 <div class="card"><b>Clash / Mihomo 订阅</b>
 <div class="row"><code id="u1">{clash}</code><button onclick="cp('u1')">复制</button></div>
+<div class="row"><a class="btn" href="{clash_deep}">⚡ 一键导入 Clash / Mihomo</a></div>
 {qr(os.environ.get("QR_CLASH",""))}</div>
 <div class="card"><b>通用订阅（v2rayN / Shadowrocket / NekoBox）</b>
 <div class="row"><code id="u2">{b64}</code><button onclick="cp('u2')">复制</button></div>
+<div class="row"><a class="btn" href="{sr_deep}">⚡ 一键导入 Shadowrocket</a></div>
 {qr(os.environ.get("QR_B64",""))}</div>
 <div class="card"><b>节点</b><div class="nodes">{chips}</div></div>
 <div class="card warn">⚠️ 此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</div>
@@ -1116,6 +1124,14 @@ do_links() {
   echo "===== 订阅 URL ====="
   printf 'Clash/Mihomo:  http://%s%s\n' "$SUB_HOST" "$SUB_PATH"
   [ -n "${SUB_B64_PATH:-}" ] && printf '通用(base64):  http://%s%s\n' "$SUB_HOST" "$SUB_B64_PATH"
+  echo
+  echo "===== 一键导入深链(在装了客户端的设备上点开即可导入) ====="
+  local _cu="http://$SUB_HOST$SUB_PATH"
+  printf 'Clash/Mihomo:  clash://install-config?url=%s&name=%s\n' \
+    "$("$PY" -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$_cu")" \
+    "$("$PY" -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$AIRPORT_NAME")"
+  [ -n "${SUB_B64_PATH:-}" ] && printf 'Shadowrocket:  shadowrocket://add/sub://%s\n' \
+    "$("$PY" -c 'import base64,sys;print(base64.b64encode(sys.argv[1].encode()).decode())' "http://$SUB_HOST$SUB_B64_PATH")"
   if ! command -v qrencode >/dev/null 2>&1; then
     echo "(装 qrencode 后这里会出二维码: apt install -y qrencode)"
   elif [ -n "${SUB_B64_PATH:-}" ]; then

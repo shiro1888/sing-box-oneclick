@@ -170,6 +170,8 @@ chkp 'sub-b64-x.txt'      '通用订阅 URL'
 chkp 'SS2022'             'SS2022 节点'
 chkp '含全部节点凭证'      '明文安全警告'
 chkp 'navigator.clipboard' '复制 JS'
+chkp 'clash://install-config?url=http%3A%2F%2F1.2.3.4%2Fsub-x.yaml&amp;name=MyNode' 'Clash 一键导入深链(URL编码+转义)'
+chkp 'shadowrocket://add/sub://aHR0cDovLzEuMi4zLjQvc3ViLWI2NC14LnR4dA==' 'Shadowrocket 深链(base64订阅URL)'
 if printf '%s' "$PANEL" | grep -qF 'CF-Vless'; then echo "FAIL  未开CF看板却有CF-Vless"; fail=1; else echo "PASS  未开CF看板无CF-Vless(条件渲染)"; fi
 PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=u render render_panel_html)"
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
