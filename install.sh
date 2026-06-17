@@ -1669,6 +1669,19 @@ do_doctor() {
   if [ -f /etc/systemd/system/singbox-admin.service ]; then
     { [ "$(systemctl is-active singbox-admin 2>/dev/null)" = active ] && P "网页管理面板运行中(仅 127.0.0.1)"; } || W "网页管理面板服务未运行: journalctl -u singbox-admin"
   fi
+  # 10) 低配/负载体检("服务 active 但节点像挂了" 多半在这里)
+  local mem_a mem_t sw iowait dproc
+  mem_a="$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null)"
+  mem_t="$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)"
+  [ -n "$mem_a" ] && { { [ "$mem_a" -ge 150 ] 2>/dev/null && P "可用内存 ${mem_a}MB / ${mem_t}MB"; } || W "可用内存仅 ${mem_a}MB: 低配机建议加 1G swap(日志已默认 warn)"; }
+  sw="$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)"
+  { [ "${sw:-0}" -gt 0 ] 2>/dev/null && P "swap ${sw}MB"; } || W "无 swap: 低内存机有 OOM 风险, 建议加 1G swap"
+  if [ -r /proc/pressure/io ]; then
+    iowait="$(awk -F'[=. ]' '/^some/{print $3; exit}' /proc/pressure/io 2>/dev/null)"
+    { [ "${iowait:-0}" -lt 20 ] 2>/dev/null && P "I/O 压力 some avg10≈${iowait:-0}%(正常)"; } || W "I/O 压力高(some avg10≈${iowait}%): 磁盘/日志在拖系统, SSH/sing-box 会像卡死; 降日志、停非必要常驻服务"
+  fi
+  dproc="$(ps -eo stat= 2>/dev/null | grep -c '^D' || true)"
+  { [ "${dproc:-0}" -eq 0 ] 2>/dev/null && P "无 D(不可中断 IO)状态进程"; } || W "$dproc 个进程处于 D 状态(IO 卡住): ps -eo pid,stat,wchan:20,comm | awk '\$2~/D/'"
   echo "======================================="
   { [ "$issues" = 0 ] && ok "全部检查通过 ✓"; } || warn "$issues 项需关注(见上面 ! / ✗)"
 }
@@ -1865,6 +1878,17 @@ EOF
   cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
   cloudflared service install "$CF_TOKEN" || die "cloudflared service install 失败(token 是否正确?)"
   systemctl enable --now cloudflared >/dev/null 2>&1 || true
+  # ③ 低配/丢包机器硬化 cloudflared: 强制 http2(抖动链路比 QUIC 稳) + 放宽启动超时, 避免反复重启失败
+  local cfsvc=/etc/systemd/system/cloudflared.service
+  if [ -f "$cfsvc" ]; then
+    cp -a "$cfsvc" "${cfsvc}.singbox-bak.$(date +%s)" 2>/dev/null || true
+    grep -q -- '--protocol' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --protocol http2#' "$cfsvc"
+    grep -q '^TimeoutStartSec=' "$cfsvc" || sed -i '/^\[Service\]/a TimeoutStartSec=60' "$cfsvc"
+    sed -i 's/^Type=notify/Type=simple/' "$cfsvc"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart cloudflared >/dev/null 2>&1 || true
+    ok "cloudflared 已硬化: --protocol http2 + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
+  fi
 
   # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
@@ -1875,15 +1899,19 @@ EOF
   write_subscription   # 同时刷新 Clash 订阅与通用(base64)订阅, 都带上 CF-Vless
 
   ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
-  log "验证隧道(看到 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
-  if curl -isS -m 10 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-       -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' \
-       "https://$CF_HOSTNAME$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
-    ok "隧道连通(101 Switching Protocols)。客户端重新拉取订阅即可看到 CF-Vless。"
+  # ② 先验本机 28080 入站, 再验公网隧道: 一眼分清是 sing-box 坏还是 cloudflared/Tunnel 坏
+  log "验证(先本机 28080, 再公网隧道; 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
+  local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
+  if curl -isS -m 8 --http1.1 -H "Host: $CF_HOSTNAME" "${ws_hdr[@]}" "http://127.0.0.1:$CF_PORT$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
+    ok "本机 WS 入站 127.0.0.1:$CF_PORT 正常(101) —— sing-box 侧 OK"
   else
-    warn "暂未拿到 101: cloudflared 可能还在连接, 或 CF 后台 hostname→http://127.0.0.1:$CF_PORT 未配好。"
-    echo "  等几秒后手动复测: systemctl is-active cloudflared sing-box"
-    echo "  curl -i -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13' https://$CF_HOSTNAME$CF_WS_PATH"
+    warn "本机 WS 入站未拿到 101: 先查 sing-box 的 cf-vless-ws-in / CF_WS_PATH / CF_VLESS_UUID(不是 cloudflared 的锅)"
+  fi
+  if curl -isS -m 10 "${ws_hdr[@]}" "https://$CF_HOSTNAME$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
+    ok "公网隧道连通(101)。客户端重新拉订阅即可看到 CF-Vless。"
+  else
+    warn "公网未拿到 101: 若上面本机 101 正常, 问题在 cloudflared/DNS/Tunnel(502/530/1033 这类), 不在 sing-box。"
+    echo "  复测: systemctl is-active cloudflared sing-box; journalctl -u cloudflared -n 50 --no-pager | grep -Ei 'Registered|timeout|error|quic|http2'"
   fi
 }
 
