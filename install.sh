@@ -436,7 +436,7 @@ JSON
   fi
   cat <<JSON
 {
-  "log": { "disabled": false, "level": "info" },
+  "log": { "disabled": false, "level": "warn" },
   "inbounds": [
     {
       "type": "hysteria2",
