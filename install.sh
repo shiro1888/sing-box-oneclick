@@ -12,7 +12,7 @@
 #
 #  常用环境变量(可选,覆盖默认):
 #    LIMIT_GB=200            每月显示/限流额度
-#    COUNT_MODE=rx+tx        计费方式 rx+tx|tx|max
+#    COUNT_MODE=tx           计费方式 tx(默认,匹配多数商家)|max|rx+tx(仅真双向计费)
 #    EXPIRE_AT="..."         到期时间(默认安装日+365天)
 #    DOMAIN=node.example.com 订阅域名(留空=用公网IP,无需域名)
 #    AIRPORT_NAME=MyNode     客户端订阅显示名
@@ -52,9 +52,9 @@ PY="${PYTHON:-python3}"
 
 # ----------------------------------------------------------------- 配置(env 可覆盖)
 LIMIT_GB="${LIMIT_GB:-200}"
-COUNT_MODE="${COUNT_MODE:-rx+tx}"
+COUNT_MODE="${COUNT_MODE:-tx}"
 DOMAIN="${DOMAIN:-}"
-AIRPORT_NAME="${AIRPORT_NAME:-MyNode}"
+AIRPORT_NAME="${AIRPORT_NAME:-US-01}"
 HY2_PORT="${HY2_PORT:-4433}"
 ANYTLS_PORT="${ANYTLS_PORT:-4434}"
 VLESS_PORT="${VLESS_PORT:-443}"
@@ -228,6 +228,7 @@ detect_net() {
   SUB_HOST="${DOMAIN:-$PUBLIC_IP}"
   ok "公网 IP: $PUBLIC_IP   网卡: $INTERFACE"
   [ -n "$DOMAIN" ] && note "订阅域名 $DOMAIN: 请确认已把它的 DNS A 记录解析到 $PUBLIC_IP(本脚本无法替你改 DNS)。"
+  return 0
 }
 
 # SS2022 密钥: base64, 长度按方法自适应(128-gcm=16字节, 256/chacha=32字节)
@@ -1120,11 +1121,11 @@ def current_month_used(data, interface, mode, now=None):
             rx = m.get("rx", 0)
             tx = m.get("tx", 0)
             break
-    if mode == "tx":
-        return tx
+    if mode == "rx+tx":
+        return rx + tx  # 仅商家真按"进+出"计费才用; 代理 rx≈tx, 这是真实用量的约 2 倍
     if mode == "max":
         return max(rx, tx)
-    return rx + tx
+    return tx  # 默认 tx: 只算出站, 匹配绝大多数商家(rx+tx 会翻倍误算)
 
 
 def build_header(used, total, expire):
@@ -1144,7 +1145,7 @@ def main():
     env = load_env()
     limit_bytes = int(float(env.get("LIMIT_GB", "200")) * 1024 ** 3)
     interface = env.get("INTERFACE", "eth0")
-    mode = env.get("COUNT_MODE", "rx+tx")
+    mode = env.get("COUNT_MODE", "tx")
     expire = parse_expire(env["EXPIRE_AT"])
 
     try:
