@@ -19,14 +19,15 @@
 #    PUBLIC_IP=1.2.3.4       手动指定公网IP(探测失败时)
 #    HY2_PORT/ANYTLS_PORT/VLESS_PORT/SS_PORT  端口(默认 4433/4434/443/4435)
 #    SS_METHOD=2022-blake3-aes-128-gcm  SS2022 加密方法(可改 256-gcm/chacha)
-#    REALITY_SNI/TLS_SNI     伪装域名(默认 www.microsoft.com / www.bing.com)
+#    REALITY_SNI/TLS_SNI     伪装域名(默认均为 www.bing.com)
 #    ENABLE_BBR=1            开启 BBR(默认开,纯 sysctl,安全)
 #    ENABLE_UFW=0            自动配置并启用 ufw(默认关,避免锁死SSH)
 #    ENABLE_OBFS=1           HY2 salamander 混淆(默认开, 抗 QUIC 识别)
 #    ENABLE_BLOCK_BT=1       拦截 BT/PT(默认开, 防被商家封机收滥用投诉)
 #    ENABLE_BLOCK_ADS=1      geosite 拦广告(默认开, 远程 rule_set)
 #    HY2_HOP_RANGE=20000-50000  HY2 端口跳跃 UDP 段(需 nftables + 云安全组放行整段)
-#    HY2_UP=50 HY2_DOWN=200      HY2 brutal 带宽 Mbps(要填你真实带宽, 烂线路提速)
+#    HY2_UP=50 HY2_DOWN=200      HY2 brutal 带宽 Mbps(客户端拥塞控制, 要填你真实带宽, 烂线路提速)
+#    HY2_UP_MBPS=80 HY2_DOWN_MBPS=160  HY2 服务端带宽护栏(给套餐峰值留余量, 防压测打爆 UDP 队列)
 #
 #  可选第5节点 CF-Vless(大保底, 需先在 CF 后台建 Tunnel 拿 token+域名):
 #    CF_TOKEN=... CF_HOSTNAME=cf.example.com  bash install.sh cf
@@ -61,7 +62,7 @@ VLESS_PORT="${VLESS_PORT:-443}"
 SS_PORT="${SS_PORT:-4435}"
 SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
 CF_PORT="${CF_PORT:-28080}"   # CF-Vless 本地 WS 入站端口(只听 127.0.0.1)
-REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
+REALITY_SNI="${REALITY_SNI:-www.bing.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
@@ -71,8 +72,10 @@ ENABLE_BLOCK_ADS="${ENABLE_BLOCK_ADS:-1}"  # geosite 拦广告(默认开; 用远
 KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"  # Komari 探针面板地址(install.sh komari 用)
 KOMARI_TOKEN="${KOMARI_TOKEN:-}"        # Komari 节点 token
 HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"   # HY2 端口跳跃 UDP 段(如 20000-50000, 空=不启用; 需 nftables+云安全组放行整段)
-HY2_UP="${HY2_UP:-}"                 # HY2 brutal 上行 Mbps(空=自适应; 设了即开暴力模式, 要填你真实带宽)
+HY2_UP="${HY2_UP:-}"                 # HY2 brutal 上行 Mbps(客户端拥塞控制; 空=自适应; 设了即开暴力模式, 要填你真实带宽)
 HY2_DOWN="${HY2_DOWN:-}"             # HY2 brutal 下行 Mbps(同上)
+HY2_UP_MBPS="${HY2_UP_MBPS:-}"       # HY2 服务端带宽护栏 up_mbps(空=不限; 按套餐峰值留余量, 防压测/多人下载打爆 UDP 队列)
+HY2_DOWN_MBPS="${HY2_DOWN_MBPS:-}"   # HY2 服务端带宽护栏 down_mbps(同上; 200Mbps 峰值机参考 up=80/down=160)
 
 # 路径
 SB_DIR=/etc/sing-box
@@ -108,8 +111,9 @@ PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secret
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
 # WARP 解锁分流(warp.env 提供; WARP_PRIVATE_KEY 非空=启用)
+WARP_DEFAULT_SITES="openai,anthropic,google-gemini,netflix,disney"
 WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"; WARP_ADDR_V4="${WARP_ADDR_V4:-}"; WARP_ADDR_V6="${WARP_ADDR_V6:-}"; WARP_RESERVED="${WARP_RESERVED:-}"
-WARP_SITES="${WARP_SITES:-}"   # 走 WARP 的 geosite 列表(逗号分隔, 可自定义; 空=render 用默认 openai,netflix,disney)
+WARP_SITES="${WARP_SITES:-}"   # 走 WARP 的 geosite 列表(逗号分隔, 可自定义; 空=render 用 WARP_DEFAULT_SITES)
 
 # ----------------------------------------------------------------- 工具
 need_root() { [ "$(id -u)" = 0 ] || die "请用 root 运行(sudo bash install.sh)"; }
@@ -142,8 +146,8 @@ validate_inputs() {
     done
   fi
   local v
-  for v in "$HY2_UP" "$HY2_DOWN"; do
-    [ -z "$v" ] || case "$v" in *[!0-9]*) die "HY2_UP/HY2_DOWN 要是数字(Mbps): '$v'";; esac
+  for v in "$HY2_UP" "$HY2_DOWN" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS"; do
+    [ -z "$v" ] || case "$v" in *[!0-9]*) die "HY2_UP/HY2_DOWN/HY2_UP_MBPS/HY2_DOWN_MBPS 要是数字(Mbps): '$v'";; esac
   done
   [ -z "$OBFS_PASSWORD" ] || case "$OBFS_PASSWORD" in *[!A-Za-z0-9]*) die "OBFS_PASSWORD 只能含字母数字: '$OBFS_PASSWORD'";; esac
 }
@@ -224,6 +228,8 @@ detect_net() {
     [ "${SOFT_DETECT:-0}" = 1 ] && PUBLIC_IP="<未探测到IP>" || die "无法探测公网 IP, 请用 PUBLIC_IP=x.x.x.x 重新运行"
   fi
   INTERFACE="${INTERFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
+  # 纯 IPv6 机器 IPv4 探测会失败, 再用 IPv6 兜底; 否则网卡被误写成 eth0 会让 vnstat 取不到数据、限流首次报错
+  [ -z "$INTERFACE" ] && INTERFACE="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   INTERFACE="${INTERFACE:-eth0}"
   SUB_HOST="${DOMAIN:-$PUBLIC_IP}"
   ok "公网 IP: $PUBLIC_IP   网卡: $INTERFACE"
@@ -312,17 +318,17 @@ check_reality_sni() {
   log "校验 Reality 偷证书目标 $host (需 TLS1.3, 建议 H2)..."
   out="$( { echo | timeout 8 openssl s_client -connect "$host:443" -servername "$host" -alpn h2; } 2>/dev/null )" || true
   if ! printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
-    note "Reality 偷证书目标 $host:443 连不上(网络/被墙?), 没能校验。确认它在 VPS 上能直连且支持 TLS1.3(默认 www.microsoft.com 一般没问题)。"
+    note "Reality 偷证书目标 $host:443 连不上(网络/被墙?), 没能校验。确认它在 VPS 上能直连且支持 TLS1.3(默认 www.bing.com 一般没问题)。"
     return 0
   fi
   if printf '%s' "$out" | grep -q 'TLSv1.3'; then
     if printf '%s' "$out" | grep -qE 'ALPN protocol: *h2$'; then
       ok "Reality SNI $host: TLS1.3 + H2 ✓"
     else
-      note "Reality SNI $host 支持 TLS1.3 但未协商出 H2: 能用, 但建议换个支持 HTTP/2 的目标更隐蔽(如 www.microsoft.com)。"
+      note "Reality SNI $host 支持 TLS1.3 但未协商出 H2: 能用, 但建议换个支持 HTTP/2 的目标更隐蔽(如 www.bing.com)。"
     fi
   else
-    note "Reality SNI $host 不支持 TLS1.3 ✗(偷证书目标的硬性要求, 握手会有问题): 换成确定支持 TLS1.3 的大站, 如 www.microsoft.com / www.cloudflare.com / www.apple.com。"
+    note "Reality SNI $host 不支持 TLS1.3 ✗(偷证书目标的硬性要求, 握手会有问题): 换成确定支持 TLS1.3 的大站, 如 www.bing.com / www.cloudflare.com / www.apple.com。"
   fi
 }
 
@@ -340,6 +346,8 @@ PUBLIC_IP="$PUBLIC_IP"
 HY2_HOP_RANGE=$HY2_HOP_RANGE
 HY2_UP=$HY2_UP
 HY2_DOWN=$HY2_DOWN
+HY2_UP_MBPS=$HY2_UP_MBPS
+HY2_DOWN_MBPS=$HY2_DOWN_MBPS
 ENABLE_BLOCK_BT=$ENABLE_BLOCK_BT
 ENABLE_BLOCK_ADS=$ENABLE_BLOCK_ADS
 EOF
@@ -379,6 +387,10 @@ JSON
   fi
   local obfs_line=""
   [ -n "$OBFS_PASSWORD" ] && obfs_line=$'\n      "obfs": { "type": "salamander", "password": "'"$OBFS_PASSWORD"'" },'
+  # HY2 服务端带宽护栏(up_mbps/down_mbps): 给套餐峰值留余量, 防压测/多人下载把 UDP 队列与 I/O wait 打爆
+  local hy2_bw_line=""
+  [ -n "$HY2_UP_MBPS" ]   && hy2_bw_line="$hy2_bw_line"$'\n      "up_mbps": '"$HY2_UP_MBPS"','
+  [ -n "$HY2_DOWN_MBPS" ] && hy2_bw_line="$hy2_bw_line"$'\n      "down_mbps": '"$HY2_DOWN_MBPS"','
   local route_json="" warp_ep=""
   if [ "$ENABLE_BLOCK_BT" = 1 ] || [ "$ENABLE_BLOCK_ADS" = 1 ] || [ -n "$WARP_PRIVATE_KEY" ]; then
     local rules="" rsets=""
@@ -391,9 +403,9 @@ JSON
       { "tag": "geosite-ads", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs", "download_detour": "direct" },'
     fi
     if [ -n "$WARP_PRIVATE_KEY" ]; then
-      # WARP_SITES 可配置(逗号分隔的 geosite 名), 默认 openai/netflix/disney
+      # WARP_SITES 可配置(逗号分隔的 geosite 名), 默认覆盖 OpenAI/Claude/Gemini/流媒体
       local site tags=""
-      for site in $(printf '%s' "${WARP_SITES:-openai,netflix,disney}" | tr ',' ' '); do
+      for site in $(printf '%s' "${WARP_SITES:-$WARP_DEFAULT_SITES}" | tr ',' ' '); do
         site="$(printf '%s' "$site" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"   # 清洗防注入
         [ -n "$site" ] || continue
         tags="$tags\"geosite-$site\","
@@ -443,7 +455,7 @@ JSON
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": $HY2_PORT,
-      "users": [ { "password": "$HY2_PASSWORD" } ],$obfs_line
+      "users": [ { "password": "$HY2_PASSWORD" } ],$obfs_line$hy2_bw_line
       "tls": { "enabled": true, "certificate_path": "$SB_DIR/server.crt", "key_path": "$SB_DIR/server.key" }
     },
 $anytls_block
@@ -582,6 +594,20 @@ rules += [
     "  - IP-CIDR,198.18.0.0/16,DIRECT,no-resolve",
     "  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
 ]
+# Google Play / GMS 下载链路必须放在国内直连规则前面, 避免下载 CDN 被误判 DIRECT 后卡 99%。
+rules += [
+    "  - GEOSITE,google,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,google.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,googleapis.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,gstatic.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,googleusercontent.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,ggpht.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,gvt1.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,gvt2.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,gvt3.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,android.com,🚀 节点选择",
+    "  - DOMAIN-SUFFIX,google-analytics.com,🚀 节点选择",
+]
 for d in ["qq.com","weixin.com","wechat.com","gtimg.com","qpic.cn","bilibili.com","b23.tv",
           "hdslb.com","taobao.com","tmall.com","jd.com","360buyimg.com","alicdn.com","aliyun.com",
           "alipay.com","douyin.com","iesdouyin.com","byteimg.com","bytedance.com","amap.com",
@@ -591,7 +617,7 @@ for d in ["qq.com","weixin.com","wechat.com","gtimg.com","qpic.cn","bilibili.com
 rules += ["  - GEOSITE,cn,DIRECT", "  - GEOIP,CN,DIRECT", "  - MATCH,🚀 节点选择"]
 
 doc = f'''mixed-port: 7897
-allow-lan: true
+allow-lan: false
 mode: rule
 log-level: info
 ipv6: false
@@ -1020,15 +1046,22 @@ config_nginx() {
   render_header "$EXPIRE_VALUE" >"$NGINX_SNIPPET"
   chmod 644 "$NGINX_SNIPPET"
 
-  # 用 server_name 精确匹配本机 IP/域名, 不抢 default_server, 避免与机器上已有站点撞 "duplicate default server"
-  local v6=""
+  # 双 server: 默认 Host/IP 一律 404; 只有订阅域名/IP 的精确随机路径返回内容。
+  local v6_default="" v6_named=""
   if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
-    v6=$'\n    listen [::]:80;'
+    v6_default=$'\n    listen [::]:80 default_server;'
+    v6_named=$'\n    listen [::]:80;'
   fi
   rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
   cat >"$NGINX_CONF" <<EOF
 server {
-    listen 80;$v6
+    listen 80 default_server;$v6_default
+    server_name _;
+    return 404;
+}
+
+server {
+    listen 80;$v6_named
     root $WWW;
     server_name $SUB_HOST;
 
@@ -1086,7 +1119,8 @@ import os
 
 ENV_PATH = "/etc/sing-box-node.env"
 HEADER_PATH = "/etc/nginx/snippets/sub_headers.conf"
-QUOTA_FLAG = "/run/sing-box-quota-stopped"
+STATE_DIR = "/var/lib/sing-box-node"
+QUOTA_FLAG = os.path.join(STATE_DIR, "quota-stopped")
 
 
 def load_env(path=ENV_PATH):
@@ -1135,18 +1169,25 @@ def build_header(used, total, expire):
 
 def decide_enforcement(used, limit_bytes, active, flag_exists):
     if used >= limit_bytes:
-        return ("stop" if active else None, True)
+        if active:
+            return ("stop", True)        # 超额且在跑: 停掉并打配额标记
+        # 已经停了: 只有原本就是配额停(有标记)才保留标记;
+        # 手动停(无标记)不抢标记, 否则下月恢复会被误当配额停机拉起。
+        return (None, flag_exists)
     if flag_exists:
         return ("start" if not active else None, False)
-    return (None, False)
+    return (None, False)  # 无标记的手动停机: 不动
 
 
 def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
     env = load_env()
     limit_bytes = int(float(env.get("LIMIT_GB", "200")) * 1024 ** 3)
     interface = env.get("INTERFACE", "eth0")
     mode = env.get("COUNT_MODE", "tx")
-    expire = parse_expire(env["EXPIRE_AT"])
+    # EXPIRE_AT 缺失/为空时不崩溃, 回退 expire=0(多数客户端视为"无到期")。
+    expire_raw = env.get("EXPIRE_AT")
+    expire = parse_expire(expire_raw) if expire_raw else 0
 
     try:
         result = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
@@ -1335,7 +1376,7 @@ print_summary() {
   printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
   printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
   [ -n "$CF_HOSTNAME" ] && printf '    - CF-Vless   (WS via %s, Argo 大保底)\n' "$CF_HOSTNAME"
-  [ -n "$WARP_PRIVATE_KEY" ] && printf '    * WARP 解锁分流已开 (OpenAI/Netflix/Disney 走 WARP)\n'
+  [ -n "$WARP_PRIVATE_KEY" ] && printf '    * WARP 解锁分流已开 (%s 走 WARP)\n' "${WARP_SITES:-$WARP_DEFAULT_SITES}"
   echo
   printf '  管理命令:\n'
   printf '    查看信息:    bash install.sh info\n'
@@ -1625,6 +1666,9 @@ do_doctor() {
   for s in sing-box nginx; do
     [ "$(systemctl is-active "$s" 2>/dev/null)" = active ] && P "$s 运行中" || F "$s 未运行: systemctl status $s"
   done
+  for s in vnstat cron; do   # 流量统计/限流依赖, 挂了降级为警告(部分系统服务名为 vnstatd/crond)
+    [ "$(systemctl is-active "$s" 2>/dev/null)" = active ] && P "$s 运行中" || W "$s 未运行(流量统计/限流依赖它): systemctl status $s"
+  done
   # 2) 配置校验
   sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1 && P "sing-box 配置校验通过" || F "sing-box 配置无效: sing-box check -c $SB_DIR/config.json"
   nginx -t >/dev/null 2>&1 && P "nginx 配置校验通过" || F "nginx 配置无效: nginx -t"
@@ -1662,10 +1706,18 @@ do_doctor() {
   fi
   # 9) 可选组件
   [ -f "$CF_ENV" ] && { [ "$(systemctl is-active cloudflared 2>/dev/null)" = active ] && P "cloudflared(CF-Vless) 运行中" || W "cloudflared 未运行: systemctl status cloudflared"; }
+  if [ -f "$CF_ENV" ] && [ -n "${CF_WS_PATH:-}" ]; then   # 本机 WS 入站 101: 区分"sing-box 入站坏"还是"cloudflared/隧道坏"
+    local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
+    if curl -isS -m 6 --http1.1 -H "Host: ${CF_HOSTNAME:-localhost}" "${ws_hdr[@]}" "http://127.0.0.1:${CF_PORT:-28080}$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
+      P "CF-Vless 本机 WS 入站 101(sing-box 侧 OK; 公网不通则查 cloudflared/DNS/Tunnel)"
+    else
+      W "CF-Vless 本机 WS 入站未拿到 101: 查 sing-box 的 cf-vless-ws-in / CF_WS_PATH / CF_VLESS_UUID"
+    fi
+  fi
   if [ -f /etc/systemd/system/sing-box-porthop.service ]; then
     { command -v nft >/dev/null 2>&1 && nft list table inet sb_hophy2 >/dev/null 2>&1 && P "端口跳跃 nftables 表在位"; } || W "端口跳跃服务装了但 nft 表缺失: systemctl restart sing-box-porthop"
   fi
-  [ -n "${WARP_PRIVATE_KEY:-}" ] && P "WARP 解锁分流已配置(站点: ${WARP_SITES:-openai,netflix,disney})"
+  [ -n "${WARP_PRIVATE_KEY:-}" ] && P "WARP 解锁分流已配置(站点: ${WARP_SITES:-$WARP_DEFAULT_SITES})"
   if [ -f /etc/systemd/system/singbox-admin.service ]; then
     { [ "$(systemctl is-active singbox-admin 2>/dev/null)" = active ] && P "网页管理面板运行中(仅 127.0.0.1)"; } || W "网页管理面板服务未运行: journalctl -u singbox-admin"
   fi
@@ -1799,7 +1851,7 @@ do_uninstall() {
   [ -n "${SUB_B64_PATH:-}" ] && rm -f "$WWW$SUB_B64_PATH" 2>/dev/null || true
   [ -n "${PANEL_PATH:-}" ] && rm -f "$WWW$PANEL_PATH" 2>/dev/null || true
   rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt "$WWW"/panel-*.html 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅/看板文件
-  rm -f /run/sing-box-quota-stopped 2>/dev/null || true
+  rm -f /var/lib/sing-box-node/quota-stopped /run/sing-box-quota-stopped 2>/dev/null || true
   rm -f "$WARP_ENV" 2>/dev/null || true   # WARP 分流状态(wgcf 二进制保留, 无害)
   if [ -f /etc/systemd/system/singbox-admin.service ]; then   # 管理面板
     systemctl disable --now singbox-admin >/dev/null 2>&1 || true
@@ -1883,11 +1935,12 @@ EOF
   if [ -f "$cfsvc" ]; then
     cp -a "$cfsvc" "${cfsvc}.singbox-bak.$(date +%s)" 2>/dev/null || true
     grep -q -- '--protocol' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --protocol http2#' "$cfsvc"
+    grep -q -- '--loglevel' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --loglevel warn#' "$cfsvc"   # 降日志, 省低配机 journald I/O
     grep -q '^TimeoutStartSec=' "$cfsvc" || sed -i '/^\[Service\]/a TimeoutStartSec=60' "$cfsvc"
-    sed -i 's/^Type=notify/Type=simple/' "$cfsvc"
+    grep -q '^Type=' "$cfsvc" && sed -i 's/^Type=.*/Type=simple/' "$cfsvc" || sed -i '/^\[Service\]/a Type=simple' "$cfsvc"
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl restart cloudflared >/dev/null 2>&1 || true
-    ok "cloudflared 已硬化: --protocol http2 + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
+    ok "cloudflared 已硬化: --protocol http2 + --loglevel warn + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
   fi
 
   # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)
@@ -1992,10 +2045,10 @@ do_warp() {
   fi
   [ -n "$WARP_PRIVATE_KEY" ] || die "WARP 私钥为空, 删 $WARP_ENV 后重试注册"
   # 站点优先级: 本次显式传入 > warp.env 记录 > 默认; 统一在此回写 warp.env(支持改站点后重跑)
-  WARP_SITES="${req_sites:-${WARP_SITES:-openai,netflix,disney}}"
+  WARP_SITES="${req_sites:-${WARP_SITES:-$WARP_DEFAULT_SITES}}"
   # 落盘前清洗成安全字符集(只留 小写字母/数字/逗号/连字符), 防引号等破坏 warp.env 的 source
   WARP_SITES="$(printf '%s' "$WARP_SITES" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9,-')"
-  [ -n "$WARP_SITES" ] || WARP_SITES="openai,netflix,disney"
+  [ -n "$WARP_SITES" ] || WARP_SITES="$WARP_DEFAULT_SITES"
   ( umask 077; cat >"$WARP_ENV" <<EOF
 WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
 WARP_ADDR_V4='$WARP_ADDR_V4'
@@ -2013,7 +2066,7 @@ EOF
     install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
     if systemctl restart sing-box; then
       ok "WARP 解锁分流已开启 —— 这些站点走 WARP 出口: $WARP_SITES"
-      echo "  改站点: WARP_SITES='openai,netflix,tiktok' bash install.sh warp   |  关闭: bash install.sh warp off"
+      echo "  改站点: WARP_SITES='openai,anthropic,google-gemini,tiktok' bash install.sh warp   |  关闭: bash install.sh warp off"
       echo "  若能连但仍被拦(解锁没生效), 多半是缺 reserved: 编辑 $WARP_ENV 设 WARP_RESERVED='a,b,c' 后重跑 warp"
     else
       warn "sing-box 重启失败, 看 systemctl status sing-box"

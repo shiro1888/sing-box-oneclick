@@ -18,7 +18,7 @@
 - **路由防护**：服务端默认**拦 BT/PT**（防被商家封机收滥用投诉）+ **geosite 拦广告**（`ENABLE_BLOCK_BT=0` / `ENABLE_BLOCK_ADS=0` 可关）。
 - **备份迁移**：`install.sh backup` 把密钥+配置+证书打成一个包，新 VPS 上 `restore <文件>` 一条命令重建——**凭证/订阅路径不变，客户端不用换密码**（换机器只需把订阅 URL 的 IP 改成新 IP，或用域名直接重指 DNS）。
 - **SSH 加固**：`install.sh harden` 一键密钥登录+禁密码+fail2ban，强护栏防锁死（见下方第 4 节）。
-- **WARP 解锁分流**：`install.sh warp` 把 ChatGPT/Netflix/Disney+ 走 Cloudflare WARP 出口（机房 IP 被拉黑时解锁），其余直连；走 WARP 的站点用 `WARP_SITES` 可自定义；带「校验不过自动回滚」护栏，不会弄坏现有节点。
+- **WARP 解锁分流**：`install.sh warp` 把 OpenAI/Claude/Gemini/Netflix/Disney+ 走 Cloudflare WARP 出口（机房 IP 被拉黑时解锁），其余直连；走 WARP 的站点用 `WARP_SITES` 可自定义；带「校验不过自动回滚」护栏，不会弄坏现有节点。
 - **Reality SNI 自检**：安装时自动探测你填的偷证书目标（`REALITY_SNI`）是否真的支持 TLS1.3+H2，填错会在结尾提示换站点（防 Reality 静默失效/易被识别）。
 - **不需要域名**：默认用公网 IP 提供订阅（也支持你自带域名）。
 - **自动随机化**：随机订阅路径、随机密码/UUID/short-id，旧路径与首页返回 404。
@@ -26,7 +26,7 @@
 - **安全细节**：`server_tokens off`、密钥文件 600、流量头只挂在订阅路径（不污染首页/404）。
 - **可选第 5 节点**：CF-Vless 大保底（Argo 命名隧道），`install.sh cf` 半自动接入——VPS 侧全自动，只有 CF 后台建 Tunnel 那步要你做。直连 IP 被墙时兜底。
 - **网络优化（自动）**：装前即应用 sysctl 调优——**UDP 收发缓冲 16MB**（Hysteria2/QUIC 关键，否则被限速并刷 quic-go 告警）、跨境高 BDP 链路的 TCP 缓冲、MTU 探测、空闲不重置拥塞窗口、TFO 等；BBR 默认开（`ENABLE_BBR=0` 关）。
-- **HY2 进阶（按需）**：salamander 混淆默认开（抗 QUIC 识别）；`HY2_HOP_RANGE` 端口跳跃抗运营商 UDP 限速；`HY2_UP/HY2_DOWN` brutal 暴力带宽烂线路提速。见环境变量表。
+- **HY2 进阶（按需）**：salamander 混淆默认开（抗 QUIC 识别）；`HY2_HOP_RANGE` 端口跳跃抗运营商 UDP 限速；`HY2_UP/HY2_DOWN` brutal 暴力带宽烂线路提速；`HY2_UP_MBPS/HY2_DOWN_MBPS` **服务端带宽护栏**（给套餐峰值留余量，防压测/多人下载打爆 UDP 队列）。见环境变量表。
 - **可选**：ufw（默认关，避免锁死 SSH）。
 - **不破坏现有节点**：二次运行复用已有密钥（含升级时自动补 SS2022 / 保留 CF-Vless）。
 
@@ -101,7 +101,7 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `PUBLIC_IP` | 自动探测 | 探测失败时手动指定 |
 | `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` / `SS_PORT` | `4433`/`4434`/`443`/`4435` | 各协议端口（SS2022 同时用 TCP+UDP） |
 | `SS_METHOD` | `2022-blake3-aes-128-gcm` | SS2022 加密方法（可改 `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`，密钥长度脚本自动适配） |
-| `REALITY_SNI` | `www.microsoft.com` | Reality 伪装域名（服务端 handshake + 客户端 servername，必须一致） |
+| `REALITY_SNI` | `www.bing.com` | Reality 伪装域名（服务端 handshake + 客户端 servername，必须一致） |
 | `TLS_SNI` | `www.bing.com` | HY2/AnyTLS 自签证书 SNI |
 | `ENABLE_BBR` | `1` | 开启 BBR（纯 sysctl，安全） |
 | `ENABLE_UFW` | `0` | 自动配置并**启用** ufw（默认关，避免把自己 SSH 关在外面） |
@@ -110,6 +110,7 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `ENABLE_BLOCK_ADS` | `1` | **拦广告**（默认开，sing-box 远程 `geosite-category-ads` rule_set）；`0` 关 |
 | `HY2_HOP_RANGE` | 空 | HY2 **端口跳跃** UDP 段（如 `20000-50000`），设了即启用（nftables 把整段重定向到 HY2 端口）。**云安全组要放行整段 UDP** |
 | `HY2_UP` / `HY2_DOWN` | 空 | HY2 **brutal 暴力带宽**（Mbps，如 `50`/`200`），设了即开「无视丢包」猛提速。**必须填你真实带宽**，填错反而更差、且抢带宽不公平 |
+| `HY2_UP_MBPS` / `HY2_DOWN_MBPS` | 空 | HY2 **服务端带宽护栏**（Mbps，写进 `hy2-in` 入站 `up_mbps`/`down_mbps`），按套餐峰值给 HY2 留余量，防压测/多人下载把 UDP 队列和 I/O wait 打爆。200Mbps 峰值机参考 `80`/`160`。与上面客户端 brutal 是两回事 |
 
 `COUNT_MODE` 怎么选：默认 `tx`（只算出站）对绝大多数机器正确——Vultr/DigitalOcean/AWS/GCP/Hetzner 等都只按出站计费，`tx` 正好等于真实用量。代理是转发、每字节过网卡两次（rx≈tx），所以 `rx+tx`≈2×真实用量，在这些机器上会把用量翻倍、提前半量误停机；**只有商家真的按"进+出"双向计费才改 `rx+tx`**（很少见）。
 
@@ -239,15 +240,15 @@ sudo bash install.sh harden    # 仅密钥登录 + 禁密码 + fail2ban
 ```
 护栏：**必须先检测到 `/root/.ssh/authorized_keys` 里有公钥才动手**（否则拒绝，防把你锁在门外）；用 `00-` 开头的 drop-in 覆盖 cloud-init 默认的 `PasswordAuthentication yes`；`sshd -t` 校验不过自动回滚。**改完务必另开一个新终端用密钥登录确认能进，再关掉旧会话。**
 
-### 5.（可选）WARP 解锁分流（ChatGPT / Netflix / Disney+）
+### 5.（可选）WARP 解锁分流（OpenAI / Claude / Gemini / Netflix / Disney+）
 很多机房 IP 被 OpenAI/流媒体拉黑，直连这些服务会报「不可用/地区限制」。一条命令把这些站点的流量改走 Cloudflare WARP 出口（其余流量仍走 VPS 直连，不影响速度）：
 ```bash
 sudo bash install.sh warp        # 自动: 装 wgcf → 注册免费 WARP 账号 → 加 WireGuard 出站 + 分流规则
 sudo bash install.sh warp off    # 关闭, 恢复全部直连
 ```
-- 默认把 `geosite-openai / netflix / disney` 走 WARP，其它直连。**自定义走 WARP 的站点**（逗号分隔的 geosite 名，会自动去空格/转小写/过滤非法字符）：
+- 默认把 `geosite-openai / anthropic / google-gemini / netflix / disney` 走 WARP，其它直连。**自定义走 WARP 的站点**（逗号分隔的 geosite 名，会自动去空格/转小写/过滤非法字符）：
   ```bash
-  sudo WARP_SITES='openai,netflix,tiktok,spotify' bash install.sh warp   # 改完即生效, 已记进 warp.env
+  sudo WARP_SITES='openai,anthropic,google-gemini,tiktok,spotify' bash install.sh warp   # 改完即生效, 已记进 warp.env
   ```
 - WARP 账号保存在 `/etc/sing-box/warp.env`，`backup` 会一并打包，迁移到新机免重新注册。
 - **安全护栏**：新配置先渲染到临时文件、`sing-box check` 通过才替换正式配置——**校验不过就回滚，绝不弄坏现有节点**。需要 sing-box ≥ 1.12（wireguard endpoint）；脚本装的是最新版，正常满足。

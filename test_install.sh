@@ -5,7 +5,14 @@
 cd "$(dirname "$0")" || exit 1
 # MSYS2_ENV_CONV_EXCL: 阻止 Git Bash 把 /cf-abc 这种斜杠开头的环境变量值转成 Windows 路径
 # (纯 Windows 测试环境问题; Linux VPS 上不存在路径转换)
-export PYTHON=python PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6'
+if [ -n "${PYTHON:-}" ]; then
+  PYTHON_BIN="$(command -v "$PYTHON" 2>/dev/null || true)"
+else
+  PYTHON_BIN="$(command -v python 2>/dev/null || command -v python3 2>/dev/null || true)"
+fi
+[ -n "$PYTHON_BIN" ] || { echo "FAIL  未找到 python/python3"; exit 1; }
+export PYTHON="$PYTHON_BIN" PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6'
+python() { "$PYTHON_BIN" "$@"; }
 fail=0
 TMP="${TMPDIR:-/tmp}"
 
@@ -13,11 +20,11 @@ TMP="${TMPDIR:-/tmp}"
 export SB_DIR="$TMP/sbtest" HY2_PORT=4433 ANYTLS_PORT=4434 VLESS_PORT=443 \
   HY2_PASSWORD=pw1 ANYTLS_PASSWORD=pw2 VLESS_UUID=11111111-1111-1111-1111-111111111111 \
   REALITY_PRIVATE_KEY=PRIVKEY REALITY_PUBLIC_KEY=PUBKEY REALITY_SHORT_ID=abcdef0123456789 \
-  REALITY_SNI=www.microsoft.com TLS_SNI=www.bing.com PUBLIC_IP=1.2.3.4 LIMIT_GB=200 \
+  REALITY_SNI=www.bing.com TLS_SNI=www.bing.com PUBLIC_IP=1.2.3.4 LIMIT_GB=200 \
   SS_PORT=4435 SS_METHOD=2022-blake3-aes-128-gcm SS_PASSWORD=MTIzNDU2Nzg5MGFiY2RlZg==
 
 # 在干净子shell里 source 脚本(guard 阻止 main 运行)并调用一个渲染函数
-render() { PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; '"$1"; }
+render() { PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; '"$1"; }
 
 echo "=== 1) bash -n 语法检查 ==="
 if bash -n install.sh; then echo "PASS  bash -n install.sh"; else echo "FAIL  bash -n"; fail=1; fi
@@ -41,8 +48,14 @@ if printf '%s' "$CFG2" | python -c "import json,sys;d=json.load(sys.stdin);asser
 if printf '%s' "$CFG3" | python -c "import json,sys;s=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='ss-in'][0];assert s['type']=='shadowsocks';assert s['method']=='2022-blake3-aes-128-gcm';assert s['password']" 2>"$TMP/e"; then
   echo "PASS  ss-in 入站方法/密码正确"; else echo "FAIL  ss-in"; cat "$TMP/e"; fail=1; fi
 
-if printf '%s' "$CFG3" | python -c "import json,sys;v=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='vless-in'][0];assert v['tls']['server_name']==v['tls']['reality']['handshake']['server'];assert v['users'][0]['flow']=='xtls-rprx-vision'" 2>"$TMP/e"; then
-  echo "PASS  Reality server_name==handshake.server 且 flow 正确"; else echo "FAIL  reality"; cat "$TMP/e"; fail=1; fi
+if printf '%s' "$CFG3" | python -c "import json,sys;v=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='vless-in'][0];assert v['tls']['server_name']==v['tls']['reality']['handshake']['server']=='www.bing.com';assert v['users'][0]['flow']=='xtls-rprx-vision'" 2>"$TMP/e"; then
+  echo "PASS  Reality server_name==handshake.server==www.bing.com 且 flow 正确"; else echo "FAIL  reality"; cat "$TMP/e"; fail=1; fi
+# HY2 服务端带宽护栏(up_mbps/down_mbps): 设了即进 hy2-in 入站; 不设则不出现
+CFGBW="$(ANYTLS_OK=1 HY2_UP_MBPS=80 HY2_DOWN_MBPS=160 render render_singbox_config)"
+if printf '%s' "$CFGBW" | python -c "import json,sys;h=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='hy2-in'][0];assert h['up_mbps']==80 and h['down_mbps']==160" 2>"$TMP/e"; then
+  echo "PASS  HY2 服务端带宽护栏 up_mbps/down_mbps 进 hy2-in"; else echo "FAIL  hy2-server-bw"; cat "$TMP/e"; fail=1; fi
+if printf '%s' "$CFG3" | python -c "import json,sys;h=[i for i in json.load(sys.stdin)['inbounds'] if i['tag']=='hy2-in'][0];assert 'up_mbps' not in h and 'down_mbps' not in h" 2>"$TMP/e"; then
+  echo "PASS  默认不设带宽护栏时 hy2-in 无 up_mbps/down_mbps"; else echo "FAIL  hy2-bw-default"; cat "$TMP/e"; fail=1; fi
 # 路由: 默认禁BT+拦广告
 if printf '%s' "$CFG3" | python -c "import json,sys;r=json.load(sys.stdin)['route'];assert any(x.get('protocol')=='bittorrent' and x.get('action')=='reject' for x in r['rules']);assert any('geosite-ads' in (x.get('rule_set') or []) for x in r['rules']);assert [s['tag'] for s in r['rule_set']]==['geosite-ads'];assert r['final']=='direct'" 2>"$TMP/e"; then
   echo "PASS  路由含 禁BT + 拦广告 rule_set + final direct"; else echo "FAIL  route"; cat "$TMP/e"; fail=1; fi
@@ -56,12 +69,15 @@ ANYTLS_OK=1 DOMAIN="" render render_subscription_yaml > "$TMP/sub.yaml"
 if python - "$TMP/sub.yaml" <<'PYV' 2>"$TMP/e"
 import yaml,sys
 d=yaml.safe_load(open(sys.argv[1],encoding='utf-8'))
+assert d['allow-lan'] is False
 names=[p['name'] for p in d['proxies']]
 assert names==['Hysteria2','AnyTLS','Vless','SS2022'], names
 g=d['proxy-groups'][0]
 assert g['type']=='select'
 assert all(x in names for x in g['proxies']), g['proxies']
 assert d['rules'][-1].startswith('MATCH,'), d['rules'][-1]
+assert d['rules'].index('GEOSITE,google,🚀 节点选择') < d['rules'].index('GEOSITE,cn,DIRECT')
+assert 'DOMAIN-SUFFIX,gvt1.com,🚀 节点选择' in d['rules']
 assert d['proxies'][0]['server']=='1.2.3.4'
 assert any(r.startswith('IP-CIDR,1.2.3.4/32,DIRECT') for r in d['rules'])
 v=[p for p in d['proxies'] if p['name']=='Vless'][0]
@@ -133,19 +149,19 @@ SUB_HOST=1.2.3.4
 PUBLIC_IP=1.2.3.4
 E
 : > "$SETD/secrets"
-PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=500 COUNT_MODE=tx' >/dev/null 2>&1
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=500 COUNT_MODE=tx' >/dev/null 2>&1
 if grep -q '^LIMIT_GB=500$' "$SETD/env" && grep -q '^COUNT_MODE=tx$' "$SETD/env" && grep -q 'EXPIRE_AT=' "$SETD/env" && grep -q '^INTERFACE=eth0$' "$SETD/env"; then
   echo "PASS  set 更新 LIMIT_GB/COUNT_MODE 并保留其它键"; else echo "FAIL  set 更新"; cat "$SETD/env"; fail=1; fi
-if PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set COUNT_MODE=bogus' >/dev/null 2>&1; then
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set COUNT_MODE=bogus' >/dev/null 2>&1; then
   echo "FAIL  set 应拒绝非法 COUNT_MODE"; fail=1
 else
   grep -q '^COUNT_MODE=tx$' "$SETD/env" && echo "PASS  set 拒绝非法 COUNT_MODE 且不改 env" || { echo "FAIL  set 非法值污染了 env"; fail=1; }
 fi
 # EXPIRE_AT 带空格作为单个参数(对应菜单 do_set "$kv")应成功
-PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set "EXPIRE_AT=2030-01-02 03:04:05 +0800"' >/dev/null 2>&1
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set "EXPIRE_AT=2030-01-02 03:04:05 +0800"' >/dev/null 2>&1
 if grep -q 'EXPIRE_AT="2030-01-02 03:04:05 +0800"' "$SETD/env"; then echo "PASS  set EXPIRE_AT(带空格单参数)成功"; else echo "FAIL  set EXPIRE_AT 空格"; grep EXPIRE_AT "$SETD/env"; fail=1; fi
 # 畸形 LIMIT_GB(多点)应被拒, 不污染 env
-if PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=5.5.5' >/dev/null 2>&1; then echo "FAIL  畸形 LIMIT_GB 应被拒"; fail=1; else echo "PASS  畸形 LIMIT_GB(5.5.5)被拒"; fi
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=5.5.5' >/dev/null 2>&1; then echo "FAIL  畸形 LIMIT_GB 应被拒"; fail=1; else echo "PASS  畸形 LIMIT_GB(5.5.5)被拒"; fi
 
 echo
 echo "=== 4e) HY2 obfs / 端口跳跃 / brutal 渲染 ==="
@@ -156,7 +172,7 @@ if printf '%s' "$SUBO" | python -c "import yaml,sys;h=[p for p in yaml.safe_load
 LNKO="$(ANYTLS_OK=1 OBFS_PASSWORD=obfspw HY2_HOP_RANGE=20000-50000 render render_share_links)"
 if printf '%s' "$LNKO" | grep -qE '^hysteria2://[^@]+@1\.2\.3\.4:20000-50000/\?.*obfs=salamander.*mport=20000-50000'; then echo "PASS  HY2 链接: 端口段进 authority + obfs + mport"; else echo "FAIL  hy2 链接选项"; printf '%s\n' "$LNKO" | grep hysteria2; fail=1; fi
 # 端口段覆盖正在监听的 UDP 端口(SS_PORT=4435 / HY2_PORT=4433)应被 validate 拒绝
-if env HY2_HOP_RANGE=4000-5000 PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; validate_inputs' >/dev/null 2>&1; then echo "FAIL  端口段覆盖 UDP 端口应被拒"; fail=1; else echo "PASS  端口段覆盖 HY2/SS 端口被拒"; fi
+if env HY2_HOP_RANGE=4000-5000 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; validate_inputs' >/dev/null 2>&1; then echo "FAIL  端口段覆盖 UDP 端口应被拒"; fail=1; else echo "PASS  端口段覆盖 HY2/SS 端口被拒"; fi
 NOO="$(ANYTLS_OK=1 render render_subscription_yaml)"
 if printf '%s' "$NOO" | grep -qE 'obfs|ports:| up:'; then echo "FAIL  默认却出现 obfs/ports/up"; fail=1; else echo "PASS  默认无 obfs/端口跳跃/brutal(条件渲染正确)"; fi
 
@@ -186,13 +202,13 @@ if printf '%s' "$PANEL" | grep -qF 'CF-Vless'; then echo "FAIL  未开CF看板�
 PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=u render render_panel_html)"
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
 # 安装上下文是 set -euo pipefail, 看板渲染不能中断(qrencode 失败/缺失都该优雅降级)
-if PYTHON=python bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
+if PYTHON="$PYTHON_BIN" bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
 
 echo
 echo "=== 4g) backup 打包 ==="
 BK="$TMP/bktest"; rm -rf "$BK"; mkdir -p "$BK/sb" "$BK/out"
 echo 'HY2_PASSWORD=x' > "$BK/sb/secrets"; echo 'LIMIT_GB=200' > "$BK/env"; echo cert > "$BK/sb/server.crt"; echo key > "$BK/sb/server.key"
-PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
   SB_DIR="'"$BK"'/sb"; SECRETS="'"$BK"'/sb/secrets"; ENVFILE="'"$BK"'/env"; CF_ENV="'"$BK"'/sb/cf.env"; BACKUP_DIR="'"$BK"'/out"
   do_backup >/dev/null 2>&1'
 bf="$(ls "$BK"/out/sing-box-backup-*.tar.gz 2>/dev/null | head -1)"
@@ -214,9 +230,10 @@ assert p['public_key']=='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=', p
 assert p['port']==2408 and p['allowed_ips']==['0.0.0.0/0','::/0']
 assert 'reserved' not in p
 r=d['route']
-assert any(x.get('outbound')=='warp' and set(['geosite-openai','geosite-netflix','geosite-disney'])<=set(x.get('rule_set') or []) for x in r['rules']), r['rules']
+default=set(['geosite-openai','geosite-anthropic','geosite-google-gemini','geosite-netflix','geosite-disney'])
+assert any(x.get('outbound')=='warp' and default<=set(x.get('rule_set') or []) for x in r['rules']), r['rules']
 tags=[s['tag'] for s in r['rule_set']]
-assert all(t in tags for t in ['geosite-ads','geosite-openai','geosite-netflix','geosite-disney']), tags
+assert all(t in tags for t in ['geosite-ads','geosite-openai','geosite-anthropic','geosite-google-gemini','geosite-netflix','geosite-disney']), tags
 " 2>"$TMP/e"; then
   echo "PASS  WARP endpoint + 解锁路由 + rule_set 正确(与BT/ads共存)"; else echo "FAIL  warp"; cat "$TMP/e"; fail=1; fi
 
@@ -231,7 +248,7 @@ d=json.load(sys.stdin)
 assert d['endpoints'][0]['tag']=='warp'
 r=d['route']
 assert not any(x.get('protocol')=='bittorrent' for x in r['rules'])
-assert [s['tag'] for s in r['rule_set']]==['geosite-openai','geosite-netflix','geosite-disney'], [s['tag'] for s in r['rule_set']]
+assert [s['tag'] for s in r['rule_set']]==['geosite-openai','geosite-anthropic','geosite-google-gemini','geosite-netflix','geosite-disney'], [s['tag'] for s in r['rule_set']]
 " 2>"$TMP/e"; then
   echo "PASS  WARP开+BT/ads关: 有endpoints, route仅warp规则"; else echo "FAIL  warp-only"; cat "$TMP/e"; fail=1; fi
 
@@ -249,7 +266,7 @@ assert [s['tag'] for s in r['rule_set']]==['geosite-tiktok','geosite-spotify','g
 echo
 echo "=== 4i) 管理面板 admin(后端 + 面板页) ==="
 APY="./_sbadmin_test.py"
-PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ADMIN_PY="'"$APY"'" write_admin_py'
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ADMIN_PY="'"$APY"'" write_admin_py'
 if python -m py_compile "$APY" 2>"$TMP/e"; then echo "PASS  admin 后端 py_compile"; else echo "FAIL  admin py_compile"; cat "$TMP/e"; fail=1; fi
 if python - "$APY" <<'PYA' 2>"$TMP/e"
 import importlib.util,sys
@@ -294,11 +311,27 @@ if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748
 awk '/cat >"\$TRAFFIC_PY" <<.PYEOF.$/{f=1;next} /^PYEOF$/{f=0} f' install.sh > "$TMP/traffic_limit.py"
 if [ -s "$TMP/traffic_limit.py" ] && python -m py_compile "$TMP/traffic_limit.py" 2>"$TMP/e"; then
   echo "PASS  内嵌 traffic_limit.py py_compile 通过"; else echo "FAIL  traffic py_compile"; cat "$TMP/e"; fail=1; fi
+if python - "$TMP/traffic_limit.py" <<'PYT' 2>"$TMP/e"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("traffic_limit", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.STATE_DIR == "/var/lib/sing-box-node"
+# os.path.join 在 Windows 开发机上会用反斜杠; 目标 Linux 上是正斜杠, 这里归一化后再比
+assert m.QUOTA_FLAG.replace("\\", "/") == "/var/lib/sing-box-node/quota-stopped"
+assert m.decide_enforcement(100, 100, True, False) == ("stop", True)
+assert m.decide_enforcement(100, 100, False, False) == (None, False)
+assert m.decide_enforcement(100, 100, False, True) == (None, True)
+assert m.decide_enforcement(50, 100, False, True) == ("start", False)
+assert m.decide_enforcement(50, 100, False, False) == (None, False)
+PYT
+then echo "PASS  内嵌 traffic_limit.py 持久标记+手动停机状态机正确"; else echo "FAIL  traffic 状态机"; cat "$TMP/e"; fail=1; fi
+if grep -q 'server_name _;' install.sh && grep -q 'listen 80 default_server' install.sh; then
+  echo "PASS  nginx 使用默认 404 server + 订阅精确 server"; else echo "FAIL  nginx 双 server 静态检查"; fail=1; fi
 
 echo
 echo "=== 6) 输入校验 validate_inputs ==="
 # 在干净子shell里用 env 覆盖变量后调用 validate_inputs;die 会以非0退出
-run_validate() { env "$@" PYTHON=python bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; validate_inputs'; }
+run_validate() { env "$@" PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; validate_inputs'; }
 ok_case()   { if run_validate "$@" >/dev/null 2>&1; then echo "PASS  $D"; else echo "FAIL  $D"; fail=1; fi; }
 bad_case()  { if run_validate "$@" >/dev/null 2>&1; then echo "FAIL  $D(应被拒却通过)"; fail=1; else echo "PASS  $D"; fi; }
 
