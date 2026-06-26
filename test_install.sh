@@ -225,6 +225,15 @@ if command -v tar >/dev/null 2>&1; then
     echo "PASS  restore 拒绝白名单外成员(解包前 die)"; fi
 else echo "skip  (未安装 tar, 跳过 restore 校验)"; fi
 
+# apply_singbox_config: 重启失败必须回滚旧配置(systemctl 用桩函数模拟成功/失败)
+AP="$TMP/aptest"; rm -rf "$AP"; mkdir -p "$AP"; echo '{"new":1}' > "$AP/new.json"
+echo '{"old":1}' > "$AP/config.json"
+if PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; SB_DIR="'"$AP"'"; systemctl(){ return 1; }; apply_singbox_config "'"$AP"'/new.json"; rc=$?; [ "$rc" -ne 0 ] && grep -q old "'"$AP"'/config.json"' >/dev/null 2>&1; then
+  echo "PASS  apply_singbox_config 重启失败回滚旧配置且返回非0"; else echo "FAIL  apply 回滚"; cat "$AP/config.json" 2>/dev/null; fail=1; fi
+echo '{"old":1}' > "$AP/config.json"
+if PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; SB_DIR="'"$AP"'"; systemctl(){ return 0; }; apply_singbox_config "'"$AP"'/new.json"; rc=$?; [ "$rc" -eq 0 ] && grep -q new "'"$AP"'/config.json"' >/dev/null 2>&1; then
+  echo "PASS  apply_singbox_config 重启成功切新配置且返回0"; else echo "FAIL  apply 成功路径"; cat "$AP/config.json" 2>/dev/null; fail=1; fi
+
 echo
 echo "=== 4h) WARP 解锁分流渲染 ==="
 CFGW="$(ANYTLS_OK=1 WARP_PRIVATE_KEY=cHJpdmtleTEyMw== WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606:4700:110:8a36::2/128 render render_singbox_config)"

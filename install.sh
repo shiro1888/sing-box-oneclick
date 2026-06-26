@@ -1890,6 +1890,26 @@ do_uninstall() {
   ok "已卸载(保留 sing-box 程序与网络优化 sysctl; 备份见上)"
 }
 
+# 用已校验通过的临时配置替换正式 config 并重启 sing-box; 重启失败则回滚旧配置并拉回旧服务。
+# 用法: apply_singbox_config <临时配置文件>  返回 0=成功切到新配置 / 1=已回滚(调用方仍需自行 rm 临时文件)。
+# 仅校验通过(sing-box check)还不够: 端口被占、运行时环境或 systemd 问题都可能让 restart 失败,
+# 那时不回滚就会把原本可用的节点留在新配置/停服状态。
+apply_singbox_config() {
+  local newc="$1" bak=""
+  [ -f "$SB_DIR/config.json" ] && { bak="$(mktemp)"; cp -a "$SB_DIR/config.json" "$bak"; }
+  install -m600 "$newc" "$SB_DIR/config.json"
+  if systemctl restart sing-box; then
+    [ -n "$bak" ] && rm -f "$bak"
+    return 0
+  fi
+  warn "sing-box 重启失败, 回滚到旧配置并拉回旧服务..."
+  if [ -n "$bak" ]; then
+    install -m600 "$bak" "$SB_DIR/config.json"; rm -f "$bak"
+    systemctl restart sing-box >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
 # 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
 do_cf() {
   umask 077
@@ -1936,11 +1956,24 @@ EOF
     chmod 755 /usr/local/bin/cloudflared
   fi
   log "安装 cloudflared 服务(token)..."
+  local cfsvc=/etc/systemd/system/cloudflared.service cfbak=""
+  # 先备份旧隧道服务: 新 token 装失败时能回滚, 不至于把已有隧道(本机其它隧道/旧 CF-Vless)弄丢
+  [ -f "$cfsvc" ] && { cfbak="$(mktemp)"; cp -a "$cfsvc" "$cfbak"; }
   cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
-  cloudflared service install "$CF_TOKEN" || die "cloudflared service install 失败(token 是否正确?)"
+  if ! cloudflared service install "$CF_TOKEN"; then
+    if [ -n "$cfbak" ]; then
+      warn "cloudflared service install 失败, 恢复旧隧道服务..."
+      cloudflared service uninstall >/dev/null 2>&1 || true   # 清掉可能装了一半的残留
+      install -m644 "$cfbak" "$cfsvc"; rm -f "$cfbak"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now cloudflared >/dev/null 2>&1 || true
+      die "cloudflared service install 失败(token 错误/过期?), 已恢复旧隧道服务。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
+    fi
+    die "cloudflared service install 失败(token 是否正确?)"
+  fi
+  [ -n "$cfbak" ] && rm -f "$cfbak"
   systemctl enable --now cloudflared >/dev/null 2>&1 || true
   # ③ 低配/丢包机器硬化 cloudflared: 强制 http2(抖动链路比 QUIC 稳) + 放宽启动超时, 避免反复重启失败
-  local cfsvc=/etc/systemd/system/cloudflared.service
   if [ -f "$cfsvc" ]; then
     cp -a "$cfsvc" "${cfsvc}.singbox-bak.$(date +%s)" 2>/dev/null || true
     grep -q -- '--protocol' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --protocol http2#' "$cfsvc"
@@ -1959,8 +1992,8 @@ EOF
   local tmpc; tmpc="$(mktemp)"
   render_singbox_config >"$tmpc"
   sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置(现有节点不受影响); 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
-  install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
-  systemctl restart sing-box
+  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; die "加入 CF 入站后 sing-box 重启失败, 已回滚到旧配置(现有节点不受影响); 看 systemctl status sing-box"; }
+  rm -f "$tmpc"
   # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
   ( umask 077; cat >"$CF_ENV" <<EOF
 CF_HOSTNAME=$CF_HOSTNAME
@@ -2025,8 +2058,8 @@ do_warp() {
     local tmpc; tmpc="$(mktemp)"
     render_singbox_config >"$tmpc"
     if sing-box check -c "$tmpc" >/dev/null 2>&1; then
-      install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
-      systemctl restart sing-box && ok "已关闭 WARP 分流(原解锁站点恢复走 VPS 直连出口)" || warn "sing-box 重启失败"
+      if apply_singbox_config "$tmpc"; then ok "已关闭 WARP 分流(原解锁站点恢复走 VPS 直连出口)"; else warn "sing-box 重启失败, 已回滚到旧配置"; fi
+      rm -f "$tmpc"
     else
       rm -f "$tmpc"; warn "关闭后配置校验异常, 已保留原配置不动"
     fi
@@ -2077,8 +2110,8 @@ do_warp() {
   local tmpc; tmpc="$(mktemp)"
   render_singbox_config >"$tmpc"
   if sing-box check -c "$tmpc" >/dev/null 2>&1; then
-    install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
-    if systemctl restart sing-box; then
+    if apply_singbox_config "$tmpc"; then
+      rm -f "$tmpc"
       ( umask 077; cat >"$WARP_ENV" <<EOF
 WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
 WARP_ADDR_V4='$WARP_ADDR_V4'
@@ -2091,7 +2124,9 @@ EOF
       echo "  改站点: WARP_SITES='openai,anthropic,google-gemini,tiktok' bash install.sh warp   |  关闭: bash install.sh warp off"
       echo "  若能连但仍被拦(解锁没生效), 多半是缺 reserved: 编辑 $WARP_ENV 设 WARP_RESERVED='a,b,c' 后重跑 warp"
     else
-      warn "sing-box 重启失败, 看 systemctl status sing-box"
+      rm -f "$tmpc"
+      warn "带 WARP 的配置重启失败, 已回滚到旧配置(现有节点不受影响); 看 systemctl status sing-box"
+      return 1
     fi
   else
     rm -f "$tmpc"
