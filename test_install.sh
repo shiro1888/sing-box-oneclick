@@ -11,7 +11,7 @@ else
   PYTHON_BIN="$(command -v python 2>/dev/null || command -v python3 2>/dev/null || true)"
 fi
 [ -n "$PYTHON_BIN" ] || { echo "FAIL  未找到 python/python3"; exit 1; }
-export PYTHON="$PYTHON_BIN" PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6'
+export PYTHON="$PYTHON_BIN" PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6;PANEL_PATH'
 python() { "$PYTHON_BIN" "$@"; }
 fail=0
 TMP="${TMPDIR:-/tmp}"
@@ -219,21 +219,32 @@ PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
 # 安装上下文是 set -euo pipefail, 看板渲染不能中断(qrencode 失败/缺失都该优雅降级)
 if PYTHON="$PYTHON_BIN" bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
-# 看板页密码(panel-pass): 生成 user:$apr1$ htpasswd; config_nginx 注入真 Basic Auth(非网页 JS 假门)
-grep -qF 'auth_basic_user_file' install.sh && grep -qF 'auth_basic "sing-box panel"' install.sh && echo "PASS  config_nginx 注入 nginx Basic Auth(看板页真鉴权)" || { echo "FAIL  缺 nginx auth_basic 注入"; fail=1; }
-if command -v openssl >/dev/null 2>&1; then
-  PP="$TMP/pptest"; rm -rf "$PP"; mkdir -p "$PP"; printf 'PANEL_PATH=/panel-x.html\n' > "$PP/secrets"
-  PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
-    SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_HTPASSWD="'"$PP"'/htp"
-    config_nginx(){ return 0; }; nginx(){ return 0; }; systemctl(){ return 0; }
-    do_panel_pass myuser secretpw' >/dev/null 2>&1
-  if grep -qE '^myuser:\$apr1\$' "$PP/htp" 2>/dev/null; then echo "PASS  panel-pass 生成 htpasswd(user:\$apr1\$ 哈希)"; else echo "FAIL  panel-pass htpasswd"; cat "$PP/htp" 2>/dev/null; fail=1; fi
-  PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
-    SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_HTPASSWD="'"$PP"'/htp"
-    config_nginx(){ return 0; }; nginx(){ return 0; }; systemctl(){ return 0; }
-    do_panel_pass off' >/dev/null 2>&1
-  [ -f "$PP/htp" ] && { echo "FAIL  panel-pass off 未删密码文件"; fail=1; } || echo "PASS  panel-pass off 删除密码文件(关闭登录)"
-else echo "skip  (无 openssl, 跳过 panel-pass 测试)"; fi
+# 看板页登录(panel-pass): 自定义登录页 + nginx 用 cookie==密码 服务端校验(非网页 JS 假门)
+grep -qF 'if ($sb_ok = 0)' install.sh && grep -qF 'include $PANEL_MAP' install.sh \
+  && echo "PASS  config_nginx 注入未登录跳登录页 + cookie 校验(看板真鉴权)" || { echo "FAIL  缺 nginx cookie 鉴权注入"; fail=1; }
+# 登录页渲染: 合法 HTML, 写 cookie sbauth, 跳看板路径; 不含密码
+LG="$(PANEL_PATH=/panel-x.html AIRPORT_NAME=MyNode render render_panel_login_html)"
+if printf '%s' "$LG" | python -c "import sys,html.parser;html.parser.HTMLParser().feed(sys.stdin.read())" 2>/dev/null && printf '%s' "$LG" | grep -qF "sbauth=" && printf '%s' "$LG" | grep -qF '"/panel-x.html"'; then
+  echo "PASS  登录页合法 HTML(写 cookie sbauth + 跳看板)"; else echo "FAIL  登录页渲染"; fail=1; fi
+# panel-pass <密码>: 写 nginx map(含密码)+ 渲染登录页
+PP="$TMP/pptest"; rm -rf "$PP"; mkdir -p "$PP/www"; printf 'PANEL_PATH=/panel-x.html\n' > "$PP/secrets"
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map.conf"; WWW="'"$PP"'/www"
+  config_nginx(){ return 0; }; nginx(){ return 0; }
+  do_panel_pass abcdef123' >/dev/null 2>&1
+if grep -qF 'map $cookie_sbauth $sb_ok' "$PP/map.conf" 2>/dev/null && grep -qF '"abcdef123" 1;' "$PP/map.conf" 2>/dev/null && [ -f "$PP/www/panel-x-login.html" ]; then
+  echo "PASS  panel-pass 写 nginx map(cookie==密码)+ 渲染登录页"; else echo "FAIL  panel-pass 生成"; cat "$PP/map.conf" 2>/dev/null; ls "$PP/www" 2>/dev/null; fail=1; fi
+# 非法字符密码应被拒
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map2.conf"; WWW="'"$PP"'/www"
+  config_nginx(){ return 0; }; nginx(){ return 0; }
+  do_panel_pass "bad pass!"' >/dev/null 2>&1; then echo "FAIL  panel-pass 应拒绝非法字符密码"; fail=1; else echo "PASS  panel-pass 拒绝非法字符密码"; fi
+# panel-pass off: 删 map + 登录页
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map.conf"; WWW="'"$PP"'/www"
+  config_nginx(){ return 0; }; nginx(){ return 0; }
+  do_panel_pass off' >/dev/null 2>&1
+{ [ ! -f "$PP/map.conf" ] && [ ! -f "$PP/www/panel-x-login.html" ]; } && echo "PASS  panel-pass off 删除 map + 登录页" || { echo "FAIL  panel-pass off 未清理"; fail=1; }
 
 echo
 echo "=== 4g) backup 打包 ==="

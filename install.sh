@@ -84,7 +84,7 @@ ENVFILE=/etc/sing-box-node.env
 WWW=/var/www/html
 NGINX_SNIPPET=/etc/nginx/snippets/sub_headers.conf
 NGINX_CONF=/etc/nginx/conf.d/00-singbox-sub.conf
-PANEL_HTPASSWD=/etc/nginx/.singbox_panel.htpasswd   # 看板页 HTTP Basic Auth 密码文件(存在=看板页需登录; panel-pass 子命令管理)
+PANEL_MAP=/etc/nginx/.singbox_panel_map.conf   # 看板页登录: nginx map 片段(600 root, 校验 cookie==密码; 存在=已开登录; panel-pass 管理)
 TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
 SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
@@ -841,6 +841,50 @@ sys.stdout.write(out)
 PY
 }
 
+# 看板页登录页(自定义好看页面, 无敏感信息): 输密码 -> JS 写 cookie sbauth -> 跳看板; nginx 校验 cookie==密码。
+render_panel_login_html() {
+  AIRPORT_NAME="$AIRPORT_NAME" PANEL_PATH="$PANEL_PATH" "$PY" - <<'PY'
+import os, html, json, sys
+name = html.escape(os.environ.get("AIRPORT_NAME", "订阅"))
+panel = json.dumps(os.environ.get("PANEL_PATH", "/"))   # 安全的 JS 字符串字面量
+out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name} · 登录</title><style>
+:root{{--bg:#0b0e14;--card:#141925;--line:rgba(255,255,255,.08);--fg:#eef1f6;--mut:#8b93a4;--g:linear-gradient(135deg,#818cf8,#c084fc)}}
+*{{box-sizing:border-box}}
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(640px 340px at 50% 0%,rgba(129,140,248,.2),transparent 70%),var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}}
+@keyframes rise{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
+.box{{width:340px;max-width:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:28px 24px;text-align:center;box-shadow:0 24px 60px -24px rgba(0,0,0,.6),0 0 0 1px rgba(129,140,248,.08);animation:rise .55s cubic-bezier(.2,.75,.2,1) both}}
+.lk{{width:54px;height:54px;margin:0 auto 14px;border-radius:16px;display:flex;align-items:center;justify-content:center;background:var(--g);color:#fff;box-shadow:0 12px 28px -10px rgba(129,140,248,.8)}}
+h1{{font-size:1.25rem;font-weight:600;margin:0;letter-spacing:-.01em}}
+.sub{{color:var(--mut);font-size:.86rem;margin:7px 0 20px}}
+input{{width:100%;height:46px;background:rgba(0,0,0,.28);border:1px solid var(--line);border-radius:12px;color:var(--fg);font-size:.95rem;padding:0 14px;outline:none;transition:border-color .2s,box-shadow .2s}}
+input:focus{{border-color:#818cf8;box-shadow:0 0 0 3px rgba(129,140,248,.22)}}
+button{{width:100%;height:46px;margin-top:12px;border:0;border-radius:12px;background:var(--g);color:#fff;font-size:.95rem;font-weight:600;cursor:pointer;box-shadow:0 12px 28px -12px rgba(129,140,248,.8);transition:transform .15s,filter .2s}}
+button:hover{{transform:translateY(-1px);filter:brightness(1.06)}}button:active{{transform:translateY(0) scale(.99)}}
+.err{{display:none;color:#fca5a5;font-size:.82rem;margin:12px 0 0}}
+.tip{{color:var(--mut);font-size:.74rem;margin:16px 0 0;line-height:1.5}}
+</style></head><body>
+<div class="box">
+<div class="lk"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+<h1>{name} 看板</h1>
+<p class="sub">输入密码查看你的节点订阅</p>
+<input id="pw" type="password" placeholder="密码" autocomplete="current-password" autofocus>
+<button id="go">登录</button>
+<p class="err" id="err">密码不对,再试一次</p>
+<p class="tip">明文 HTTP 下密码不加密传输; 不可信网络请走 HTTPS。</p>
+</div>
+<script>
+var P={panel};
+function go(){{var v=document.getElementById('pw').value;if(!v)return;try{{sessionStorage.setItem('sbt','1')}}catch(e){{}}document.cookie='sbauth='+v+'; path=/; max-age=604800; samesite=lax';location.replace(P);}}
+document.getElementById('go').onclick=go;
+document.getElementById('pw').addEventListener('keydown',function(e){{if(e.key==='Enter')go();}});
+try{{if(sessionStorage.getItem('sbt')){{sessionStorage.removeItem('sbt');document.getElementById('err').style.display='block';document.getElementById('pw').focus();}}}}catch(e){{}}
+</script></body></html>'''
+sys.stdout.write(out)
+PY
+}
+
 # 管理面板页(可写: 改限额/到期/计费 + 重启/备份); __TOKEN__ 由后端注入。仅经 127.0.0.1+SSH隧道访问。
 render_admin_html() {
   cat <<'HTML'
@@ -1097,11 +1141,17 @@ config_nginx() {
     v6_named=$'\n    listen [::]:80;'
   fi
   rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
-  # 看板页可选 HTTP Basic Auth: 存在密码文件就让 nginx 在伺服看板前要求登录(真鉴权, 非网页内 JS 假门)
-  local panel_auth=""
-  [ -s "$PANEL_HTPASSWD" ] && panel_auth=$'\n        auth_basic "sing-box panel";\n        auth_basic_user_file '"$PANEL_HTPASSWD"';'
+  # 看板页可选登录(nginx 真鉴权, 不是网页里的 JS 假门): 存在 map 片段时, nginx 用 \$sb_ok 校验 cookie 是否
+  # 等于密码(密码只在 600 root 的 \$PANEL_MAP 里, 由 nginx master 加载, 从不下发浏览器); 不对就 302 跳登录页。
+  local panel_login="${PANEL_PATH%.html}-login.html"
+  local panel_inc="" panel_guard="" login_loc=""
+  if [ -s "$PANEL_MAP" ]; then
+    panel_inc="include $PANEL_MAP;"$'\n'
+    panel_guard=$'\n        if ($sb_ok = 0) { return 302 '"$panel_login"'; }'
+    login_loc=$'    location = '"$panel_login"$' {\n        default_type text/html;\n        try_files $uri =404;\n    }\n'
+  fi
   cat >"$NGINX_CONF" <<EOF
-server {
+${panel_inc}server {
     listen 80 default_server;$v6_default
     server_name _;
     return 404;
@@ -1124,11 +1174,11 @@ server {
         try_files \$uri =404;
     }
 
-    location = $PANEL_PATH {$panel_auth
+    location = $PANEL_PATH {$panel_guard
         default_type text/html;
         try_files \$uri =404;
     }
-
+$login_loc
     location / {
         return 404;
     }
@@ -1510,11 +1560,15 @@ do_panel() {
   render_panel_html >"$WWW$PANEL_PATH"; chmod 644 "$WWW$PANEL_PATH"
   ok "可视化看板页: http://$SUB_HOST$PANEL_PATH"
   echo "  浏览器打开即可看两种订阅 + 扫码导入 + 一键复制; 手机扫码最方便。"
-  [ -s "$PANEL_HTPASSWD" ] && echo "  (已设密码登录; 打开会先弹登录框。改/关: bash install.sh panel-pass <用户> <密码> | panel-pass off)" \
-    || echo "  想加密码登录: bash install.sh panel-pass <用户名> <密码>"
+  if [ -s "$PANEL_MAP" ]; then
+    render_panel_login_html >"$WWW${PANEL_PATH%.html}-login.html"; chmod 644 "$WWW${PANEL_PATH%.html}-login.html"
+    echo "  (已开密码登录: 打开会先到登录页。改密码/关闭: bash install.sh panel-pass <密码> | panel-pass off)"
+  else
+    echo "  想加密码登录(自定义登录页): bash install.sh panel-pass <密码>"
+  fi
 }
 
-# 给看板页加 HTTP Basic Auth(由 nginx 真鉴权, 不是网页里的 JS 假门)。off 关闭。
+# 给看板页加登录: 自定义好看登录页 + nginx 用 cookie==密码 服务端校验(真鉴权, 不是网页里的 JS 假门)。off 关闭。
 do_panel_pass() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   # shellcheck disable=SC1090
@@ -1524,30 +1578,34 @@ do_panel_pass() {
   # config_nginx 需要的派生变量(单独跑该函数时补齐)
   EXPIRE_VALUE="${EXPIRE_AT:-$(date -d '+365 days' '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo '2099-12-31 23:59:59 +0800')}"
   SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
+  local login_file="$WWW${PANEL_PATH%.html}-login.html"
   if [ "${1:-}" = "off" ]; then
-    rm -f "$PANEL_HTPASSWD"
+    rm -f "$PANEL_MAP" "$login_file"
     config_nginx
-    ok "已关闭看板页密码(恢复为随机路径直达)。"
+    ok "已关闭看板页登录(恢复为随机路径直达)。"
     return 0
   fi
-  local user="${1:-}" pass="${2:-}"
-  { [ -n "$user" ] && [ -n "$pass" ]; } || die "用法: bash install.sh panel-pass <用户名> <密码>   (关闭: panel-pass off)"
-  case "$user" in *:*|*[!A-Za-z0-9_-]*) die "用户名只能含 字母/数字/_/-, 且不含冒号: $user";; esac
-  command -v openssl >/dev/null 2>&1 || die "需要 openssl 生成密码哈希"
-  local hash
-  # || true: set -o pipefail 下, openssl 不支持 -stdin / awk 找不到文件会让命令替换非零, 触发 errexit 提前退出
-  hash="$(printf '%s' "$pass" | openssl passwd -apr1 -stdin 2>/dev/null || true)"   # 优先 stdin, 密码不进进程列表
-  [ -n "$hash" ] || hash="$(openssl passwd -apr1 "$pass" 2>/dev/null || true)"      # 老 openssl 无 -stdin 时回退
-  [ -n "$hash" ] || die "生成密码哈希失败(openssl passwd -apr1)"
-  local ngx_user; ngx_user="$(awk '$1=="user"{print $2}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';' | head -1 || true)"
-  [ -n "$ngx_user" ] || ngx_user=www-data
-  ( umask 027; printf '%s:%s\n' "$user" "$hash" >"$PANEL_HTPASSWD" )
-  chown "root:$ngx_user" "$PANEL_HTPASSWD" 2>/dev/null && chmod 640 "$PANEL_HTPASSWD" || chmod 644 "$PANEL_HTPASSWD"
+  local pass="${1:-}"
+  [ -n "$pass" ] || die "用法: bash install.sh panel-pass <密码>   (关闭: panel-pass off)"
+  # 密码会进 cookie 和 nginx map, 限安全字符集(免转义/免 cookie 截断); 长度 >=6
+  case "$pass" in *[!A-Za-z0-9._~-]*) die "密码只能含 字母/数字/. _ ~ -(免转义), 例: openssl rand -hex 12";; esac
+  [ "${#pass}" -ge 6 ] || die "密码至少 6 位(建议 openssl rand -hex 12)"
+  # nginx map 片段: 校验 cookie sbauth 是否等于密码。600 root —— 由 nginx master(root)加载, 密码从不下发浏览器。
+  ( umask 077; cat >"$PANEL_MAP" <<EOF
+map \$cookie_sbauth \$sb_ok {
+    default 0;
+    "$pass" 1;
+}
+EOF
+  )
+  chown root:root "$PANEL_MAP" 2>/dev/null || true; chmod 600 "$PANEL_MAP"
+  mkdir -p "$WWW"; chmod 755 "$WWW"
+  render_panel_login_html >"$login_file"; chmod 644 "$login_file"   # 登录页不含密码, 可公开
   config_nginx
-  ok "看板页已加密码登录(HTTP Basic Auth)。"
-  echo "  打开 http://$SUB_HOST$PANEL_PATH 会先弹登录框: 用户名 $user / 你设的密码"
-  note "看板密码走 Basic Auth: 明文 HTTP 下密码是 base64(同网段可嗅探), 只挡'知道链接的人'; 要真加密走 HTTPS(CF Tunnel)。"
-  note "密码文件 $PANEL_HTPASSWD 不随 backup 迁移; 换机后重跑 panel-pass 重设。"
+  ok "看板页已加密码登录(自定义登录页 + nginx 服务端校验)。"
+  echo "  打开 http://$SUB_HOST$PANEL_PATH 会先跳到登录页, 输入你设的密码即可。"
+  note "登录是 cookie==密码、nginx 服务端校验(密码只存 600 root 的 $PANEL_MAP, 不下发浏览器)。明文 HTTP 下 cookie 不加密(同网段可嗅探), 只挡'知道链接的人'; 要真加密走 HTTPS(CF Tunnel)。"
+  note "无登录限速, 请用强密码。$PANEL_MAP / 登录页不随 backup 迁移, 换机后重跑 panel-pass。"
 }
 
 do_komari() {
@@ -1957,8 +2015,8 @@ do_uninstall() {
   rm -f "$ENVFILE" "$TRAFFIC_PY" "$CRON" "$NGINX_SNIPPET" "$NGINX_CONF" 2>/dev/null || true
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
   [ -n "${SUB_B64_PATH:-}" ] && rm -f "$WWW$SUB_B64_PATH" 2>/dev/null || true
-  [ -n "${PANEL_PATH:-}" ] && rm -f "$WWW$PANEL_PATH" 2>/dev/null || true
-  rm -f "$PANEL_HTPASSWD" 2>/dev/null || true   # 看板页 Basic Auth 密码文件
+  [ -n "${PANEL_PATH:-}" ] && rm -f "$WWW$PANEL_PATH" "$WWW${PANEL_PATH%.html}-login.html" 2>/dev/null || true
+  rm -f "$PANEL_MAP" 2>/dev/null || true   # 看板页登录: nginx map 密码片段
   rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt "$WWW"/panel-*.html 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅/看板文件
   rm -f /var/lib/sing-box-node/quota-stopped /run/sing-box-quota-stopped 2>/dev/null || true
   rm -f "$WARP_ENV" 2>/dev/null || true   # WARP 分流状态(wgcf 二进制保留, 无害)
@@ -2301,7 +2359,7 @@ main() {
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|panel-pass <用户> <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|panel-pass <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 
