@@ -234,6 +234,18 @@ echo '{"old":1}' > "$AP/config.json"
 if PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; SB_DIR="'"$AP"'"; systemctl(){ return 0; }; apply_singbox_config "'"$AP"'/new.json"; rc=$?; [ "$rc" -eq 0 ] && grep -q new "'"$AP"'/config.json"' >/dev/null 2>&1; then
   echo "PASS  apply_singbox_config 重启成功切新配置且返回0"; else echo "FAIL  apply 成功路径"; cat "$AP/config.json" 2>/dev/null; fail=1; fi
 
+# 回滚护栏接线检查(静态): 主安装路径/CF/WARP-off 都应走回滚, 不再直接覆盖/过早删状态
+grep -qF 'render_singbox_config >"$SB_DIR/config.json"' install.sh && { echo "FAIL  write_singbox_config 仍直接覆盖正式 config"; fail=1; } || echo "PASS  主安装路径不再直接覆盖正式 config"
+if grep -qF 'cf_restore_service "$cfbak"' install.sh && [ "$(grep -c cf_restore_service install.sh)" -ge 3 ]; then
+  echo "PASS  do_cf 后续失败均回滚旧 cloudflared 隧道(cf_restore_service)"; else echo "FAIL  do_cf 缺 cloudflared 回滚"; fail=1; fi
+grep -qF 'rm -f "$tmpc" "$WARP_ENV"' install.sh && echo "PASS  warp off 成功落地后才删 WARP_ENV" || { echo "FAIL  warp off WARP_ENV 删除时机"; fail=1; }
+# write_singbox_config 端到端: 重启失败必须回滚旧配置(桩 sing-box/systemctl)
+WT="$TMP/wsctest"; rm -rf "$WT"; mkdir -p "$WT"; echo '{"sentinel":"old"}' > "$WT/config.json"
+PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e
+  SB_DIR="'"$WT"'"; sing-box(){ return 0; }; systemctl(){ case "$1" in restart) return 1;; *) return 0;; esac; }
+  write_singbox_config' >/dev/null 2>&1
+if grep -q sentinel "$WT/config.json"; then echo "PASS  write_singbox_config 重启失败端到端回滚旧配置"; else echo "FAIL  write_singbox_config 回滚"; cat "$WT/config.json" 2>/dev/null; fail=1; fi
+
 echo
 echo "=== 4h) WARP 解锁分流渲染 ==="
 CFGW="$(ANYTLS_OK=1 WARP_PRIVATE_KEY=cHJpdmtleTEyMw== WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606:4700:110:8a36::2/128 render render_singbox_config)"

@@ -1015,11 +1015,14 @@ PY
 # ---- 写文件 + 副作用 -------------------------------------------------------
 write_singbox_config() {
   log "写入 sing-box 配置并校验..."
-  render_singbox_config >"$SB_DIR/config.json"
-  chmod 600 "$SB_DIR/config.json"
-  sing-box check -c "$SB_DIR/config.json" || die "sing-box 配置校验失败(请把上面报错贴出来)"
   systemctl enable sing-box >/dev/null 2>&1 || true
-  systemctl restart sing-box
+  # 重装已有节点时也走回滚护栏: 先临时文件 sing-box check, 再经 apply_singbox_config 落地;
+  # restart 失败时回滚旧配置, 不把原本可用的节点丢在新配置/停服状态(首次安装无旧配置可回滚)。
+  local tmpc; tmpc="$(mktemp)"
+  render_singbox_config >"$tmpc"
+  sing-box check -c "$tmpc" || { rm -f "$tmpc"; die "sing-box 配置校验失败(请把上面报错贴出来)"; }
+  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; die "sing-box 重启失败, 已回滚到旧配置(首次安装则无旧配置); 看 systemctl status sing-box"; }
+  rm -f "$tmpc"
   ok "sing-box 已启动"
 }
 
@@ -1910,6 +1913,18 @@ apply_singbox_config() {
   return 1
 }
 
+# do_cf 后续步骤失败时把 cloudflared 切回旧隧道服务(参数: 旧 cloudflared.service 备份文件)。
+# 换 token = 卸旧装新; 若 sing-box 那边随后回滚/没动, cloudflared 也必须切回去, 否则旧 CF 节点会断。
+cf_restore_service() {
+  local b="${1:-}"
+  [ -n "$b" ] && [ -f "$b" ] || return 0
+  warn "恢复旧 cloudflared 隧道服务(回滚 token 切换)..."
+  cloudflared service uninstall >/dev/null 2>&1 || true
+  install -m644 "$b" /etc/systemd/system/cloudflared.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now cloudflared >/dev/null 2>&1 || true
+}
+
 # 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
 do_cf() {
   umask 077
@@ -1940,6 +1955,10 @@ EOF
   CF_WS_PATH="${CF_WS_PATH:-/cf-$(openssl rand -hex 8)}"
   case "$CF_WS_PATH" in /*) ;; *) CF_WS_PATH="/$CF_WS_PATH";; esac
   # CF_ENV 状态文件改到"配置校验+落地成功"后再写(见下), 避免坏参数留下"已接入"状态毒害后续 install/重启
+  # 网卡/IP 探测与 anytls 入站判定放到"换 cloudflared token"之前: 这俩若失败应在动 cloudflared 之前就退出,
+  # 免得换完 token 才在这里 die、把已有隧道留在新 token 上回不去。
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
+  detect_net
 
   # 装 cloudflared(直接下二进制, 跨发行版)
   if ! command -v cloudflared >/dev/null 2>&1; then
@@ -1962,16 +1981,12 @@ EOF
   cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
   if ! cloudflared service install "$CF_TOKEN"; then
     if [ -n "$cfbak" ]; then
-      warn "cloudflared service install 失败, 恢复旧隧道服务..."
-      cloudflared service uninstall >/dev/null 2>&1 || true   # 清掉可能装了一半的残留
-      install -m644 "$cfbak" "$cfsvc"; rm -f "$cfbak"
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      systemctl enable --now cloudflared >/dev/null 2>&1 || true
+      cf_restore_service "$cfbak"; rm -f "$cfbak"
       die "cloudflared service install 失败(token 错误/过期?), 已恢复旧隧道服务。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
     fi
     die "cloudflared service install 失败(token 是否正确?)"
   fi
-  [ -n "$cfbak" ] && rm -f "$cfbak"
+  # cfbak 先保留: 后续 sing-box check / apply_singbox_config 任一失败, 都要把 cloudflared 切回旧隧道(见下)
   systemctl enable --now cloudflared >/dev/null 2>&1 || true
   # ③ 低配/丢包机器硬化 cloudflared: 强制 http2(抖动链路比 QUIC 稳) + 放宽启动超时, 避免反复重启失败
   if [ -f "$cfsvc" ]; then
@@ -1985,15 +2000,15 @@ EOF
     ok "cloudflared 已硬化: --protocol http2 + --loglevel warn + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
   fi
 
-  # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)
-  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
-  detect_net
-  # 安全护栏: 先渲染到临时文件并 sing-box check 通过, 再覆盖正式 config; 失败保留原配置(现有节点不受影响)
+  # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)。
+  # 安全护栏: 先渲染到临时文件并 sing-box check 通过, 再覆盖正式 config; 失败保留原配置。
+  # 这之后任一步失败, 除回滚 sing-box 配置外, 还要 cf_restore_service 把 cloudflared 切回旧隧道(token 已换)。
   local tmpc; tmpc="$(mktemp)"
   render_singbox_config >"$tmpc"
-  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置(现有节点不受影响); 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
-  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; die "加入 CF 入站后 sing-box 重启失败, 已回滚到旧配置(现有节点不受影响); 看 systemctl status sing-box"; }
+  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; cf_restore_service "$cfbak"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置并恢复旧隧道; 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
+  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; cf_restore_service "$cfbak"; die "加入 CF 入站后 sing-box 重启失败, 已回滚配置并恢复旧隧道; 看 systemctl status sing-box"; }
   rm -f "$tmpc"
+  [ -n "$cfbak" ] && rm -f "$cfbak"   # 全流程成功, 旧隧道备份不再需要
   # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
   ( umask 077; cat >"$CF_ENV" <<EOF
 CF_HOSTNAME=$CF_HOSTNAME
@@ -2050,18 +2065,19 @@ do_warp() {
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   detect_net
 
-  # 关闭分流: 删状态 + 重渲染(护栏校验)
+  # 关闭分流: 重渲染"无 WARP"配置(护栏校验); WARP_ENV 状态文件等无 WARP 配置成功落地后才删,
+  # 失败则保留原配置与状态, 避免"配置仍带 WARP 但状态文件已丢"的不一致。
   if [ "${1:-}" = "off" ]; then
     [ -f "$WARP_ENV" ] || { ok "未启用 WARP 分流, 无需关闭"; return 0; }
-    rm -f "$WARP_ENV"
-    WARP_PRIVATE_KEY=""; WARP_ADDR_V4=""; WARP_ADDR_V6=""; WARP_RESERVED=""
+    WARP_PRIVATE_KEY=""; WARP_ADDR_V4=""; WARP_ADDR_V6=""; WARP_RESERVED=""   # 清空 shell 变量→渲染出无 WARP 配置(暂不删 WARP_ENV)
     local tmpc; tmpc="$(mktemp)"
     render_singbox_config >"$tmpc"
-    if sing-box check -c "$tmpc" >/dev/null 2>&1; then
-      if apply_singbox_config "$tmpc"; then ok "已关闭 WARP 分流(原解锁站点恢复走 VPS 直连出口)"; else warn "sing-box 重启失败, 已回滚到旧配置"; fi
-      rm -f "$tmpc"
+    if sing-box check -c "$tmpc" >/dev/null 2>&1 && apply_singbox_config "$tmpc"; then
+      rm -f "$tmpc" "$WARP_ENV"   # 无 WARP 配置已成功落地, 现在才删状态文件
+      ok "已关闭 WARP 分流(原解锁站点恢复走 VPS 直连出口)"
     else
-      rm -f "$tmpc"; warn "关闭后配置校验异常, 已保留原配置不动"
+      rm -f "$tmpc"
+      warn "关闭 WARP 失败(校验或重启未通过), 已保留原 WARP 配置与状态不动(WARP_ENV 未删)"
     fi
     return 0
   fi
