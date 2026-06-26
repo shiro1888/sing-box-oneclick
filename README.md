@@ -133,7 +133,7 @@ sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/
 sudo bash install.sh backup      # 打包密钥+配置 -> /root/sing-box-backup-时间.tar.gz
 sudo bash install.sh restore <文件>   # 新 VPS 上恢复(同一套凭证, 客户端不用换密码)
 sudo bash install.sh harden      # SSH 加固: 密钥登录+禁密码+fail2ban(必须先有授权公钥)
-sudo bash install.sh warp        # WARP 解锁分流: ChatGPT/Netflix/Disney 走 WARP(关闭: warp off)
+sudo bash install.sh warp        # WARP 解锁分流: OpenAI/Claude/Gemini/Netflix/Disney 走 WARP(关闭: warp off)
 sudo bash install.sh admin       # 网页管理面板(仅 127.0.0.1+SSH隧道+token, 改限额/到期/重启/备份; 关闭: admin off)
 sudo bash install.sh update      # 更新 sing-box 到最新版并重启
 sudo bash install.sh restart     # 重启 sing-box / nginx (/ cloudflared)
