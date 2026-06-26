@@ -162,6 +162,22 @@ PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 
 if grep -q 'EXPIRE_AT="2030-01-02 03:04:05 +0800"' "$SETD/env"; then echo "PASS  set EXPIRE_AT(带空格单参数)成功"; else echo "FAIL  set EXPIRE_AT 空格"; grep EXPIRE_AT "$SETD/env"; fail=1; fi
 # 畸形 LIMIT_GB(多点)应被拒, 不污染 env
 if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; do_set LIMIT_GB=5.5.5' >/dev/null 2>&1; then echo "FAIL  畸形 LIMIT_GB 应被拒"; fail=1; else echo "PASS  畸形 LIMIT_GB(5.5.5)被拒"; fi
+# do_set 拒绝不存在的网卡(打错网卡名会让 vnstat 取不到数据、配额限流静默失效); 用 ip 桩函数模拟存在/不存在
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; ip(){ return 1; }; do_set INTERFACE=eth9' >/dev/null 2>&1; then
+  echo "FAIL  do_set 应拒绝不存在的网卡"; fail=1
+else
+  grep -q '^INTERFACE=eth9$' "$SETD/env" && { echo "FAIL  非法网卡污染了 env"; fail=1; } || echo "PASS  do_set 拒绝不存在的网卡(ip 校验)"
+fi
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; ip(){ return 0; }; do_set INTERFACE=eth1' >/dev/null 2>&1
+grep -q '^INTERFACE=eth1$' "$SETD/env" && echo "PASS  do_set 接受存在的网卡并落盘" || { echo "FAIL  do_set 合法网卡未落盘"; grep INTERFACE "$SETD/env"; fail=1; }
+# cf_restore_service 首次接入(空备份)应卸载刚装的新隧道, 不留孤儿服务
+MK="$TMP/cf_uninstall_mk"; rm -f "$MK"
+PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; cloudflared(){ [ "${1:-} ${2:-}" = "service uninstall" ] && touch "'"$MK"'"; return 0; }; systemctl(){ return 0; }; cf_restore_service ""' >/dev/null 2>&1
+[ -f "$MK" ] && echo "PASS  cf_restore_service 首次接入(空备份)卸载新隧道不留孤儿" || { echo "FAIL  cf_restore_service 空备份未卸载"; fail=1; }
+# apply_singbox_config: 回滚后旧服务也起不来时, 必须显式报警, 不静默谎称"节点不受影响"
+AP2="$TMP/ap2"; rm -rf "$AP2"; mkdir -p "$AP2"; echo '{"old":1}' > "$AP2/config.json"; echo '{"new":1}' > "$AP2/new.json"
+errout="$(PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; SB_DIR="'"$AP2"'"; systemctl(){ return 1; }; apply_singbox_config "'"$AP2"'/new.json"' 2>&1)"
+printf '%s' "$errout" | grep -q '回滚后 sing-box 仍未运行' && echo "PASS  apply 回滚后旧服务仍挂会显式报警" || { echo "FAIL  apply 缺回滚失败报警"; fail=1; }
 
 echo
 echo "=== 4e) HY2 obfs / 端口跳跃 / brutal 渲染 ==="

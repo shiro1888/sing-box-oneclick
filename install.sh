@@ -1765,14 +1765,18 @@ do_set() {
   # 兼容旧 env(可能无 PUBLIC_IP/SUB_HOST): 回填后再让 write_env 重写, 否则会被清空
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
-  local a key val
+  local a key val iface_changed=0
   for a in "$@"; do
     key="${a%%=*}"; val="${a#*=}"
     [ "$key" != "$a" ] || die "参数要写成 KEY=VAL: $a"
     case "$key" in
       LIMIT_GB)   case "$val" in ''|.|*.*.*|*[!0-9.]*) die "LIMIT_GB 要是数字(如 200 或 0.5): $val";; esac; LIMIT_GB="$val" ;;
       COUNT_MODE) case "$val" in rx+tx|tx|max) COUNT_MODE="$val" ;; *) die "COUNT_MODE 只能 rx+tx/tx/max";; esac ;;
-      INTERFACE)  [ -n "$val" ] || die "INTERFACE 不能空"; INTERFACE="$val" ;;
+      INTERFACE)  [ -n "$val" ] || die "INTERFACE 不能空"
+                  # 校验网卡真实存在: 打错名字会让 vnstat 取不到数据, traffic_limit.py 提前退出,
+                  # 流量头不更新且配额自动停机静默失效。有 ip 命令时落盘前就拦掉(测试机无 ip 则跳过)。
+                  if command -v ip >/dev/null 2>&1; then ip -br link show "$val" >/dev/null 2>&1 || die "网卡不存在: $val(用 ip -br link 查真实名)"; fi
+                  INTERFACE="$val"; iface_changed=1 ;;
       EXPIRE_AT)  [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || die "EXPIRE_AT 格式须为 'YYYY-MM-DD HH:MM:SS +0800'"; EXPIRE_AT="$val" ;;
       *) die "不支持的键: $key (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE)" ;;
     esac
@@ -1780,6 +1784,10 @@ do_set() {
   done
   write_env   # 用更新后的全局重写 env(SUB_HOST/PUBLIC_IP 已从 env 读到, 一并保留)
   [ -f "$TRAFFIC_PY" ] && { "$PY" "$TRAFFIC_PY" >/dev/null 2>&1 && ok "已刷新订阅流量头(限额/到期即时生效)" || warn "流量头刷新失败, 5 分钟后 cron 会自动重试"; }
+  # 改了网卡: HY2 端口跳跃的 nft 规则把旧网卡名烤进了 porthop.nft(do_set 不重建以免用错 HY2_PORT),
+  # 提示用户重跑 install 刷新, 否则跳跃段仍绑旧网卡、客户端经跳跃端口连不上 HY2(直连 HY2_PORT 不受影响)。
+  [ "$iface_changed" = 1 ] && [ -f /etc/systemd/system/sing-box-porthop.service ] && \
+    warn "网卡已改, 但 HY2 端口跳跃 nft 规则仍绑旧网卡; 重跑 'bash install.sh' 刷新端口跳跃(否则跳跃段连不上 HY2)。"
 }
 
 do_update() {
@@ -1908,21 +1916,30 @@ apply_singbox_config() {
   warn "sing-box 重启失败, 回滚到旧配置并拉回旧服务..."
   if [ -n "$bak" ]; then
     install -m600 "$bak" "$SB_DIR/config.json"; rm -f "$bak"
+    systemctl reset-failed sing-box >/dev/null 2>&1 || true   # 清掉 failed 状态, 否则 restart 可能不动
     systemctl restart sing-box >/dev/null 2>&1 || true
+    # 回滚后必须确认旧配置真的起来了; 否则别让调用方误报"节点不受影响"
+    systemctl is-active --quiet sing-box || err "回滚后 sing-box 仍未运行! 全部节点可能失联, 手动查: systemctl status sing-box"
   fi
   return 1
 }
 
-# do_cf 后续步骤失败时把 cloudflared 切回旧隧道服务(参数: 旧 cloudflared.service 备份文件)。
-# 换 token = 卸旧装新; 若 sing-box 那边随后回滚/没动, cloudflared 也必须切回去, 否则旧 CF 节点会断。
+# do_cf 后续步骤失败时回滚 cloudflared(参数: 旧 cloudflared.service 备份文件, 空=首次接入无旧隧道)。
+# 换 token = 卸旧装新; 若 sing-box 那边随后回滚/没动, cloudflared 也必须跟着回滚, 否则状态不一致:
+#   - 有旧隧道备份: 切回旧隧道, 否则旧 CF 节点会断;
+#   - 首次接入(无备份): 卸掉刚装的新隧道, 否则留下一个连上 CF 却指向无监听端口的孤儿服务(502/530)。
 cf_restore_service() {
   local b="${1:-}"
-  [ -n "$b" ] && [ -f "$b" ] || return 0
-  warn "恢复旧 cloudflared 隧道服务(回滚 token 切换)..."
-  cloudflared service uninstall >/dev/null 2>&1 || true
-  install -m644 "$b" /etc/systemd/system/cloudflared.service
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now cloudflared >/dev/null 2>&1 || true
+  cloudflared service uninstall >/dev/null 2>&1 || true   # 先清掉当前(可能是新装或装一半的)服务
+  if [ -n "$b" ] && [ -f "$b" ]; then
+    warn "恢复旧 cloudflared 隧道服务(回滚 token 切换)..."
+    install -m644 "$b" /etc/systemd/system/cloudflared.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now cloudflared >/dev/null 2>&1 || true
+  else
+    warn "首次接入 CF 失败, 已卸载刚装的 cloudflared 隧道(无旧隧道可恢复, 不留孤儿服务)。"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
 }
 
 # 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
@@ -1954,6 +1971,9 @@ EOF
   CF_VLESS_UUID="${CF_VLESS_UUID:-$(sing-box generate uuid)}"
   CF_WS_PATH="${CF_WS_PATH:-/cf-$(openssl rand -hex 8)}"
   case "$CF_WS_PATH" in /*) ;; *) CF_WS_PATH="/$CF_WS_PATH";; esac
+  # 字符白名单: WS 路径会原样进订阅 YAML(裸标量)。含 ': ' 等字符虽过 sing-box check(JSON 合法),
+  # 却会让整份 Clash 订阅 YAML 解析失败、所有客户端拉不到订阅。这里和 CF_HOSTNAME 一样早挡掉。
+  case "$CF_WS_PATH" in *[!A-Za-z0-9/_.-]*) die "CF_WS_PATH 含非法字符(只允许 字母数字 / _ . -): $CF_WS_PATH";; esac
   # CF_ENV 状态文件改到"配置校验+落地成功"后再写(见下), 避免坏参数留下"已接入"状态毒害后续 install/重启
   # 网卡/IP 探测与 anytls 入站判定放到"换 cloudflared token"之前: 这俩若失败应在动 cloudflared 之前就退出,
   # 免得换完 token 才在这里 die、把已有隧道留在新 token 上回不去。
@@ -1980,11 +2000,8 @@ EOF
   [ -f "$cfsvc" ] && { cfbak="$(mktemp)"; cp -a "$cfsvc" "$cfbak"; }
   cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
   if ! cloudflared service install "$CF_TOKEN"; then
-    if [ -n "$cfbak" ]; then
-      cf_restore_service "$cfbak"; rm -f "$cfbak"
-      die "cloudflared service install 失败(token 错误/过期?), 已恢复旧隧道服务。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
-    fi
-    die "cloudflared service install 失败(token 是否正确?)"
+    cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"   # 有旧隧道切回, 首次接入则卸掉装一半的, 不留孤儿
+    die "cloudflared service install 失败(token 错误/过期?)。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
   fi
   # cfbak 先保留: 后续 sing-box check / apply_singbox_config 任一失败, 都要把 cloudflared 切回旧隧道(见下)
   systemctl enable --now cloudflared >/dev/null 2>&1 || true
@@ -2003,10 +2020,12 @@ EOF
   # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)。
   # 安全护栏: 先渲染到临时文件并 sing-box check 通过, 再覆盖正式 config; 失败保留原配置。
   # 这之后任一步失败, 除回滚 sing-box 配置外, 还要 cf_restore_service 把 cloudflared 切回旧隧道(token 已换)。
-  local tmpc; tmpc="$(mktemp)"
-  render_singbox_config >"$tmpc"
-  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; cf_restore_service "$cfbak"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置并恢复旧隧道; 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
-  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; cf_restore_service "$cfbak"; die "加入 CF 入站后 sing-box 重启失败, 已回滚配置并恢复旧隧道; 看 systemctl status sing-box"; }
+  local tmpc=""
+  # mktemp/render 也纳入回滚保护: errexit 下它们若失败(如磁盘满)会直接退出, 不补这层就会跳过 cloudflared 回滚。
+  tmpc="$(mktemp)" || { cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "创建临时文件失败, 已恢复旧隧道"; }
+  render_singbox_config >"$tmpc" || { rm -f "$tmpc"; cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "渲染配置失败, 已恢复旧隧道"; }
+  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置并恢复旧隧道; 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
+  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "加入 CF 入站后 sing-box 重启失败, 已回滚配置并恢复旧隧道; 看 systemctl status sing-box"; }
   rm -f "$tmpc"
   [ -n "$cfbak" ] && rm -f "$cfbak"   # 全流程成功, 旧隧道备份不再需要
   # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
