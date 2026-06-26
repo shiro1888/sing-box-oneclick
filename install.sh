@@ -703,9 +703,10 @@ render_panel_html() {
     command -v qrencode >/dev/null 2>&1 && qr1="$(printf '%s' "$link" | qrencode -t PNG -o - 2>/dev/null | base64 -w0 || true)"
     node_data="${node_data}${nm}"$'\t'"${link}"$'\t'"${qr1}"$'\n'
   done < <(render_share_links)
+  local login_path=""; [ -s "$PANEL_MAP" ] && login_path="${PANEL_PATH%.html}-login.html"   # 开了登录才在看板显示"退出"
   AIRPORT_NAME="$AIRPORT_NAME" CLASH_URL="$clash_url" B64_URL="$b64_url" \
   QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODE_DATA="$node_data" \
-  LIMIT_GB="$LIMIT_GB" EXP="${EXPIRE_VALUE:-${EXPIRE_AT:-}}" \
+  LIMIT_GB="$LIMIT_GB" EXP="${EXPIRE_VALUE:-${EXPIRE_AT:-}}" PANEL_LOGIN="$login_path" \
   "$PY" - <<'PY'
 import os, html, sys, urllib.parse, base64, json, datetime
 e = html.escape
@@ -718,6 +719,9 @@ clash_deep = e("clash://install-config?url=" + urllib.parse.quote(clash_raw, saf
 sr_deep = e("shadowrocket://add/sub://" + base64.b64encode(b64_raw.encode()).decode())
 clash_js = json.dumps(clash_raw)   # 安全的 JS 字符串字面量, 供 fetch 用
 limit_gb = e(os.environ.get("LIMIT_GB", "") or "—")
+login_path = os.environ.get("PANEL_LOGIN", "")   # 非空=已开登录, 显示"退出"按钮(清 cookie 回登录页)
+logout_btn = '<button class="tg" onclick="lo()">退出</button>' if login_path else ''
+logout_js = f"function lo(){{document.cookie='sbauth=; path=/; max-age=0; samesite=lax';location.replace({json.dumps(login_path)});}}" if login_path else ""
 try:
     _exp = os.environ.get("EXP", "")
     exp_disp = e(datetime.datetime.strptime(_exp, "%Y-%m-%d %H:%M:%S %z").strftime("%Y-%m-%d")) if _exp else "—"
@@ -801,7 +805,7 @@ body.light .trow>span{{background:#f5f7fb}}
 body.light .cp,body.light .lat,body.light .tg{{background:#f3f4f8}}
 body.light .warn{{background:#fff5f5;border-color:#ffd0d0;color:#b42318}}
 </style></head><body><div class="wrap">
-<div class="hd"><div class="nm"><span class="dot"></span><h1>{name}</h1></div><button class="tg" onclick="tg()">{I_MOON} 主题</button></div>
+<div class="hd"><div class="nm"><span class="dot"></span><h1>{name}</h1></div><div style="display:flex;gap:8px">{logout_btn}<button class="tg" onclick="tg()">{I_MOON} 主题</button></div></div>
 <p class="sub">扫码或一键导入即可使用 · 整段订阅含全部节点,下方可逐条导入</p>
 <div class="card main">
 <div class="ttl"><span>Clash / Mihomo 订阅</span><span class="tag">主用</span></div>
@@ -822,6 +826,7 @@ body.light .warn{{background:#fff5f5;border-color:#ffd0d0;color:#b42318}}
 <div class="warn">{I_WARN}<span>此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</span></div>
 <p class="foot">管理（改限额 / 更新 / 加节点）请用 SSH：<span class="kbd">bash install.sh menu</span></p>
 </div><script>
+{logout_js}
 function cpx(b){{navigator.clipboard.writeText(b.parentElement.querySelector('code').textContent);var o=b.textContent;b.textContent='已复制';setTimeout(function(){{b.textContent=o}},1200)}}
 function tg(){{document.body.classList.toggle('light');try{{localStorage.setItem('sbtheme',document.body.classList.contains('light')?'light':'dark')}}catch(e){{}}}}
 try{{if(localStorage.getItem('sbtheme')==='light')document.body.classList.add('light')}}catch(e){{}}
@@ -1578,10 +1583,15 @@ do_panel_pass() {
   # config_nginx 需要的派生变量(单独跑该函数时补齐)
   EXPIRE_VALUE="${EXPIRE_AT:-$(date -d '+365 days' '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo '2099-12-31 23:59:59 +0800')}"
   SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
+  [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   local login_file="$WWW${PANEL_PATH%.html}-login.html"
+  # 重渲染看板, 让"退出"按钮随登录开关即时出现/消失(render_panel_html 按 $PANEL_MAP 判断)
+  _repanel() { mkdir -p "$WWW"; render_panel_html >"$WWW$PANEL_PATH" 2>/dev/null && chmod 644 "$WWW$PANEL_PATH" || true; }
   if [ "${1:-}" = "off" ]; then
     rm -f "$PANEL_MAP" "$login_file"
     config_nginx
+    _repanel   # 去掉"退出"按钮
     ok "已关闭看板页登录(恢复为随机路径直达)。"
     return 0
   fi
@@ -1602,6 +1612,7 @@ EOF
   mkdir -p "$WWW"; chmod 755 "$WWW"
   render_panel_login_html >"$login_file"; chmod 644 "$login_file"   # 登录页不含密码, 可公开
   config_nginx
+  _repanel   # 看板加上"退出"按钮
   ok "看板页已加密码登录(自定义登录页 + nginx 服务端校验)。"
   echo "  打开 http://$SUB_HOST$PANEL_PATH 会先跳到登录页, 输入你设的密码即可。"
   note "登录是 cookie==密码、nginx 服务端校验(密码只存 600 root 的 $PANEL_MAP, 不下发浏览器)。明文 HTTP 下 cookie 不加密(同网段可嗅探), 只挡'知道链接的人'; 要真加密走 HTTPS(CF Tunnel)。"

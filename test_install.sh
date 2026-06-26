@@ -11,7 +11,7 @@ else
   PYTHON_BIN="$(command -v python 2>/dev/null || command -v python3 2>/dev/null || true)"
 fi
 [ -n "$PYTHON_BIN" ] || { echo "FAIL  未找到 python/python3"; exit 1; }
-export PYTHON="$PYTHON_BIN" PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6;PANEL_PATH'
+export PYTHON="$PYTHON_BIN" PYTHONUTF8=1 PYTHONIOENCODING=utf-8 MSYS2_ENV_CONV_EXCL='CF_WS_PATH;WARP_ADDR_V4;WARP_ADDR_V6;PANEL_PATH;PANEL_LOGIN'
 python() { "$PYTHON_BIN" "$@"; }
 fail=0
 TMP="${TMPDIR:-/tmp}"
@@ -245,6 +245,14 @@ PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 
   config_nginx(){ return 0; }; nginx(){ return 0; }
   do_panel_pass off' >/dev/null 2>&1
 { [ ! -f "$PP/map.conf" ] && [ ! -f "$PP/www/panel-x-login.html" ]; } && echo "PASS  panel-pass off 删除 map + 登录页" || { echo "FAIL  panel-pass off 未清理"; fail=1; }
+# 看板"退出"按钮: 开登录时出现(清 cookie 回登录页), 未开时不出现
+echo x > "$PP/map_on"
+PL_ON="$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  PANEL_MAP="'"$PP"'/map_on"; PANEL_PATH=/panel-x.html; SB_DIR="'"$TMP"'/sbtest"; SUB_HOST=1.2.3.4; SUB_PATH=/s.yaml; SUB_B64_PATH=/b.txt; ANYTLS_OK=1
+  render_panel_html')"
+printf '%s' "$PL_ON" | grep -qF 'onclick="lo()"' && printf '%s' "$PL_ON" | grep -qF 'function lo()' \
+  && echo "PASS  开登录时看板有退出按钮(清 cookie 回登录页)" || { echo "FAIL  看板缺退出按钮"; fail=1; }
+printf '%s' "$PANEL" | grep -qF 'onclick="lo()"' && { echo "FAIL  未开登录却有退出按钮"; fail=1; } || echo "PASS  未开登录时看板无退出按钮"
 
 echo
 echo "=== 4g) backup 打包 ==="
