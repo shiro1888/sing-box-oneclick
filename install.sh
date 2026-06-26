@@ -84,6 +84,7 @@ ENVFILE=/etc/sing-box-node.env
 WWW=/var/www/html
 NGINX_SNIPPET=/etc/nginx/snippets/sub_headers.conf
 NGINX_CONF=/etc/nginx/conf.d/00-singbox-sub.conf
+PANEL_HTPASSWD=/etc/nginx/.singbox_panel.htpasswd   # 看板页 HTTP Basic Auth 密码文件(存在=看板页需登录; panel-pass 子命令管理)
 TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
 SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
@@ -1096,6 +1097,9 @@ config_nginx() {
     v6_named=$'\n    listen [::]:80;'
   fi
   rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+  # 看板页可选 HTTP Basic Auth: 存在密码文件就让 nginx 在伺服看板前要求登录(真鉴权, 非网页内 JS 假门)
+  local panel_auth=""
+  [ -s "$PANEL_HTPASSWD" ] && panel_auth=$'\n        auth_basic "sing-box panel";\n        auth_basic_user_file '"$PANEL_HTPASSWD"';'
   cat >"$NGINX_CONF" <<EOF
 server {
     listen 80 default_server;$v6_default
@@ -1120,7 +1124,7 @@ server {
         try_files \$uri =404;
     }
 
-    location = $PANEL_PATH {
+    location = $PANEL_PATH {$panel_auth
         default_type text/html;
         try_files \$uri =404;
     }
@@ -1506,6 +1510,44 @@ do_panel() {
   render_panel_html >"$WWW$PANEL_PATH"; chmod 644 "$WWW$PANEL_PATH"
   ok "可视化看板页: http://$SUB_HOST$PANEL_PATH"
   echo "  浏览器打开即可看两种订阅 + 扫码导入 + 一键复制; 手机扫码最方便。"
+  [ -s "$PANEL_HTPASSWD" ] && echo "  (已设密码登录; 打开会先弹登录框。改/关: bash install.sh panel-pass <用户> <密码> | panel-pass off)" \
+    || echo "  想加密码登录: bash install.sh panel-pass <用户名> <密码>"
+}
+
+# 给看板页加 HTTP Basic Auth(由 nginx 真鉴权, 不是网页里的 JS 假门)。off 关闭。
+do_panel_pass() {
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  # shellcheck disable=SC1090
+  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  [ -n "${PANEL_PATH:-}" ] || die "本安装无看板页, 先重跑 install 升级再设密码"
+  command -v nginx >/dev/null 2>&1 || die "未检测到 nginx"
+  # config_nginx 需要的派生变量(单独跑该函数时补齐)
+  EXPIRE_VALUE="${EXPIRE_AT:-$(date -d '+365 days' '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo '2099-12-31 23:59:59 +0800')}"
+  SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
+  if [ "${1:-}" = "off" ]; then
+    rm -f "$PANEL_HTPASSWD"
+    config_nginx
+    ok "已关闭看板页密码(恢复为随机路径直达)。"
+    return 0
+  fi
+  local user="${1:-}" pass="${2:-}"
+  { [ -n "$user" ] && [ -n "$pass" ]; } || die "用法: bash install.sh panel-pass <用户名> <密码>   (关闭: panel-pass off)"
+  case "$user" in *:*|*[!A-Za-z0-9_-]*) die "用户名只能含 字母/数字/_/-, 且不含冒号: $user";; esac
+  command -v openssl >/dev/null 2>&1 || die "需要 openssl 生成密码哈希"
+  local hash
+  # || true: set -o pipefail 下, openssl 不支持 -stdin / awk 找不到文件会让命令替换非零, 触发 errexit 提前退出
+  hash="$(printf '%s' "$pass" | openssl passwd -apr1 -stdin 2>/dev/null || true)"   # 优先 stdin, 密码不进进程列表
+  [ -n "$hash" ] || hash="$(openssl passwd -apr1 "$pass" 2>/dev/null || true)"      # 老 openssl 无 -stdin 时回退
+  [ -n "$hash" ] || die "生成密码哈希失败(openssl passwd -apr1)"
+  local ngx_user; ngx_user="$(awk '$1=="user"{print $2}' /etc/nginx/nginx.conf 2>/dev/null | tr -d ';' | head -1 || true)"
+  [ -n "$ngx_user" ] || ngx_user=www-data
+  ( umask 027; printf '%s:%s\n' "$user" "$hash" >"$PANEL_HTPASSWD" )
+  chown "root:$ngx_user" "$PANEL_HTPASSWD" 2>/dev/null && chmod 640 "$PANEL_HTPASSWD" || chmod 644 "$PANEL_HTPASSWD"
+  config_nginx
+  ok "看板页已加密码登录(HTTP Basic Auth)。"
+  echo "  打开 http://$SUB_HOST$PANEL_PATH 会先弹登录框: 用户名 $user / 你设的密码"
+  note "看板密码走 Basic Auth: 明文 HTTP 下密码是 base64(同网段可嗅探), 只挡'知道链接的人'; 要真加密走 HTTPS(CF Tunnel)。"
+  note "密码文件 $PANEL_HTPASSWD 不随 backup 迁移; 换机后重跑 panel-pass 重设。"
 }
 
 do_komari() {
@@ -1916,6 +1958,7 @@ do_uninstall() {
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
   [ -n "${SUB_B64_PATH:-}" ] && rm -f "$WWW$SUB_B64_PATH" 2>/dev/null || true
   [ -n "${PANEL_PATH:-}" ] && rm -f "$WWW$PANEL_PATH" 2>/dev/null || true
+  rm -f "$PANEL_HTPASSWD" 2>/dev/null || true   # 看板页 Basic Auth 密码文件
   rm -f "$WWW"/sub-*.yaml "$WWW"/sub-b64-*.txt "$WWW"/panel-*.html 2>/dev/null || true   # 兜底: 即使 secrets 丢失也清掉含凭证的订阅/看板文件
   rm -f /var/lib/sing-box-node/quota-stopped /run/sing-box-quota-stopped 2>/dev/null || true
   rm -f "$WARP_ENV" 2>/dev/null || true   # WARP 分流状态(wgcf 二进制保留, 无害)
@@ -2242,6 +2285,7 @@ main() {
     install)   do_install ;;
     info)      do_info ;;
     panel)     do_panel ;;
+    panel-pass) shift; do_panel_pass "$@" ;;
     links)     do_links ;;
     status)    do_status ;;
     doctor)    do_doctor ;;
@@ -2257,7 +2301,7 @@ main() {
     komari)    do_komari ;;
     menu)      do_menu ;;
     uninstall) do_uninstall ;;
-    *) echo "用法: $0 [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]"; exit 1 ;;
+    *) echo "用法: $0 [install|info|panel|panel-pass <用户> <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]"; exit 1 ;;
   esac
 }
 

@@ -219,6 +219,21 @@ PANELCF="$(SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 CF_
 if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板有CF-Vless"; else echo "FAIL  开CF看板缺CF-Vless"; fail=1; fi
 # 安装上下文是 set -euo pipefail, 看板渲染不能中断(qrencode 失败/缺失都该优雅降级)
 if PYTHON="$PYTHON_BIN" bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
+# 看板页密码(panel-pass): 生成 user:$apr1$ htpasswd; config_nginx 注入真 Basic Auth(非网页 JS 假门)
+grep -qF 'auth_basic_user_file' install.sh && grep -qF 'auth_basic "sing-box panel"' install.sh && echo "PASS  config_nginx 注入 nginx Basic Auth(看板页真鉴权)" || { echo "FAIL  缺 nginx auth_basic 注入"; fail=1; }
+if command -v openssl >/dev/null 2>&1; then
+  PP="$TMP/pptest"; rm -rf "$PP"; mkdir -p "$PP"; printf 'PANEL_PATH=/panel-x.html\n' > "$PP/secrets"
+  PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+    SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_HTPASSWD="'"$PP"'/htp"
+    config_nginx(){ return 0; }; nginx(){ return 0; }; systemctl(){ return 0; }
+    do_panel_pass myuser secretpw' >/dev/null 2>&1
+  if grep -qE '^myuser:\$apr1\$' "$PP/htp" 2>/dev/null; then echo "PASS  panel-pass 生成 htpasswd(user:\$apr1\$ 哈希)"; else echo "FAIL  panel-pass htpasswd"; cat "$PP/htp" 2>/dev/null; fail=1; fi
+  PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+    SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_HTPASSWD="'"$PP"'/htp"
+    config_nginx(){ return 0; }; nginx(){ return 0; }; systemctl(){ return 0; }
+    do_panel_pass off' >/dev/null 2>&1
+  [ -f "$PP/htp" ] && { echo "FAIL  panel-pass off 未删密码文件"; fail=1; } || echo "PASS  panel-pass off 删除密码文件(关闭登录)"
+else echo "skip  (无 openssl, 跳过 panel-pass 测试)"; fi
 
 echo
 echo "=== 4g) backup 打包 ==="
