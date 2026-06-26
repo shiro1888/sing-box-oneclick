@@ -721,7 +721,7 @@ clash_js = json.dumps(clash_raw)   # 安全的 JS 字符串字面量, 供 fetch 
 limit_gb = e(os.environ.get("LIMIT_GB", "") or "—")
 login_path = os.environ.get("PANEL_LOGIN", "")   # 非空=已开登录, 显示"退出"按钮(清 cookie 回登录页)
 logout_btn = '<button class="tg" onclick="lo()">退出</button>' if login_path else ''
-logout_js = f"function lo(){{document.cookie='sbauth=; path=/; max-age=0; samesite=lax';location.replace({json.dumps(login_path)});}}" if login_path else ""
+logout_js = f"function lo(){{document.cookie='sbauth=; path=/; max-age=0; samesite=lax';document.body.style.opacity='0';setTimeout(function(){{location.replace({json.dumps(login_path)})}},220);}}" if login_path else ""
 try:
     _exp = os.environ.get("EXP", "")
     exp_disp = e(datetime.datetime.strptime(_exp, "%Y-%m-%d %H:%M:%S %z").strftime("%Y-%m-%d")) if _exp else "—"
@@ -753,7 +753,7 @@ out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>{name} 订阅</title><style>
 :root{{--bg:#0b0e14;--card:#141925;--line:rgba(255,255,255,.07);--line2:rgba(255,255,255,.15);--fg:#eef1f6;--mut:#8b93a4;--acc:#818cf8;--accfg:#fff;--g:linear-gradient(135deg,#818cf8,#c084fc);color-scheme:dark light}}
 *{{box-sizing:border-box}}
-body{{margin:0;padding:0;min-height:100vh;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;-webkit-font-smoothing:antialiased;transition:background .3s,color .3s}}
+body{{margin:0;padding:0;min-height:100vh;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;-webkit-font-smoothing:antialiased;transition:background .3s,color .3s,opacity .25s}}
 body::before{{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(680px 360px at 50% -6%,rgba(129,140,248,.18),transparent 70%)}}
 .wrap{{position:relative;max-width:560px;margin:0 auto;padding:30px 16px 48px}}
 @keyframes rise{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
@@ -857,7 +857,9 @@ out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>{name} · 登录</title><style>
 :root{{--bg:#0b0e14;--card:#141925;--line:rgba(255,255,255,.08);--fg:#eef1f6;--mut:#8b93a4;--g:linear-gradient(135deg,#818cf8,#c084fc)}}
 *{{box-sizing:border-box}}
-body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(640px 340px at 50% 0%,rgba(129,140,248,.2),transparent 70%),var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}}
+body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(640px 340px at 50% 0%,rgba(129,140,248,.2),transparent 70%),var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased;animation:fadein .4s ease both}}
+body.leaving{{animation:none;opacity:0;transition:opacity .22s ease}}
+@keyframes fadein{{from{{opacity:0}}to{{opacity:1}}}}
 @keyframes rise{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
 .box{{width:340px;max-width:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:28px 24px;text-align:center;box-shadow:0 24px 60px -24px rgba(0,0,0,.6),0 0 0 1px rgba(129,140,248,.08);animation:rise .55s cubic-bezier(.2,.75,.2,1) both}}
 .lk{{width:54px;height:54px;margin:0 auto 14px;border-radius:16px;display:flex;align-items:center;justify-content:center;background:var(--g);color:#fff;box-shadow:0 12px 28px -10px rgba(129,140,248,.8)}}
@@ -881,7 +883,7 @@ button:hover{{transform:translateY(-1px);filter:brightness(1.06)}}button:active{
 </div>
 <script>
 var P={panel};
-function go(){{var v=document.getElementById('pw').value;if(!v)return;try{{sessionStorage.setItem('sbt','1')}}catch(e){{}}document.cookie='sbauth='+v+'; path=/; max-age=604800; samesite=lax';location.replace(P);}}
+function go(){{var v=document.getElementById('pw').value;if(!v)return;try{{sessionStorage.setItem('sbt','1')}}catch(e){{}}document.cookie='sbauth='+v+'; path=/; max-age=604800; samesite=lax';document.body.classList.add('leaving');setTimeout(function(){{location.replace(P)}},200);}}
 document.getElementById('go').onclick=go;
 document.getElementById('pw').addEventListener('keydown',function(e){{if(e.key==='Enter')go();}});
 try{{if(sessionStorage.getItem('sbt')){{sessionStorage.removeItem('sbt');document.getElementById('err').style.display='block';document.getElementById('pw').focus();}}}}catch(e){{}}
