@@ -215,6 +215,16 @@ bf="$(ls "$BK"/out/sing-box-backup-*.tar.gz 2>/dev/null | head -1)"
 if [ -n "$bf" ] && tar tzf "$bf" 2>/dev/null | grep -q 'secrets' && tar tzf "$bf" 2>/dev/null | grep -q 'server.key'; then
   echo "PASS  backup 生成 tar.gz 且含 密钥/证书/参数"; else echo "FAIL  backup"; ls -la "$BK/out" 2>/dev/null; fail=1; fi
 
+# restore 安全护栏: 含白名单外成员的 tar 必须在解包前被拒(防以 root 解任意 tar 覆盖系统文件)
+if command -v tar >/dev/null 2>&1; then
+  RST="$TMP/rsttest"; rm -rf "$RST"; mkdir -p "$RST"; echo evil > "$RST/evil.txt"
+  ( cd "$RST" && tar czf bad.tar.gz evil.txt ) 2>/dev/null
+  if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SB_DIR="'"$RST"'/sb"; do_restore "'"$RST"'/bad.tar.gz"' >/dev/null 2>&1; then
+    echo "FAIL  restore 应拒绝白名单外成员(evil.txt)"; fail=1
+  else
+    echo "PASS  restore 拒绝白名单外成员(解包前 die)"; fi
+else echo "skip  (未安装 tar, 跳过 restore 校验)"; fi
+
 echo
 echo "=== 4h) WARP 解锁分流渲染 ==="
 CFGW="$(ANYTLS_OK=1 WARP_PRIVATE_KEY=cHJpdmtleTEyMw== WARP_ADDR_V4=172.16.0.2/32 WARP_ADDR_V6=2606:4700:110:8a36::2/128 render render_singbox_config)"

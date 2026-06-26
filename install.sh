@@ -1556,7 +1556,22 @@ do_restore() {
   [ -n "$bf" ] || die "用法: install.sh restore <备份文件.tar.gz>"
   [ -f "$bf" ] || die "找不到备份文件: $bf"
   command -v tar >/dev/null 2>&1 || die "缺 tar(先 apt install -y tar)"
-  log "恢复备份(解包到 /)..."
+  log "恢复备份(先校验成员, 再解包)..."
+  # 安全护栏: 以 root 解任意 tar 到 / 风险高(传错文件/恶意包可覆盖系统文件)。
+  # 解包前先白名单校验: 只接受普通文件/目录, 拒绝符号/硬链接、绝对路径、.. 路径, 以及预期之外的成员。
+  tar tzvf "$bf" >/dev/null 2>&1 || die "无法读取备份内容(文件损坏或不是 tar.gz?): $bf"
+  if tar tzvf "$bf" 2>/dev/null | awk 'NF && substr($0,1,1)!~/[-d]/{bad=1} END{exit !bad}'; then
+    die "备份含非普通文件成员(符号/硬链接/设备等), 拒绝恢复(可能指向系统文件)"
+  fi
+  local m
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    case "$m" in
+      /*|*..*) die "备份含危险路径(绝对路径或 ..), 拒绝恢复: $m" ;;
+      etc/sing-box/|etc/sing-box/*|etc/sing-box-node.env) ;;   # 与 do_backup 打包的成员一致
+      *) die "备份含预期之外的成员, 拒绝恢复(可能不是本脚本的备份): $m" ;;
+    esac
+  done < <(tar tzf "$bf" 2>/dev/null)
   mkdir -p "$SB_DIR"
   tar xzf "$bf" -C / 2>/dev/null || die "解包失败(文件损坏?)"
   [ -f "$SECRETS" ] || die "备份里没有密钥文件, 无法恢复"
@@ -1899,18 +1914,12 @@ EOF
   fi
   case "$CF_HOSTNAME" in *[!A-Za-z0-9.-]*) die "CF_HOSTNAME 含非法字符: $CF_HOSTNAME";; esac
   case "$CF_PORT" in ''|*[!0-9]*) die "CF_PORT 必须是数字: $CF_PORT";; esac
+  { [ "$CF_PORT" -ge 1 ] && [ "$CF_PORT" -le 65535 ]; } || die "CF_PORT 超出范围 1-65535: $CF_PORT"
 
   CF_VLESS_UUID="${CF_VLESS_UUID:-$(sing-box generate uuid)}"
   CF_WS_PATH="${CF_WS_PATH:-/cf-$(openssl rand -hex 8)}"
   case "$CF_WS_PATH" in /*) ;; *) CF_WS_PATH="/$CF_WS_PATH";; esac
-
-  cat >"$CF_ENV" <<EOF
-CF_HOSTNAME=$CF_HOSTNAME
-CF_PORT=$CF_PORT
-CF_VLESS_UUID=$CF_VLESS_UUID
-CF_WS_PATH=$CF_WS_PATH
-EOF
-  chmod 600 "$CF_ENV"
+  # CF_ENV 状态文件改到"配置校验+落地成功"后再写(见下), 避免坏参数留下"已接入"状态毒害后续 install/重启
 
   # 装 cloudflared(直接下二进制, 跨发行版)
   if ! command -v cloudflared >/dev/null 2>&1; then
@@ -1946,9 +1955,20 @@ EOF
   # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   detect_net
-  render_singbox_config >"$SB_DIR/config.json"; chmod 600 "$SB_DIR/config.json"
-  sing-box check -c "$SB_DIR/config.json" || die "加入 CF 入站后 sing-box 配置校验失败"
+  # 安全护栏: 先渲染到临时文件并 sing-box check 通过, 再覆盖正式 config; 失败保留原配置(现有节点不受影响)
+  local tmpc; tmpc="$(mktemp)"
+  render_singbox_config >"$tmpc"
+  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置(现有节点不受影响); 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
+  install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
   systemctl restart sing-box
+  # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
+  ( umask 077; cat >"$CF_ENV" <<EOF
+CF_HOSTNAME=$CF_HOSTNAME
+CF_PORT=$CF_PORT
+CF_VLESS_UUID=$CF_VLESS_UUID
+CF_WS_PATH=$CF_WS_PATH
+EOF
+  )
   write_subscription   # 同时刷新 Clash 订阅与通用(base64)订阅, 都带上 CF-Vless
 
   ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
@@ -2049,22 +2069,24 @@ do_warp() {
   # 落盘前清洗成安全字符集(只留 小写字母/数字/逗号/连字符), 防引号等破坏 warp.env 的 source
   WARP_SITES="$(printf '%s' "$WARP_SITES" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9,-')"
   [ -n "$WARP_SITES" ] || WARP_SITES="$WARP_DEFAULT_SITES"
-  ( umask 077; cat >"$WARP_ENV" <<EOF
-WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
-WARP_ADDR_V4='$WARP_ADDR_V4'
-WARP_ADDR_V6='$WARP_ADDR_V6'
-WARP_RESERVED='$WARP_RESERVED'
-WARP_SITES='$WARP_SITES'
-EOF
-  )
 
-  # 安全护栏: 渲染到临时文件 -> sing-box check 通过才替换正式 config, 失败保留原配置(节点不受影响)
+  # 安全护栏: 渲染到临时文件 -> sing-box check 通过才替换正式 config, 失败保留原配置(节点不受影响)。
+  # WARP_ENV 状态也等"校验+重启都成功"后再落盘: 否则校验失败(如 sing-box<1.12 不支持 wireguard endpoint)
+  # 却留下"已启用"状态文件, 会让后续 install/重启 source 它继续尝试启用 WARP 而反复失败。
   log "生成带 WARP 分流的配置并校验..."
   local tmpc; tmpc="$(mktemp)"
   render_singbox_config >"$tmpc"
   if sing-box check -c "$tmpc" >/dev/null 2>&1; then
     install -m600 "$tmpc" "$SB_DIR/config.json"; rm -f "$tmpc"
     if systemctl restart sing-box; then
+      ( umask 077; cat >"$WARP_ENV" <<EOF
+WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
+WARP_ADDR_V4='$WARP_ADDR_V4'
+WARP_ADDR_V6='$WARP_ADDR_V6'
+WARP_RESERVED='$WARP_RESERVED'
+WARP_SITES='$WARP_SITES'
+EOF
+      )
       ok "WARP 解锁分流已开启 —— 这些站点走 WARP 出口: $WARP_SITES"
       echo "  改站点: WARP_SITES='openai,anthropic,google-gemini,tiktok' bash install.sh warp   |  关闭: bash install.sh warp off"
       echo "  若能连但仍被拦(解锁没生效), 多半是缺 reserved: 编辑 $WARP_ENV 设 WARP_RESERVED='a,b,c' 后重跑 warp"
