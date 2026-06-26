@@ -722,7 +722,10 @@ try:
     exp_disp = e(datetime.datetime.strptime(_exp, "%Y-%m-%d %H:%M:%S %z").strftime("%Y-%m-%d")) if _exp else "—"
 except Exception:
     exp_disp = "—"
-def qr(data): return f'<img class="qr" alt="QR" src="data:image/png;base64,{data}">' if data else '<span class="muted">(装 qrencode 可显示二维码)</span>'
+def qr(data): return f'<div class="qrbox"><img class="qr" alt="QR" src="data:image/png;base64,{data}"></div>' if data else '<div class="qrbox"><span class="muted">(装 qrencode 可显示二维码)</span></div>'
+I_BOLT = '<svg class="i" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 3 4 14h7l-1 7 9-11h-7z"/></svg>'
+I_MOON = '<svg class="i" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>'
+I_WARN = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none;margin-top:1px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>'
 # 每节点一张卡片: 名字 + 单条分享链接(复制) + 各自二维码
 node_cards = []
 for ln in os.environ.get("NODE_DATA", "").split("\n"):
@@ -734,54 +737,74 @@ for ln in os.environ.get("NODE_DATA", "").split("\n"):
     nm_disp = e(urllib.parse.unquote(parts[0]))
     link_e = e(parts[1])
     qr1 = parts[2] if len(parts) > 2 else ""
-    qr_html = f'<img class="qr" alt="QR" src="data:image/png;base64,{qr1}">' if qr1 else ''
+    qr_html = f'<div class="qrbox"><img class="qr" alt="QR" src="data:image/png;base64,{qr1}"></div>' if qr1 else ''
     node_cards.append(
-        f'<div class="card"><b>{nm_disp}</b>'
-        f'<div class="row"><code>{link_e}</code><button onclick="cpx(this)">复制</button></div>'
+        f'<div class="ncard"><div class="nhd">{nm_disp}</div>'
+        f'<div class="urlrow"><code>{link_e}</code><button class="cp" onclick="cpx(this)">复制</button></div>'
         f'{qr_html}</div>')
 nodes_html = "\n".join(node_cards)
 out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{name} 订阅</title><style>
-:root{{color-scheme:light dark}}
-body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0e1116;color:#e6e6e6;margin:0;padding:24px;line-height:1.6;transition:background .2s,color .2s}}
-.wrap{{max-width:760px;margin:0 auto}} h1{{font-size:1.4rem;margin:.2em 0}}
-.muted{{color:#8b949e;font-size:.9rem}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px;margin:14px 0}}
-.row{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
-code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;word-break:break-all;flex:1;min-width:200px;font-size:.82rem}}
-button{{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;font-size:.85rem}} button:active{{opacity:.7}}
-button.ghost{{background:transparent;border:1px solid #30363d;color:inherit}}
-a.btn{{display:inline-block;background:#1f6feb;color:#fff;text-decoration:none;border-radius:6px;padding:8px 14px;font-size:.85rem;margin-top:8px}} a.btn:active{{opacity:.7}}
-img.qr{{background:#fff;padding:8px;border-radius:8px;width:170px;height:170px;margin-top:12px}}
-.warn{{background:#3d1c1c;border-color:#5c2626;color:#ffb4b4}}
-body.light{{background:#f6f8fa;color:#1f2328}}
-body.light .card{{background:#fff;border-color:#d0d7de}}
-body.light code{{background:#f6f8fa;border-color:#d0d7de;color:#1f2328}}
-body.light .muted{{color:#656d76}}
-body.light .warn{{background:#fff5f5;border-color:#ffc1c1;color:#a40e26}}
+:root{{--bg:#0f1217;--card:#171b22;--line:#262b34;--fg:#e8eaf0;--mut:#9097a3;--acc:#7c83ff;--accfg:#fff;color-scheme:dark light}}
+*{{box-sizing:border-box}}
+body{{margin:0;padding:22px 16px 46px;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;transition:background .2s,color .2s}}
+.wrap{{max-width:540px;margin:0 auto}}
+.hd{{display:flex;align-items:center;justify-content:space-between;gap:12px}}
+h1{{font-size:1.4rem;font-weight:600;margin:0;letter-spacing:-.01em}}
+.sub{{color:var(--mut);font-size:.85rem;margin:7px 0 18px}}
+.i{{vertical-align:-2px}}
+.tg{{display:inline-flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--line);color:var(--fg);border-radius:999px;padding:7px 13px;font-size:.8rem;cursor:pointer}}
+.tg:active{{transform:scale(.97)}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin:12px 0}}
+.card.main{{border-color:var(--acc)}}
+.ttl{{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:.95rem;font-weight:600;margin:0 0 13px}}
+.tag{{font-size:.68rem;font-weight:600;color:var(--accfg);background:var(--acc);border-radius:999px;padding:3px 10px}}
+.urlrow{{display:flex;gap:8px;align-items:stretch}}
+code{{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:.76rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg);word-break:break-all;overflow-wrap:anywhere}}
+.cp{{flex:none;background:transparent;border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:0 15px;font-size:.82rem;cursor:pointer}}
+.cp:active{{transform:scale(.96)}}
+.imp{{display:flex;align-items:center;justify-content:center;gap:7px;background:var(--acc);color:var(--accfg);border:0;border-radius:12px;padding:12px;font-size:.9rem;font-weight:600;text-decoration:none;margin-top:12px}}
+.imp:active{{opacity:.85}}
+.qrbox{{display:flex;justify-content:center;margin-top:14px}}
+.qr{{background:#fff;padding:10px;border-radius:14px;width:150px;height:150px}}
+.trow{{display:flex;gap:10px;flex-wrap:wrap}}
+.trow>span{{flex:1;min-width:92px;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:11px 12px;font-size:.78rem;color:var(--mut)}}
+.trow b{{display:block;color:var(--fg);font-size:1.02rem;font-weight:600;margin-top:3px}}
+.row2{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+.lat{{background:transparent;border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:8px 15px;font-size:.82rem;cursor:pointer}}
+.sec{{font-size:.8rem;font-weight:600;color:var(--mut);margin:22px 2px 2px}}
+.ncard{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:10px 0}}
+.nhd{{font-weight:600;font-size:.9rem;margin-bottom:10px}}
+.muted{{color:var(--mut);font-size:.84rem}}
+.warn{{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.32);color:#fca5a5;border-radius:14px;padding:14px;font-size:.82rem;display:flex;gap:10px;align-items:flex-start;margin-top:18px}}
+.foot{{color:var(--mut);font-size:.82rem;margin:14px 2px 0}}
+.kbd{{font-family:ui-monospace,Menlo,monospace;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:.78rem}}
+body.light{{--bg:#f5f6f8;--card:#ffffff;--line:#e7e9ee;--fg:#1a1d24;--mut:#6b7280;--acc:#5b5bd6}}
+body.light .warn{{background:#fff5f5;border-color:#ffd0d0;color:#b42318}}
 </style></head><body><div class="wrap">
-<div class="row" style="justify-content:space-between"><h1>{name} 节点订阅</h1><button class="ghost" onclick="tg()">🌓 主题</button></div>
-<p class="muted">导入下面任一订阅；手机可直接扫码。整段订阅含全部节点；下方“单节点”可逐条导入。</p>
-<div class="card"><b>Clash / Mihomo 订阅</b>
-<div class="row"><code>{clash}</code><button onclick="cpx(this)">复制</button></div>
-<div class="row"><a class="btn" href="{clash_deep}">⚡ 一键导入 Clash / Mihomo</a></div>
+<div class="hd"><h1>{name}</h1><button class="tg" onclick="tg()">{I_MOON} 主题</button></div>
+<p class="sub">扫码或一键导入即可使用 · 整段订阅含全部节点,下方可逐条导入</p>
+<div class="card main">
+<div class="ttl"><span>Clash / Mihomo 订阅</span><span class="tag">主用</span></div>
+<div class="urlrow"><code>{clash}</code><button class="cp" onclick="cpx(this)">复制</button></div>
+<a class="imp" href="{clash_deep}">{I_BOLT} 一键导入 Clash / Mihomo</a>
 {qr(os.environ.get("QR_CLASH",""))}</div>
-<div class="card"><b>通用订阅（v2rayN / Shadowrocket / NekoBox）</b>
-<div class="row"><code>{b64}</code><button onclick="cpx(this)">复制</button></div>
-<div class="row"><a class="btn" href="{sr_deep}">⚡ 一键导入 Shadowrocket</a></div>
+<div class="card">
+<div class="ttl"><span>通用订阅 · v2rayN / Shadowrocket / NekoBox</span></div>
+<div class="urlrow"><code>{b64}</code><button class="cp" onclick="cpx(this)">复制</button></div>
+<a class="imp" href="{sr_deep}">{I_BOLT} 一键导入 Shadowrocket</a>
 {qr(os.environ.get("QR_B64",""))}</div>
-<div class="card"><b>流量 / 到期</b>
-<div class="row"><span>限额 <b>{limit_gb} GB</b></span><span class="muted">·</span><span>到期 <b>{exp_disp}</b></span><span class="muted">·</span><span>已用 <b id="used">查询中…</b></span></div>
-<p class="muted">已用为实时拉取订阅响应头（每 5 分钟由服务器刷新）。</p></div>
-<div class="card"><b>延迟自测</b>
-<div class="row"><button onclick="lat()">测一下</button><span id="lat" class="muted">到本机 HTTP 往返(参考，浏览器测不了各协议实测)</span></div></div>
-<h3 style="margin:18px 0 0">单节点（逐条导入 / 扫码）</h3>
+<div class="card">
+<div class="ttl"><span>流量 / 到期</span></div>
+<div class="trow"><span>限额 <b>{limit_gb} GB</b></span><span>到期 <b>{exp_disp}</b></span><span>已用 <b id="used">查询中…</b></span></div>
+<div class="row2" style="margin-top:13px"><button class="lat" onclick="lat()">延迟自测</button><span id="lat" class="muted">到本机 HTTP 往返(参考)</span></div></div>
+<div class="sec">单节点（逐条导入 / 扫码）</div>
 {nodes_html}
-<div class="card warn">⚠️ 此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</div>
-<p class="muted">管理（改限额 / 更新 / 加节点）请用 SSH：<code>bash install.sh menu</code></p>
+<div class="warn">{I_WARN}<span>此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</span></div>
+<p class="foot">管理（改限额 / 更新 / 加节点）请用 SSH：<span class="kbd">bash install.sh menu</span></p>
 </div><script>
-function cpx(b){{navigator.clipboard.writeText(b.parentElement.querySelector('code').textContent)}}
+function cpx(b){{navigator.clipboard.writeText(b.parentElement.querySelector('code').textContent);var o=b.textContent;b.textContent='已复制';setTimeout(function(){{b.textContent=o}},1200)}}
 function tg(){{document.body.classList.toggle('light');try{{localStorage.setItem('sbtheme',document.body.classList.contains('light')?'light':'dark')}}catch(e){{}}}}
 try{{if(localStorage.getItem('sbtheme')==='light')document.body.classList.add('light')}}catch(e){{}}
 function lat(){{var o=document.getElementById('lat');o.textContent='测试中…';var t=[],n=5,i=0;
