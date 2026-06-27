@@ -239,6 +239,11 @@ if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/nu
   SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map2.conf"; WWW="'"$PP"'/www"
   config_nginx(){ return 0; }; nginx(){ return 0; }
   do_panel_pass "bad pass!"' >/dev/null 2>&1; then echo "FAIL  panel-pass 应拒绝非法字符密码"; fail=1; else echo "PASS  panel-pass 拒绝非法字符密码"; fi
+# 大写密码应被拒(nginx map 大小写不敏感, 限小写免白丢熵)
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map3.conf"; WWW="'"$PP"'/www"
+  config_nginx(){ return 0; }; nginx(){ return 0; }
+  do_panel_pass ABCdef123' >/dev/null 2>&1; then echo "FAIL  panel-pass 应拒绝大写密码"; fail=1; else echo "PASS  panel-pass 拒绝大写密码(nginx 大小写不敏感)"; fi
 # panel-pass off: 删 map + 登录页
 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
   SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map.conf"; WWW="'"$PP"'/www"

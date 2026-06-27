@@ -827,6 +827,8 @@ body.light .warn{{background:#fff5f5;border-color:#ffd0d0;color:#b42318}}
 <p class="foot">管理（改限额 / 更新 / 加节点）请用 SSH：<span class="kbd">bash install.sh menu</span></p>
 </div><script>
 {logout_js}
+try{{sessionStorage.removeItem('sbt')}}catch(e){{}}   // 到了看板=登录成功, 清掉标记, 免得退出后回登录页误报"密码错误"
+window.addEventListener('pageshow',function(e){{if(e.persisted)document.body.style.opacity=''}});  // bfcache 返回时恢复(退出时淡出过, 别卡在透明)
 function cpx(b){{navigator.clipboard.writeText(b.parentElement.querySelector('code').textContent);var o=b.textContent;b.textContent='已复制';setTimeout(function(){{b.textContent=o}},1200)}}
 function tg(){{document.body.classList.toggle('light');try{{localStorage.setItem('sbtheme',document.body.classList.contains('light')?'light':'dark')}}catch(e){{}}}}
 try{{if(localStorage.getItem('sbtheme')==='light')document.body.classList.add('light')}}catch(e){{}}
@@ -861,6 +863,7 @@ body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:
 body.leaving{{animation:none;opacity:0;transition:opacity .22s ease}}
 @keyframes fadein{{from{{opacity:0}}to{{opacity:1}}}}
 @keyframes rise{{from{{opacity:0;transform:translateY(14px)}}to{{opacity:1;transform:none}}}}
+@media (prefers-reduced-motion:reduce){{body,.box{{animation:none}}body.leaving{{transition:none}}}}
 .box{{width:340px;max-width:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:28px 24px;text-align:center;box-shadow:0 24px 60px -24px rgba(0,0,0,.6),0 0 0 1px rgba(129,140,248,.08);animation:rise .55s cubic-bezier(.2,.75,.2,1) both}}
 .lk{{width:54px;height:54px;margin:0 auto 14px;border-radius:16px;display:flex;align-items:center;justify-content:center;background:var(--g);color:#fff;box-shadow:0 12px 28px -10px rgba(129,140,248,.8)}}
 h1{{font-size:1.25rem;font-weight:600;margin:0;letter-spacing:-.01em}}
@@ -883,6 +886,7 @@ button:hover{{transform:translateY(-1px);filter:brightness(1.06)}}button:active{
 </div>
 <script>
 var P={panel};
+window.addEventListener('pageshow',function(e){{if(e.persisted)document.body.classList.remove('leaving')}});  // bfcache 返回时清除淡出态, 别卡在透明
 function go(){{var v=document.getElementById('pw').value;if(!v)return;try{{sessionStorage.setItem('sbt','1')}}catch(e){{}}document.cookie='sbauth='+v+'; path=/; max-age=604800; samesite=lax';document.body.classList.add('leaving');setTimeout(function(){{location.replace(P)}},200);}}
 document.getElementById('go').onclick=go;
 document.getElementById('pw').addEventListener('keydown',function(e){{if(e.key==='Enter')go();}});
@@ -1131,6 +1135,8 @@ write_subscription() {
   if [ -n "${PANEL_PATH:-}" ]; then     # 可视化看板页(订阅+二维码+节点)
     render_panel_html >"$WWW$PANEL_PATH"
     chmod 644 "$WWW$PANEL_PATH"
+    # 开了登录就同步刷新登录页(重装/换 CF 后保持在位且最新; 失败不致命)
+    [ -s "$PANEL_MAP" ] && { render_panel_login_html >"$WWW${PANEL_PATH%.html}-login.html" 2>/dev/null && chmod 644 "$WWW${PANEL_PATH%.html}-login.html" || true; }
   fi
 }
 
@@ -1600,7 +1606,9 @@ do_panel_pass() {
   local pass="${1:-}"
   [ -n "$pass" ] || die "用法: bash install.sh panel-pass <密码>   (关闭: panel-pass off)"
   # 密码会进 cookie 和 nginx map, 限安全字符集(免转义/免 cookie 截断); 长度 >=6
-  case "$pass" in *[!A-Za-z0-9._~-]*) die "密码只能含 字母/数字/. _ ~ -(免转义), 例: openssl rand -hex 12";; esac
+  # nginx map 字符串匹配大小写不敏感(官方: strings are matched ignoring the case), 故限小写,
+  # 免得大写密码被误以为区分大小写、实际白丢这部分熵。免转义/免 cookie 截断字符集。
+  case "$pass" in *[!a-z0-9._~-]*) die "密码只能含 小写字母/数字/. _ ~ -(nginx 匹配不分大小写, 故限小写; 例: openssl rand -hex 12)";; esac
   [ "${#pass}" -ge 6 ] || die "密码至少 6 位(建议 openssl rand -hex 12)"
   # nginx map 片段: 校验 cookie sbauth 是否等于密码。600 root —— 由 nginx master(root)加载, 密码从不下发浏览器。
   ( umask 077; cat >"$PANEL_MAP" <<EOF
