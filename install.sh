@@ -52,6 +52,15 @@ note() { NOTES+=("$*"); }
 PY="${PYTHON:-python3}"
 
 # ----------------------------------------------------------------- 配置(env 可覆盖)
+# 先记录"用户本次是否显式传入"这些运行参数, 再套默认值。
+# 用途: 重装(二次运行 install)时, 已存在的 $ENVFILE 里的值应作为默认被沿用,
+# 但本次命令行显式传的 env 仍要赢 —— 见 do_install 里的 merge_env_defaults。
+for _v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
+          HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS; do
+  eval "_CLI_$_v=\"\${$_v:-}\""
+done
+unset _v
+
 LIMIT_GB="${LIMIT_GB:-200}"
 COUNT_MODE="${COUNT_MODE:-tx}"
 DOMAIN="${DOMAIN:-}"
@@ -222,13 +231,15 @@ detect_net() {
   if [ -z "$PUBLIC_IP" ]; then
     PUBLIC_IP="$(curl -fsSL4 --max-time 8 https://api.ipify.org   2>/dev/null || true)"
     [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(curl -fsSL4 --max-time 8 https://ifconfig.me 2>/dev/null || true)"
-    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    # || true 必须留着: 纯 IPv6 机器上 ip -4 route get 会失败, pipefail 会把非零传出来,
+    # set -e 就在这里静默退出, 走不到下面那句友好的 die 提示。
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   fi
   if [ -z "$PUBLIC_IP" ]; then
     # SOFT_DETECT=1(info 用)时探测失败不致命, 用占位符; 安装时仍直接报错
     [ "${SOFT_DETECT:-0}" = 1 ] && PUBLIC_IP="<未探测到IP>" || die "无法探测公网 IP, 请用 PUBLIC_IP=x.x.x.x 重新运行"
   fi
-  INTERFACE="${INTERFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
+  INTERFACE="${INTERFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)}"
   # 纯 IPv6 机器 IPv4 探测会失败, 再用 IPv6 兜底; 否则网卡被误写成 eth0 会让 vnstat 取不到数据、限流首次报错
   [ -z "$INTERFACE" ] && INTERFACE="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   INTERFACE="${INTERFACE:-eth0}"
@@ -331,6 +342,24 @@ check_reality_sni() {
   else
     note "Reality SNI $host 不支持 TLS1.3 ✗(偷证书目标的硬性要求, 握手会有问题): 换成确定支持 TLS1.3 的大站, 如 www.bing.com / www.cloudflare.com / www.apple.com。"
   fi
+}
+
+# 重装保参数: 已有 $ENVFILE 时, 把文件里的运行参数当默认值沿用;
+# 本次显式传入的 env(_CLI_* 非空)优先级更高, 仍然覆盖文件值。
+# 不这样做的话, 二次运行 install 会把 LIMIT_GB 打回 200、EXPIRE_AT 顺延成"安装日+365天"、
+# HY2 带宽护栏(up/down_mbps)被清空 —— 静默丢掉用户 set 过的配置。
+merge_env_defaults() {
+  [ -f "$ENVFILE" ] || return 0
+  local v cli
+  # shellcheck disable=SC1090
+  . "$ENVFILE" 2>/dev/null || true       # 文件值先进来当默认
+  for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
+           HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS; do
+    eval "cli=\"\${_CLI_$v:-}\""
+    [ -n "$cli" ] && eval "$v=\"\$cli\""  # 本次显式传的赢回来
+  done
+  log "检测到已有运行参数, 沿用(LIMIT_GB=$LIMIT_GB, EXPIRE_AT=${EXPIRE_AT:-未设})"
+  return 0
 }
 
 write_env() {
@@ -2355,6 +2384,7 @@ do_install() {
   [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true   # 已接入过 WARP 则重装/更新时保留分流
   gen_cert
   config_sysctl   # 在 sing-box 启动前应用, 这样 HY2/QUIC 一启动就拿到大 UDP 缓冲
+  merge_env_defaults   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT/HY2 护栏等, 显式传入的仍优先
   write_env
   write_singbox_config
   write_subscription

@@ -389,6 +389,43 @@ adm 'X-Token'     'token 鉴权头'
 adm '127.0.0.1'   '仅本机访问说明'
 
 echo
+echo
+echo "=== 4j) 重装保参数 merge_env_defaults + detect_net set -e 陷阱 ==="
+# 重装(二次运行 install)必须沿用已有 ENVFILE 的运行参数, 否则会静默把 LIMIT_GB 打回 200、
+# EXPIRE_AT 顺延成"安装日+365天"、HY2 带宽护栏被清空。
+MENV="$TMP/mergeenv.env"
+cat >"$MENV" <<'ENVEOF'
+LIMIT_GB=500
+EXPIRE_AT="2026-08-03 10:22:10 +0800"
+COUNT_MODE=max
+HY2_UP_MBPS=80
+HY2_DOWN_MBPS=160
+ENVEOF
+# a) 无显式 env: 文件值应被完整沿用
+#    注意 unset: 本测试脚本顶部 export 了 LIMIT_GB=200, 不清掉就会被正确地当成"用户显式传入"而优先
+out=$(unset LIMIT_GB COUNT_MODE EXPIRE_AT HY2_UP_MBPS HY2_DOWN_MBPS; PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$MENV"'"; merge_env_defaults >/dev/null 2>&1; echo "$LIMIT_GB|$COUNT_MODE|$HY2_UP_MBPS|$HY2_DOWN_MBPS|$EXPIRE_AT"' 2>/dev/null)
+if [ "$out" = '500|max|80|160|2026-08-03 10:22:10 +0800' ]; then
+  echo "PASS  重装沿用已有运行参数(LIMIT_GB/COUNT_MODE/HY2护栏/EXPIRE_AT)"
+else echo "FAIL  merge_env_defaults 未沿用文件值: got '$out'"; fail=1; fi
+# b) 显式传入的 env 必须仍然优先于文件值
+out=$(LIMIT_GB=999 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$MENV"'"; merge_env_defaults >/dev/null 2>&1; echo "$LIMIT_GB|$COUNT_MODE"' 2>/dev/null)
+if [ "$out" = '999|max' ]; then
+  echo "PASS  显式传入 env 优先于文件值(LIMIT_GB=999 覆盖, 其余仍沿用)"
+else echo "FAIL  显式 env 未优先: got '$out'"; fail=1; fi
+# c) detect_net 在纯 IPv6(ip -4 route get 失败)时不能被 set -e 静默打断, 要走到 die 提示
+#    unset PUBLIC_IP: 顶部 export 了 1.2.3.4, 不清掉 detect_net 会短路、测不到这条路径
+out=$(unset PUBLIC_IP INTERFACE; PYTHON="$PYTHON_BIN" bash -c '
+  source ./install.sh >/dev/null 2>&1
+  set -euo pipefail
+  curl(){ return 1; }; ip(){ return 2; }          # 模拟纯 IPv6: curl -4 与 ip -4 route 全失败
+  die(){ echo "REACHED_DIE"; exit 9; }
+  detect_net' 2>&1)
+case "$out" in
+  *REACHED_DIE*) echo "PASS  detect_net 探测失败时走到 die 提示(未被 set -e 静默退出)" ;;
+  *) echo "FAIL  detect_net 疑似被 set -e 静默打断(应出现 REACHED_DIE): '$out'"; fail=1 ;;
+esac
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then
