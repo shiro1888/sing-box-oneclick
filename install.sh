@@ -97,6 +97,11 @@ PANEL_MAP=/etc/nginx/.singbox_panel_map.conf   # 看板页登录: nginx map 片�
 TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
 SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
+# SSH 加固(harden)相关路径 —— 提成变量只为可测试(测试里指到临时目录);
+# 生产默认值与原来的写死路径完全一致, 不要在真机上覆盖它们。
+AKEYS="${AKEYS:-/root/.ssh/authorized_keys}"
+SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+SSHD_DROPIN_DIR="${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
 CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
 WARP_ENV="$SB_DIR/warp.env"   # WARP 解锁状态(存在=已接入; 由 warp 子命令写入)
 # 管理面板(admin 子命令; 仅监听 127.0.0.1, 经 SSH 隧道访问, Token 鉴权)
@@ -1788,7 +1793,7 @@ do_restore() {
 do_harden() {
   command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
   detect_os   # 设 PKG, 装 fail2ban 用
-  local akeys=/root/.ssh/authorized_keys
+  local akeys="$AKEYS"
   if ! { [ -s "$akeys" ] && grep -qE '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-)' "$akeys"; }; then
     err "未在 $akeys 找到有效 SSH 公钥! 为防止把你锁在门外, 拒绝禁用密码登录。"
     echo "  先在你本地电脑: ssh-copy-id root@<本机IP>  (或手动把公钥粘进 $akeys),"
@@ -1801,8 +1806,8 @@ do_harden() {
     dnf|yum) "$PKG" install -y epel-release >/dev/null 2>&1 || true; "$PKG" install -y fail2ban >/dev/null 2>&1 || warn "fail2ban 装失败, 跳过" ;;
   esac
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
-  mkdir -p /etc/ssh/sshd_config.d
-  local dropin=/etc/ssh/sshd_config.d/00-singbox-harden.conf
+  mkdir -p "$SSHD_DROPIN_DIR"
+  local dropin="$SSHD_DROPIN_DIR/00-singbox-harden.conf"
   cat >"$dropin" <<'EOF'
 # sing-box-oneclick SSH 加固(文件名 00- 排最前, 覆盖 50-cloud-init 的 PasswordAuthentication yes)
 PubkeyAuthentication yes
@@ -1811,15 +1816,15 @@ KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 EOF
   local bak=""
-  if ! grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+  if ! grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSHD_CONFIG"; then
     warn "sshd_config 无 Include sshd_config.d/, drop-in 可能不生效; 直接改主文件兜底..."
-    local kv key; bak="/etc/ssh/sshd_config.singbox-bak.$(date +%s)"; cp -a /etc/ssh/sshd_config "$bak"
+    local kv key; bak="$SSHD_CONFIG.singbox-bak.$(date +%s)"; cp -a "$SSHD_CONFIG" "$bak"
     for kv in "PasswordAuthentication no" "PubkeyAuthentication yes" "KbdInteractiveAuthentication no"; do
       key="${kv%% *}"
-      if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}\b" /etc/ssh/sshd_config; then
-        sed -i "s|^[[:space:]]*#\?[[:space:]]*${key}\b.*|${kv}|I" /etc/ssh/sshd_config
+      if grep -qiE "^[[:space:]]*#?[[:space:]]*${key}\b" "$SSHD_CONFIG"; then
+        sed -i "s|^[[:space:]]*#\?[[:space:]]*${key}\b.*|${kv}|I" "$SSHD_CONFIG"
       else
-        printf '%s\n' "$kv" >> /etc/ssh/sshd_config
+        printf '%s\n' "$kv" >> "$SSHD_CONFIG"
       fi
     done
     ok "已备份原 sshd_config 到 $bak"
@@ -1830,7 +1835,7 @@ EOF
     warn "⚠️ 现在请【另开一个新终端】用密钥登录确认能进, 再关掉当前会话! 进不去就: rm $dropin && systemctl reload sshd 回滚。"
   else
     rm -f "$dropin"
-    [ -n "$bak" ] && cp -a "$bak" /etc/ssh/sshd_config   # 兜底分支改过主文件, 校验不过要一并还原
+    [ -n "$bak" ] && cp -a "$bak" "$SSHD_CONFIG"   # 兜底分支改过主文件, 校验不过要一并还原
     die "sshd 配置校验(sshd -t)未过, 已回滚(drop-in + 主文件), 未改动 SSH"
   fi
 }

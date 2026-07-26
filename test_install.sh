@@ -426,6 +426,72 @@ case "$out" in
 esac
 
 echo
+echo "=== 4k) SSH 加固 do_harden(防锁死护栏 + 回滚) ==="
+# do_harden 是全脚本唯一能把用户锁在 SSH 门外的函数, 这里覆盖它的 4 条安全性质。
+# 路径全部指到临时目录(AKEYS/SSHD_CONFIG/SSHD_DROPIN_DIR), 不碰本机真实 SSH 配置。
+HD="$TMP/harden"
+# 公共 stub: 让 do_harden 在无 systemd/无 sshd 的 Windows 上也能跑到关键分支
+HSTUB='detect_os(){ PKG=apt; }; systemctl(){ return 0; }; apt-get(){ return 0; }; export DEBIAN_FRONTEND=""'
+# $1=场景名 $2=authorized_keys 内容 $3=sshd_config 内容 $4=sshd -t 结果(0/1)
+harden_run() {
+  rm -rf "$HD"; mkdir -p "$HD/dropin"
+  printf '%s' "$2" > "$HD/authorized_keys"
+  printf '%s' "$3" > "$HD/sshd_config"
+  PYTHON="$PYTHON_BIN" bash -c '
+    set +euo pipefail
+    source ./install.sh >/dev/null 2>&1
+    '"$HSTUB"'
+    sshd(){ return '"$4"'; }
+    AKEYS="'"$HD"'/authorized_keys"
+    SSHD_CONFIG="'"$HD"'/sshd_config"
+    SSHD_DROPIN_DIR="'"$HD"'/dropin"
+    do_harden >/dev/null 2>&1
+    echo "rc=$?"' 2>/dev/null
+}
+VALIDKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test@host
+'
+INCLUDE_CFG='Include /etc/ssh/sshd_config.d/*.conf
+PasswordAuthentication yes
+'
+DROPIN="$HD/dropin/00-singbox-harden.conf"
+
+# (1) 最关键: 没有有效公钥时必须拒绝, 且不能留下任何 drop-in(否则重启 sshd 就锁死)
+rc=$(harden_run "nokey" "# just a comment, no key
+" "$INCLUDE_CFG" 0)
+if [ "$rc" != "rc=0" ] && [ ! -f "$DROPIN" ]; then
+  echo "PASS  do_harden 无有效公钥时拒绝加固且不写 drop-in(防锁死)"
+else echo "FAIL  do_harden 无公钥时未拒绝或已写 drop-in ($rc, dropin存在=$([ -f "$DROPIN" ] && echo yes || echo no))"; fail=1; fi
+
+# (2) 空 authorized_keys 同样要拒绝
+rc=$(harden_run "empty" "" "$INCLUDE_CFG" 0)
+if [ "$rc" != "rc=0" ] && [ ! -f "$DROPIN" ]; then
+  echo "PASS  do_harden 空 authorized_keys 时拒绝加固"
+else echo "FAIL  do_harden 空公钥文件未拒绝 ($rc)"; fail=1; fi
+
+# (3) 有公钥 + sshd -t 通过: 应写入 4 条关键指令
+rc=$(harden_run "ok" "$VALIDKEY" "$INCLUDE_CFG" 0)
+if [ -f "$DROPIN" ] \
+   && grep -q '^PasswordAuthentication no' "$DROPIN" \
+   && grep -q '^PubkeyAuthentication yes' "$DROPIN" \
+   && grep -q '^KbdInteractiveAuthentication no' "$DROPIN" \
+   && grep -q '^PermitRootLogin prohibit-password' "$DROPIN"; then
+  echo "PASS  do_harden 有公钥时写入 drop-in 且四条指令齐全"
+else echo "FAIL  do_harden drop-in 内容不正确 ($rc)"; [ -f "$DROPIN" ] && cat "$DROPIN"; fail=1; fi
+
+# (4) sshd -t 校验不过: 必须回滚删掉 drop-in 并非零退出(否则 reload 后锁死)
+rc=$(harden_run "badcfg" "$VALIDKEY" "$INCLUDE_CFG" 1)
+if [ "$rc" != "rc=0" ] && [ ! -f "$DROPIN" ]; then
+  echo "PASS  do_harden sshd -t 不过时回滚 drop-in 并报错退出"
+else echo "FAIL  do_harden 校验失败未回滚 ($rc, dropin存在=$([ -f "$DROPIN" ] && echo yes || echo no))"; fail=1; fi
+
+# (5) 主文件无 Include 时走兜底: 改主文件并留备份; 校验不过要把主文件还原回去
+rc=$(harden_run "noinclude" "$VALIDKEY" "PasswordAuthentication yes
+" 1)
+if [ "$rc" != "rc=0" ] && ! grep -q '^PasswordAuthentication no' "$HD/sshd_config" 2>/dev/null; then
+  echo "PASS  do_harden 无 Include 兜底改主文件, 校验失败后还原主文件"
+else echo "FAIL  do_harden 兜底分支未还原主文件 ($rc)"; sed -n '1,5p' "$HD/sshd_config" 2>/dev/null; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then
