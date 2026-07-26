@@ -61,7 +61,7 @@ proxy 的瓶颈是带宽，不是 CPU/内存，所以对机器要求很低。
 - **systemd**：脚本开头检查 `systemctl`，没有直接报错退出 → **Alpine/OpenRC 不支持**。
 - **root** 权限。
 - **架构**：`x86_64`（amd64）或 `aarch64`（arm64）。
-- **公网 IPv4**（直连节点需要）；纯 IPv6 机子要手动传 `PUBLIC_IP=` 且有坑。
+- **公网 IP**：IPv4 最省事。纯 IPv6 机现已支持（自动识别并开 `ipv6: true`、用 `IP-CIDR6/128` 分流、分享链接自动加方括号），但**客户端网络必须有 IPv6** 才连得上；给 IPv4-only 客户端用需再加 `install.sh cf`（CF-Vless 走 Cloudflare 边缘，IPv4 客户端也能进）。建议配好 AAAA 后用 `NODE_ADDR=你的域名`。
 - 能联网（下载 sing-box、geo 数据）。
 
 **系统**
@@ -113,7 +113,8 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 | `EXPIRE_AT` | 空(订阅不显示到期) | 到期时间，**必须**是 `YYYY-MM-DD HH:MM:SS +0800` 格式（四位时区偏移，不能写 `+08:00` 或省略）。格式不对脚本会在开头直接报错退出，不会装到一半才崩。 |
 | `DOMAIN` | 空（用 IP） | 订阅域名（仅支持单个）；填了需自己把 DNS A 记录指向本机 IP。脚本只处理一个订阅域名，需要备用域名请手动改 nginx 的 `server_name` 与订阅 `rules`。 |
 | `AIRPORT_NAME` | `US-01` | 客户端里的订阅显示名 |
-| `PUBLIC_IP` | 自动探测 | 探测失败时手动指定 |
+| `PUBLIC_IP` | 自动探测 | 探测失败时手动指定。探测顺序: curl v4 → ip -4 路由 → curl v6 → ip -6 路由, 纯 IPv6 机也能自动识别 |
+| `NODE_ADDR` | 同 `PUBLIC_IP` | 节点 `server:` 用的连接地址。**纯 IPv6 机建议填已配 AAAA 的域名**(不少客户端对 IPv6 字面量支持不好)；填了不影响订阅 URL |
 | `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` / `SS_PORT` | `4433`/`4434`/`443`/`4435` | 各协议端口（SS2022 同时用 TCP+UDP） |
 | `SS_METHOD` | `2022-blake3-aes-128-gcm` | SS2022 加密方法（可改 `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`，密钥长度脚本自动适配） |
 | `REALITY_SNI` | `www.bing.com` | Reality 伪装域名（服务端 handshake + 客户端 servername，必须一致） |

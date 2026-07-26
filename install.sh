@@ -133,6 +133,7 @@ CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="
 # 1=公网隧道已验证 101, 才允许把 CF-Vless 写进订阅。
 # 旧版 cf.env 没有这个字段, 默认按 1 处理以保持向后兼容。
 CF_VERIFIED="${CF_VERIFIED:-1}"
+IS_IPV6="${IS_IPV6:-0}"; NODE_ADDR="${NODE_ADDR:-}"   # detect_net 里按探测结果赋值
 # WARP 解锁分流(warp.env 提供; WARP_PRIVATE_KEY 非空=启用)
 WARP_DEFAULT_SITES="openai,anthropic,google-gemini,netflix,disney"
 WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"; WARP_ADDR_V4="${WARP_ADDR_V4:-}"; WARP_ADDR_V6="${WARP_ADDR_V6:-}"; WARP_RESERVED="${WARP_RESERVED:-}"
@@ -250,6 +251,9 @@ detect_net() {
     # || true 必须留着: 纯 IPv6 机器上 ip -4 route get 会失败, pipefail 会把非零传出来,
     # set -e 就在这里静默退出, 走不到下面那句友好的 die 提示。
     [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    # 纯 IPv6 机器上面三步都会空手而归, 再试 IPv6; 否则脚本只能靠用户手传 PUBLIC_IP
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(curl -fsSL6 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
+    [ -z "$PUBLIC_IP" ] && PUBLIC_IP="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   fi
   if [ -z "$PUBLIC_IP" ]; then
     # SOFT_DETECT=1(info 用)时探测失败不致命, 用占位符; 安装时仍直接报错
@@ -260,6 +264,15 @@ detect_net() {
   [ -z "$INTERFACE" ] && INTERFACE="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   INTERFACE="${INTERFACE:-eth0}"
   SUB_HOST="${DOMAIN:-$PUBLIC_IP}"
+  # 纯 IPv6 机: 客户端要走 AAAA/IPv6, 订阅必须 ipv6: true, 分流规则要用 IP-CIDR6/128,
+  # 分享链接里的地址还得加方括号。这里统一判定一次, 供各渲染函数取用。
+  case "$PUBLIC_IP" in *:*) IS_IPV6=1 ;; *) IS_IPV6=0 ;; esac
+  # 节点连接地址: 默认用探测到的 IP; 纯 IPv6 机建议传 NODE_ADDR=你的域名(已配 AAAA),
+  # 因为不少客户端对 IPv6 字面量支持不好, 用域名更稳。
+  NODE_ADDR="${NODE_ADDR:-$PUBLIC_IP}"
+  if [ "$IS_IPV6" = 1 ] && [ "$NODE_ADDR" = "$PUBLIC_IP" ]; then
+    note "检测到纯 IPv6 出口($PUBLIC_IP): 订阅已开 ipv6。IPv4-only 的客户端连不到本机, 建议 (1) 配好 AAAA 后用 NODE_ADDR=你的域名 重跑, 并 (2) 用 install.sh cf 加 CF-Vless 作为 IPv4 客户端的入口。"
+  fi
   ok "公网 IP: $PUBLIC_IP   网卡: $INTERFACE"
   [ -n "$DOMAIN" ] && note "订阅域名 $DOMAIN: 请确认已把它的 DNS A 记录解析到 $PUBLIC_IP(本脚本无法替你改 DNS)。"
   return 0
@@ -592,9 +605,11 @@ render_subscription_yaml() {
   CF_VERIFIED="$CF_VERIFIED" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   ENABLE_HY2="$ENABLE_HY2" SS_UDP="$SS_UDP" \
+  IS_IPV6="$IS_IPV6" NODE_ADDR="$NODE_ADDR" \
   "$PY" - <<'PY'
 import os
-ip  = os.environ["PUBLIC_IP"]
+ip  = os.environ.get("NODE_ADDR") or os.environ["PUBLIC_IP"]   # 节点连接地址(纯 IPv6 机可传域名)
+v6  = os.environ.get("IS_IPV6", "0") == "1"
 dom = os.environ.get("DOMAIN", "")
 anytls = os.environ["ANYTLS_OK"] == "1"
 hy2_on = os.environ.get("ENABLE_HY2", "1") == "1"
@@ -679,7 +694,14 @@ grp = "\n".join(f'      - "{n}"' for n in names)
 rules = []
 if dom:
     rules.append(f"  - DOMAIN,{dom},DIRECT")
-rules.append(f"  - IP-CIDR,{ip}/32,DIRECT,no-resolve")
+# 本机地址直连: IPv6 要用 IP-CIDR6//128, 写成 /32 不生效。
+# ip 可能是域名(NODE_ADDR), 那种情况没有可写的 CIDR, 靠上面的 DOMAIN 规则兜。
+_pub = os.environ.get("PUBLIC_IP", "")
+if v6:
+    if ":" in _pub:
+        rules.append(f"  - IP-CIDR6,{_pub}/128,DIRECT,no-resolve")
+elif _pub:
+    rules.append(f"  - IP-CIDR,{_pub}/32,DIRECT,no-resolve")
 rules += [
     "  - DOMAIN-SUFFIX,local,DIRECT",
     "  - DOMAIN-SUFFIX,localhost,DIRECT",
@@ -692,6 +714,15 @@ rules += [
     "  - IP-CIDR,198.18.0.0/16,DIRECT,no-resolve",
     "  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
 ]
+# 开了 ipv6 之后必须补本地 IPv6 直连: 上面那组全是 IPv4 网段,
+# 否则回环/链路本地/ULA/组播这些本地 IPv6 流量会因为没规则匹配而误走代理。
+if v6:
+    rules += [
+        "  - IP-CIDR6,::1/128,DIRECT,no-resolve",
+        "  - IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+        "  - IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+        "  - IP-CIDR6,ff00::/8,DIRECT,no-resolve",
+    ]
 # Google Play / GMS 下载链路必须放在国内直连规则前面, 避免下载 CDN 被误判 DIRECT 后卡 99%。
 rules += [
     "  - GEOSITE,google,🚀 节点选择",
@@ -718,7 +749,7 @@ doc = f'''mixed-port: 7897
 allow-lan: false
 mode: rule
 log-level: info
-ipv6: false
+ipv6: {"true" if v6 else "false"}
 tcp-concurrent: true
 
 proxies:
@@ -750,10 +781,14 @@ render_share_links() {
   CF_VERIFIED="$CF_VERIFIED" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   ENABLE_HY2="$ENABLE_HY2" \
+  IS_IPV6="$IS_IPV6" NODE_ADDR="$NODE_ADDR" \
   "$PY" - <<'PY'
 import os, urllib.parse as u
 def q(s): return u.quote(str(s), safe='')
-ip  = os.environ["PUBLIC_IP"]
+ip  = os.environ.get("NODE_ADDR") or os.environ["PUBLIC_IP"]
+# URI 里的 IPv6 字面量必须加方括号(RFC 3986), 否则 host:port 会被解析错, 所有分享链接失效
+if ":" in ip and not ip.startswith("["):
+    ip = f"[{ip}]"
 tls = os.environ["TLS_SNI"]
 out = []
 hy2q = f"insecure=1&sni={q(tls)}"

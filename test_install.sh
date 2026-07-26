@@ -629,6 +629,36 @@ if printf '%s' "$out" | grep -q 'expire=1798732799'; then
   echo "PASS  EXPIRE_AT 有值时仍正常换算时间戳"; else echo "FAIL  有值时换算异常"; fail=1; fi
 
 echo
+echo "=== 4r) 纯 IPv6 机支持(ipv6 开关/IP-CIDR6/URI 方括号) ==="
+V6ENV='PUBLIC_IP=2001:db8::1 IS_IPV6=1 NODE_ADDR=2001:db8::1'
+out=$(env $V6ENV PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_subscription_yaml' 2>/dev/null)
+if printf '%s' "$out" | grep -q '^ipv6: true'; then
+  echo "PASS  纯 IPv6 机订阅写 ipv6: true(否则 mihomo 禁用 AAAA 解析, 照抄会连不上)"
+else echo "FAIL  IPv6 机订阅仍是 ipv6: false"; fail=1; fi
+if printf '%s' "$out" | grep -q 'IP-CIDR6,2001:db8::1/128,DIRECT'; then
+  echo "PASS  本机地址用 IP-CIDR6//128(写成 /32 不生效)"; else echo "FAIL  缺 IP-CIDR6 本机直连规则"; fail=1; fi
+miss=""
+for c in '::1/128' 'fc00::/7' 'fe80::/10' 'ff00::/8'; do
+  printf '%s' "$out" | grep -q "IP-CIDR6,$c,DIRECT" || miss="$miss $c"
+done
+if [ -z "$miss" ]; then
+  echo "PASS  已补本地 IPv6 直连(回环/ULA/链路本地/组播不误走代理)"
+else echo "FAIL  缺本地 IPv6 直连规则:$miss"; fail=1; fi
+out=$(env $V6ENV PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_share_links' 2>/dev/null)
+if printf '%s' "$out" | grep -q '@\[2001:db8::1\]:4433' && ! printf '%s' "$out" | grep -q '@2001:db8::1:4433'; then
+  echo "PASS  分享链接给 IPv6 字面量加了方括号(RFC 3986)"; else echo "FAIL  IPv6 URI 未加方括号, 链接会解析错"; fail=1; fi
+# NODE_ADDR 传域名时应原样使用(纯 IPv6 机推荐做法, 避免客户端对 v6 字面量支持不佳)
+out=$(env PUBLIC_IP=2001:db8::1 IS_IPV6=1 NODE_ADDR=node6.example.com PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_subscription_yaml' 2>/dev/null)
+if printf '%s' "$out" | grep -q 'server: node6.example.com'; then
+  echo "PASS  NODE_ADDR 可用域名作节点地址"; else echo "FAIL  NODE_ADDR 域名未生效"; fail=1; fi
+# IPv4 默认不能受影响
+out=$(render 'render_subscription_yaml')
+if printf '%s' "$out" | grep -q '^ipv6: false' && printf '%s' "$out" | grep -q 'IP-CIDR,1.2.3.4/32,DIRECT' \
+   && ! printf '%s' "$out" | grep -q 'IP-CIDR6'; then
+  echo "PASS  IPv4 机行为不变(ipv6:false + IP-CIDR/32 + 无 IPv6 规则)"
+else echo "FAIL  IPv4 默认行为被改动"; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then
