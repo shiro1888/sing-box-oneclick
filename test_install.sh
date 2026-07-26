@@ -562,6 +562,40 @@ if [ "$out" = "OK" ]; then
 else echo "FAIL  SS 密钥长度逻辑有问题: $out"; fail=1; fi
 
 echo
+echo "=== 4n) doctor/status 订阅探测必须带 Host 头(否则健康机误报) ==="
+# nginx 是双 server 结构: 默认 server(server_name _)一律 404, 订阅 server 绑 server_name $SUB_HOST。
+# 不带 Host 的 curl 会命中默认 server 拿到 404, 让每台正常机器都报"订阅本机不可达"。
+if grep -q 'curl -fsS -o /dev/null -m 5 -H "Host: \$SUB_HOST" "http://127.0.0.1\$SUB_PATH"' install.sh; then
+  echo "PASS  doctor 订阅探测带 Host 头"; else echo "FAIL  doctor 订阅探测缺 Host 头(健康机会误报不可达)"; fail=1; fi
+if grep -q 'curl -s -o /dev/null -H "Host: \$SUB_HOST"' install.sh; then
+  echo "PASS  status 订阅探测带 Host 头"; else echo "FAIL  status 订阅探测缺 Host 头"; fail=1; fi
+# 确认 nginx 确实是"默认 server 404 + 订阅 server 绑 SUB_HOST"这个结构(上面结论的前提)
+if grep -q 'server_name _;' install.sh && grep -q 'server_name \$SUB_HOST;' install.sh; then
+  echo "PASS  nginx 双 server 结构成立(默认404 + 订阅绑 SUB_HOST)"; else echo "FAIL  nginx server 结构与预期不符"; fail=1; fi
+
+echo
+echo "=== 4o) ENABLE_OBFS=0 能在已装机器上真正关闭 HY2 混淆 ==="
+OBT="$TMP/obfs"; rm -rf "$OBT"; mkdir -p "$OBT"
+printf 'SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="\nOBFS_PASSWORD="oldobfs123"\nSUB_B64_PATH=/b.txt\nPANEL_PATH=/p.html\nSUB_PATH=/s.yaml\n' > "$OBT/secrets.env"
+out=$(ENABLE_OBFS=0 PYTHON="$PYTHON_BIN" bash -c '
+  set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="'"$OBT"'"; SECRETS="'"$OBT"'/secrets.env"
+  gen_secrets >/dev/null 2>&1
+  echo "OBFS=[$OBFS_PASSWORD]"' 2>/dev/null)
+if [ "$out" = "OBFS=[]" ] && ! grep -q '^OBFS_PASSWORD=' "$OBT/secrets.env"; then
+  echo "PASS  ENABLE_OBFS=0 清空 OBFS_PASSWORD 并从 secrets 删除(混淆真的关掉)"
+else echo "FAIL  ENABLE_OBFS=0 未能关闭混淆: $out"; fail=1; fi
+# 默认(ENABLE_OBFS=1)不能误删已有 obfs 密码
+printf 'SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="\nOBFS_PASSWORD="keepme123"\nSUB_B64_PATH=/b.txt\nPANEL_PATH=/p.html\nSUB_PATH=/s.yaml\n' > "$OBT/secrets.env"
+out=$(PYTHON="$PYTHON_BIN" bash -c '
+  set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="'"$OBT"'"; SECRETS="'"$OBT"'/secrets.env"
+  gen_secrets >/dev/null 2>&1
+  echo "OBFS=[$OBFS_PASSWORD]"' 2>/dev/null)
+if [ "$out" = "OBFS=[keepme123]" ]; then
+  echo "PASS  默认不误删已有 OBFS_PASSWORD"; else echo "FAIL  默认误改了 obfs 密码: $out"; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then

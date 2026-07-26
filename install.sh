@@ -286,7 +286,16 @@ gen_secrets() {
       SS_PASSWORD="$(gen_ss_password)"
       printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
       log "已为升级补充 SS2022 密钥"
-    elif [ "$(ss_key_bytes "$SS_PASSWORD")" != "$(ss_need_bytes)" ]; then
+    fi
+    # ENABLE_OBFS=0 要能在已装机器上真的关掉 obfs。渲染只看 OBFS_PASSWORD 是否为空,
+    # 而复用分支以前从不清它, 于是"装过一次就永远关不掉"(清洗敏感机想减少 UDP 特征时会踩)。
+    if [ "$ENABLE_OBFS" != 1 ] && [ -n "${OBFS_PASSWORD:-}" ]; then
+      OBFS_PASSWORD=""
+      sed -i '/^OBFS_PASSWORD=/d' "$SECRETS"
+      warn "ENABLE_OBFS=0: 已关闭 HY2 salamander 混淆(清除 OBFS_PASSWORD)"
+      note "HY2 混淆已关闭, 客户端需重新拉取订阅, 否则仍按旧的 obfs 参数连接会失败。"
+    fi
+    if [ -n "${SS_PASSWORD:-}" ] && [ "$(ss_key_bytes "$SS_PASSWORD")" != "$(ss_need_bytes)" ]; then
       # SS2022 的密钥长度和加密方法强绑定(128-gcm=16 字节, 256-gcm/chacha=32 字节)。
       # 用户改了 SS_METHOD 重跑时, 旧密钥长度对不上会让 sing-box check 直接失败,
       # 这里按新方法重新生成一条并覆盖写回, 只影响 SS2022 一条节点。
@@ -1957,7 +1966,8 @@ do_status() {
     local ap=8088; [ -f "$ADMIN_ENV" ] && ap="$(. "$ADMIN_ENV" 2>/dev/null; echo "${ADMIN_PORT:-8088}")"
     printf '  网页管理面板: %s (127.0.0.1:%s; 取访问方式: install.sh admin)\n' "$(systemctl is-active singbox-admin 2>/dev/null || echo inactive)" "$ap"
   fi
-  curl -s -o /dev/null -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
+  # 同 doctor: 不带 Host 会命中默认 server 得到 404, 让健康机看起来像订阅坏了
+  curl -s -o /dev/null -H "Host: $SUB_HOST" -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
   echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
 }
 
@@ -2014,7 +2024,11 @@ do_doctor() {
     openssl x509 -checkend $((30*86400)) -noout -in "$SB_DIR/server.crt" >/dev/null 2>&1 && P "自签证书 30 天内不过期" || W "自签证书 30 天内将过期: 重跑 install 重新生成"
   fi
   # 8) 订阅可达
-  curl -fsS -o /dev/null -m 5 "http://127.0.0.1$SUB_PATH" 2>/dev/null && P "订阅本机可达" || F "订阅本机不可达: 看 nginx -t / $WWW 权限"
+  # 必须带 Host: 订阅 server 绑的是 server_name $SUB_HOST, 不带 Host 会命中默认 server(return 404),
+  # 于是每台完全正常的机器都会被报成"订阅本机不可达", 真故障反而被这条噪声淹没。
+  curl -fsS -o /dev/null -m 5 -H "Host: $SUB_HOST" "http://127.0.0.1$SUB_PATH" 2>/dev/null \
+    && P "订阅本机可达" \
+    || F "订阅本机不可达: 看 nginx -t / $WWW 权限(若手改过 server_name, Host 不匹配也会 404)"
   if [ -n "${PUBLIC_IP:-}" ]; then
     curl -fsS -o /dev/null -m 6 "http://$PUBLIC_IP$SUB_PATH" 2>/dev/null && P "订阅经公网 IP 可达" \
       || W "订阅经公网 IP 不可达(可能是 hairpin 不支持, 不一定是真问题): 用手机流量/外部网络测 http://$SUB_HOST$SUB_PATH"
@@ -2127,7 +2141,8 @@ do_menu() {
     echo "  5) 改参数(限额/到期)     6) 更新 sing-box"
     echo "  7) 加 CF 大保底(第5节点) 8) 重启服务"
     echo "  9) 卸载                  0) 退出"
-    echo "  p) 看板页地址            k) 装 Komari 探针"
+    echo "  p) 看板页地址            s) 看板加/改登录密码"
+    echo "  k) 装 Komari 探针"
     echo "  b) 备份                  r) 恢复(迁移)"
     echo "  h) SSH 加固(密钥登录)    w) WARP 解锁分流"
     echo "  d) doctor 自检(常见坑)   a) 管理面板(localhost)"
@@ -2148,6 +2163,11 @@ do_menu() {
       8) ( do_restart ) || true ;;
       9) ( do_uninstall ) || true ;;
       p|P) ( do_panel ) || true ;;
+      # 看板页含全套节点凭证, 随机路径不是登录保护 —— 菜单里必须能直接加密码,
+      # 否则只用菜单的人永远不知道有 panel-pass 这回事, 看板就一直裸着。
+      s|S) printf '  设置看板登录密码(留空=随机生成, 输入 off=关闭登录): '; read -r pw || true
+           if [ "$pw" = off ]; then ( do_panel_pass off ) || true
+           else ( do_panel_pass "${pw:-$(openssl rand -hex 12)}" ) || true; fi ;;
       k|K) printf '  KOMARI_ENDPOINT: '; read -r ke || true; printf '  KOMARI_TOKEN: '; read -r kt || true
            if [ -n "${ke:-}" ] && [ -n "${kt:-}" ]; then ( KOMARI_ENDPOINT="$ke" KOMARI_TOKEN="$kt" do_komari ) || true; else echo "  已取消"; fi ;;
       b|B) ( do_backup ) || true ;;

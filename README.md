@@ -147,7 +147,7 @@ sudo bash install.sh panel-pass <密码>   # 给看板页加登录(自定义登�
 sudo bash install.sh links       # 打印每个节点分享链接 + 两个订阅 URL(+ 二维码)
 sudo bash install.sh status      # 状态体检: 服务/配置/端口/时间/证书/限额/订阅可达
 sudo bash install.sh doctor      # 一键自检常见坑: sysctl调优/防火墙+安全组/证书到期/外部可达/端口跳跃/内存+swap+IO压力, 带修复提示
-sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 改限额/到期/计费/网卡, 即时刷新流量头
+sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 可改 LIMIT_GB/EXPIRE_AT/COUNT_MODE/INTERFACE/HY2_UP_MBPS/HY2_DOWN_MBPS; 其余参数(端口/SNI/ENABLE_HY2 等)带环境变量重跑 install.sh 即可, 未传的会自动沿用
 sudo bash install.sh backup      # 打包密钥+配置 -> /root/sing-box-backup-时间.tar.gz
 sudo bash install.sh restore <文件>   # 新 VPS 上恢复(同一套凭证, 客户端不用换密码)
 sudo bash install.sh harden      # SSH 加固: 密钥登录+禁密码+fail2ban(必须先有授权公钥)
@@ -234,7 +234,8 @@ sudo KOMARI_ENDPOINT='https://你的komari面板' KOMARI_TOKEN='节点token' bas
 默认用 `http://<IP>/<随机路径>` 提供订阅。**两个订阅文件（Clash YAML 和通用 base64）都含全部节点凭证（密码、UUID、Reality 公钥），HTTP 是明文传输**——base64 只是编码不是加密，同样能被嗅探：随机路径只能防扫描，挡不住在途嗅探——任何能抓到这次订阅请求的人（机房、运营商、出口路由）一次就拿到全套凭证、直接接管你的节点。自用、低频拉取、信任链路时风险尚可，但只要走过不可信网络，就该上 HTTPS：
 - 你自己把域名 DNS A 记录指向本机 IP，安装时加 `DOMAIN=node.example.com`；
 - 要真正的 HTTPS（443 已被 Reality 占用），推荐把订阅路径挂到下面的 Cloudflare Tunnel 上走 HTTPS，而不是在 VPS 上另开 443。
-- 临时缓解：拉取一次后可换 `SUB_PATH`（等于换凭证），或拉完就把订阅文件删掉本地保存。
+- 临时缓解：拉完就把订阅文件删掉、只在本地保存。
+- ⚠️ **换 `SUB_PATH` 不等于换凭证**：订阅一旦被截获，里面的密码 / UUID / Reality 公钥就已经泄露，换个随机路径只能挡住"别人继续拉订阅"，旧凭证照样能直连你的节点。真怀疑被截获时要**重置节点凭证**——删掉 `/etc/sing-box/node-secrets.env` 里对应的密码/UUID 行后重跑 `bash install.sh`（会重新生成并重写订阅），然后让所有客户端重新拉取。
 
 ### 3.（可选）CF-Vless 大保底 / 「Argo 隧道」（IP 被墙时兜底）—— 第 5 节点
 网上说的 **「Argo 隧道」就是这里的 Cloudflare Tunnel**，这个**命名隧道（固定域名）就是稳定版的 Argo**。VPS 这一侧脚本能自动做，**只有 Cloudflare 后台那步需要你**（要你自己的账号 + 一个托管在 CF 的域名）。
