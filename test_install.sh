@@ -596,6 +596,39 @@ if [ "$out" = "OBFS=[keepme123]" ]; then
   echo "PASS  默认不误删已有 OBFS_PASSWORD"; else echo "FAIL  默认误改了 obfs 密码: $out"; fail=1; fi
 
 echo
+echo "=== 4p) CF-Vless 未验证不进订阅(文档铁律: 验证通过才加入) ==="
+CFV='CF_HOSTNAME=cf.example.com CF_VLESS_UUID=11111111-1111-1111-1111-111111111111 CF_WS_PATH=/w'
+out=$(env $CFV CF_VERIFIED=1 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_subscription_yaml' 2>/dev/null)
+if printf '%s' "$out" | grep -q 'CF-Vless'; then
+  echo "PASS  CF_VERIFIED=1 时 CF-Vless 进订阅"; else echo "FAIL  已验证却没进订阅"; fail=1; fi
+out=$(env $CFV CF_VERIFIED=0 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_subscription_yaml' 2>/dev/null)
+if ! printf '%s' "$out" | grep -q 'CF-Vless'; then
+  echo "PASS  CF_VERIFIED=0 时订阅不含 CF-Vless(不产生死节点)"; else echo "FAIL  未验证的 CF 节点仍进了订阅"; fail=1; fi
+out=$(env $CFV CF_VERIFIED=0 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_share_links' 2>/dev/null)
+if ! printf '%s' "$out" | grep -q 'cf.example.com'; then
+  echo "PASS  CF_VERIFIED=0 时分享链接(通用订阅)也不含 CF 节点"; else echo "FAIL  分享链接仍含未验证的 CF 节点"; fail=1; fi
+# 旧版 cf.env 无该字段时要向后兼容(视为已验证), 否则升级会让老用户的 CF 节点凭空消失
+printf 'CF_HOSTNAME=cf.example.com
+CF_PORT=28080
+CF_VLESS_UUID=11111111-1111-1111-1111-111111111111
+CF_WS_PATH=/w
+' > "$TMP/old-cf.env"
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; . "'"$TMP"'/old-cf.env"; render_subscription_yaml' 2>/dev/null)
+if printf '%s' "$out" | grep -q 'CF-Vless'; then
+  echo "PASS  旧 cf.env 无 CF_VERIFIED 时按已验证处理(向后兼容)"; else echo "FAIL  升级会让老用户 CF 节点消失"; fail=1; fi
+
+echo
+echo "=== 4q) EXPIRE_AT 不再捏造安装日+365天 ==="
+if ! grep -q "365 days" install.sh; then
+  echo "PASS  脚本中已无 +365 天的假到期日兜底"; else echo "FAIL  仍有 +365 天捏造逻辑"; fail=1; fi
+out=$(render 'render_header ""')
+if printf '%s' "$out" | grep -q 'expire=0'; then
+  echo "PASS  EXPIRE_AT 留空 -> expire=0(客户端视为无到期)"; else echo "FAIL  空 EXPIRE_AT 未回退 expire=0: $out"; fail=1; fi
+out=$(render 'render_header "2026-12-31 23:59:59 +0800"')
+if printf '%s' "$out" | grep -q 'expire=1798732799'; then
+  echo "PASS  EXPIRE_AT 有值时仍正常换算时间戳"; else echo "FAIL  有值时换算异常"; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then

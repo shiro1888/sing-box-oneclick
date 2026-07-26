@@ -5,7 +5,7 @@
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|panel-pass <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -130,6 +130,9 @@ OBFS_PASSWORD="${OBFS_PASSWORD:-}" # HY2 obfs 密码(非空=启用 obfs; gen_sec
 PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secrets 生成)
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
+# 1=公网隧道已验证 101, 才允许把 CF-Vless 写进订阅。
+# 旧版 cf.env 没有这个字段, 默认按 1 处理以保持向后兼容。
+CF_VERIFIED="${CF_VERIFIED:-1}"
 # WARP 解锁分流(warp.env 提供; WARP_PRIVATE_KEY 非空=启用)
 WARP_DEFAULT_SITES="openai,anthropic,google-gemini,netflix,disney"
 WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"; WARP_ADDR_V4="${WARP_ADDR_V4:-}"; WARP_ADDR_V6="${WARP_ADDR_V6:-}"; WARP_RESERVED="${WARP_RESERVED:-}"
@@ -170,6 +173,9 @@ validate_inputs() {
     [ -z "$v" ] || case "$v" in *[!0-9]*) die "HY2_UP/HY2_DOWN/HY2_UP_MBPS/HY2_DOWN_MBPS 要是数字(Mbps): '$v'";; esac
   done
   [ -z "$OBFS_PASSWORD" ] || case "$OBFS_PASSWORD" in *[!A-Za-z0-9]*) die "OBFS_PASSWORD 只能含字母数字: '$OBFS_PASSWORD'";; esac
+  # SS_METHOD 会裸插进 Clash YAML 的 cipher: 与 ss:// 链接; 含引号或 ": " 会让整份订阅 YAML 解析失败
+  # (四个节点全拉不到, 不只是 SS 那条)。用字符白名单而非枚举, 以免误杀传统 cipher。
+  case "$SS_METHOD" in ''|*[!A-Za-z0-9-]*) die "SS_METHOD 只能含 字母/数字/连字符: '$SS_METHOD'";; esac
 }
 
 detect_os() {
@@ -402,8 +408,11 @@ merge_env_defaults() {
 }
 
 write_env() {
-  local expire_default; expire_default="$(date -d '+365 days' '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo '2099-12-31 23:59:59 +0800')"
-  EXPIRE_VALUE="${EXPIRE_AT:-$expire_default}"   # 单一来源, config_nginx 复用, 不再二次 grep
+  # 不再捏造"安装日+365天": 那个假到期日会让客户端在一年后显示"订阅已过期"、
+  # 而限流脚本到期并不停机(节点其实还在跑), 把排查方向带偏; merge_env_defaults 还会一路沿用它。
+  # 留空 -> 流量头 expire=0, 客户端普遍视为"无到期", 比一个编出来的日期诚实。
+  EXPIRE_VALUE="${EXPIRE_AT:-}"   # 单一来源, config_nginx 复用, 不再二次 grep
+  [ -n "$EXPIRE_VALUE" ] || note "未设置 EXPIRE_AT: 订阅不显示到期(expire=0)。要显示续费日请用: bash install.sh set EXPIRE_AT='2026-12-31 23:59:59 +0800'"
   cat >"$ENVFILE" <<EOF
 # 由 install.sh 生成 —— 运行参数单一来源
 LIMIT_GB=$LIMIT_GB
@@ -580,6 +589,7 @@ render_subscription_yaml() {
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
   CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  CF_VERIFIED="$CF_VERIFIED" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   ENABLE_HY2="$ENABLE_HY2" SS_UDP="$SS_UDP" \
   "$PY" - <<'PY'
@@ -646,7 +656,7 @@ proxies.append(f'''  - name: "SS2022"
 
 cf_host = os.environ.get("CF_HOSTNAME", "")
 cf_uuid = os.environ.get("CF_VLESS_UUID", "")
-cf_on = bool(cf_host and cf_uuid)
+cf_on = bool(cf_host and cf_uuid) and (os.environ.get("CF_VERIFIED") or "1") == "1"
 if cf_on:
     proxies.append(f'''  - name: "CF-Vless"
     type: vless
@@ -737,6 +747,7 @@ render_share_links() {
   REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  CF_VERIFIED="$CF_VERIFIED" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   ENABLE_HY2="$ENABLE_HY2" \
   "$PY" - <<'PY'
@@ -764,6 +775,9 @@ out.append(f"vless://{os.environ['VLESS_UUID']}@{ip}:{os.environ['VLESS_PORT']}?
 # SS2022(SIP022): method:password(密码百分号编码), 不做 base64
 out.append(f"ss://{os.environ['SS_METHOD']}:{q(os.environ['SS_PASSWORD'])}@{ip}:{os.environ['SS_PORT']}#{q('SS2022')}")
 cfh = os.environ.get("CF_HOSTNAME",""); cfu = os.environ.get("CF_VLESS_UUID","")
+# 与订阅口径一致: 隧道未验证通过就不给分享链接, 否则通用订阅里同样会多一条死节点
+if (os.environ.get("CF_VERIFIED") or "1") != "1":
+    cfh = cfu = ""
 if cfh and cfu:
     cq = u.urlencode({'encryption':'none','security':'tls','sni':cfh,'fp':'chrome',
                       'type':'ws','host':cfh,'path':os.environ['CF_WS_PATH']})
@@ -1192,7 +1206,9 @@ render_header() {
   LIMIT_GB="$LIMIT_GB" EXPIRE_AT_VAL="$1" "$PY" - <<'PY'
 import os, datetime
 limit = int(float(os.environ["LIMIT_GB"]) * 1024 ** 3)
-exp = int(datetime.datetime.strptime(os.environ["EXPIRE_AT_VAL"], "%Y-%m-%d %H:%M:%S %z").timestamp())
+# EXPIRE_AT 留空 -> expire=0(客户端普遍视为"无到期"), 与 traffic_limit.py 口径一致
+_raw = os.environ["EXPIRE_AT_VAL"].strip()
+exp = int(datetime.datetime.strptime(_raw, "%Y-%m-%d %H:%M:%S %z").timestamp()) if _raw else 0
 print(f'add_header Subscription-Userinfo "upload=0; download=0; total={limit}; expire={exp}" always;')
 PY
 }
@@ -1293,7 +1309,8 @@ EOF
     sed -i '0,/http[[:space:]]*{/s//http {\n    server_tokens off;/' /etc/nginx/nginx.conf
   fi
 
-  local terr="/tmp/singbox-nginxt.$$"
+  # 不用 /tmp/xxx.$$: 文件名由 PID 决定可预测, root 写入会跟随他人预置的符号链接
+  local terr; terr="$(mktemp)"
   if ! nginx -t 2>"$terr"; then
     err "nginx 配置校验失败:"; cat "$terr" >&2
     if grep -qi 'duplicate default server' "$terr" 2>/dev/null; then
@@ -1732,7 +1749,8 @@ do_panel_pass() {
   [ -n "${PANEL_PATH:-}" ] || die "本安装无看板页, 先重跑 install 升级再设密码"
   command -v nginx >/dev/null 2>&1 || die "未检测到 nginx"
   # config_nginx 需要的派生变量(单独跑该函数时补齐)
-  EXPIRE_VALUE="${EXPIRE_AT:-$(date -d '+365 days' '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo '2099-12-31 23:59:59 +0800')}"
+  # 同 write_env: 不捏造到期日, 留空即 expire=0("无到期"), 也避免 panel-pass 顺手把假日期写进流量头
+  EXPIRE_VALUE="${EXPIRE_AT:-}"
   SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
   [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
@@ -1992,6 +2010,19 @@ do_doctor() {
   for s in vnstat cron; do   # 流量统计/限流依赖, 挂了降级为警告(部分系统服务名为 vnstatd/crond)
     [ "$(systemctl is-active "$s" 2>/dev/null)" = active ] && P "$s 运行中" || W "$s 未运行(流量统计/限流依赖它): systemctl status $s"
   done
+  # 光看 vnstat/cron active 不够: 网卡改名/vnstat 库重置后, traffic_limit.py 会因取不到
+  # $INTERFACE 数据而提前 exit, 流量头永远停在 download=0、配额停机静默失效, 而上面两条依然全绿。
+  if command -v vnstat >/dev/null 2>&1 && [ -n "${INTERFACE:-}" ]; then
+    if vnstat --json 2>/dev/null | grep -q "\"name\":\"$INTERFACE\""; then
+      P "vnstat 已采集网卡 $INTERFACE"
+    else
+      W "vnstat 里没有网卡 $INTERFACE 的数据: 流量统计/配额停机会静默失效。核对 'ip -br link' 后用 'install.sh set INTERFACE=真实网卡' 修正"
+    fi
+  fi
+  if [ -f "$TRAFFIC_PY" ]; then
+    if "$PY" "$TRAFFIC_PY" >/dev/null 2>&1; then P "限流脚本可正常执行(流量头已刷新)"
+    else W "限流脚本执行失败: 'journalctl -t traffic_limit -n 20' 看原因(多为 INTERFACE 不对或 vnstat 无数据)"; fi
+  fi
   # 2) 配置校验
   sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1 && P "sing-box 配置校验通过" || F "sing-box 配置无效: sing-box check -c $SB_DIR/config.json"
   nginx -t >/dev/null 2>&1 && P "nginx 配置校验通过" || F "nginx 配置无效: nginx -t"
@@ -2314,11 +2345,14 @@ EOF
     log "下载 cloudflared..."
     local cfarch
     case "$(uname -m)" in
-      x86_64|amd64)  cfarch=amd64 ;;
-      aarch64|arm64) cfarch=arm64 ;;
-      *) die "cloudflared 不支持架构 $(uname -m)" ;;
+      x86_64|amd64)   cfarch=amd64 ;;
+      aarch64|arm64)  cfarch=arm64 ;;
+      armv7l|armv7|armhf) cfarch=arm ;;   # 官方有 cloudflared-linux-arm; wgcf 分支也支持 armv7, 这里对齐
+      i386|i686)      cfarch=386 ;;
+      *) die "cloudflared 不支持架构 $(uname -m)(官方仅提供 amd64/arm64/arm/386)" ;;
     esac
-    curl -fsSL -o /usr/local/bin/cloudflared \
+    # --retry: 单次 curl 遇到网络抖动就整条 cf 流程失败, 重试几次成本极低
+    curl -fsSL --retry 3 --retry-delay 2 -o /usr/local/bin/cloudflared \
       "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cfarch" \
       || die "cloudflared 下载失败"
     chmod 755 /usr/local/bin/cloudflared
@@ -2358,29 +2392,43 @@ EOF
   rm -f "$tmpc"
   [ -n "$cfbak" ] && rm -f "$cfbak"   # 全流程成功, 旧隧道备份不再需要
   # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
-  ( umask 077; cat >"$CF_ENV" <<EOF
-CF_HOSTNAME=$CF_HOSTNAME
-CF_PORT=$CF_PORT
-CF_VLESS_UUID=$CF_VLESS_UUID
-CF_WS_PATH=$CF_WS_PATH
-EOF
-  )
-  write_subscription   # 同时刷新 Clash 订阅与通用(base64)订阅, 都带上 CF-Vless
-
-  ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
-  # ② 先验本机 28080 入站, 再验公网隧道: 一眼分清是 sing-box 坏还是 cloudflared/Tunnel 坏
-  log "验证(先本机 28080, 再公网隧道; 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
+  # ② 先验本机 28080 入站, 再验公网隧道: 一眼分清是 sing-box 坏还是 cloudflared/Tunnel 坏。
+  # 验证必须排在 write_subscription 之前: 隧道没通就把 CF-Vless 写进订阅 = 客户端多一条死节点,
+  # 万一客户端手动选中它, 表现是"所有流量都断", 正是最难自查的场景。
+  log "验证(先本机 $CF_PORT, 再公网隧道; 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
   local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
   if curl -isS -m 8 --http1.1 -H "Host: $CF_HOSTNAME" "${ws_hdr[@]}" "http://127.0.0.1:$CF_PORT$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
     ok "本机 WS 入站 127.0.0.1:$CF_PORT 正常(101) —— sing-box 侧 OK"
   else
     warn "本机 WS 入站未拿到 101: 先查 sing-box 的 cf-vless-ws-in / CF_WS_PATH / CF_VLESS_UUID(不是 cloudflared 的锅)"
   fi
+  local cf_verified=0
   if curl -isS -m 10 "${ws_hdr[@]}" "https://$CF_HOSTNAME$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
-    ok "公网隧道连通(101)。客户端重新拉订阅即可看到 CF-Vless。"
+    cf_verified=1
+  fi
+
+  # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)。
+  # CF_VERIFIED 决定该节点是否进订阅: 未验证通过时后续 install/warp 也不会把死节点加回来。
+  ( umask 077; cat >"$CF_ENV" <<EOF
+CF_HOSTNAME=$CF_HOSTNAME
+CF_PORT=$CF_PORT
+CF_VLESS_UUID=$CF_VLESS_UUID
+CF_WS_PATH=$CF_WS_PATH
+CF_VERIFIED=$cf_verified
+EOF
+  )
+  CF_VERIFIED="$cf_verified"
+  write_subscription   # 同时刷新 Clash 订阅与通用(base64)订阅
+
+  if [ "$cf_verified" = 1 ]; then
+    ok "公网隧道连通(101)。CF-Vless 已加入订阅, 客户端重新拉订阅即可看到。"
+    ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
   else
     warn "公网未拿到 101: 若上面本机 101 正常, 问题在 cloudflared/DNS/Tunnel(502/530/1033 这类), 不在 sing-box。"
+    warn "按'验证通过才加入订阅'的原则, 本次【未】把 CF-Vless 写进订阅(否则客户端会多一条连不上的死节点)。"
+    echo "  隧道通了之后重跑一次 'bash install.sh cf' 即可加入订阅(参数会自动沿用)。"
     echo "  复测: systemctl is-active cloudflared sing-box; journalctl -u cloudflared -n 50 --no-pager | grep -Ei 'Registered|timeout|error|quic|http2'"
+    note "CF-Vless 隧道未验证通过, 暂未加入订阅; 隧道正常后重跑 'bash install.sh cf'。"
   fi
 }
 
