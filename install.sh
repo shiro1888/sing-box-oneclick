@@ -1258,13 +1258,20 @@ def current_month_used(data, interface, mode, now=None):
             break
     if iface is None:
         return None
-    rx = tx = 0
-    for m in iface.get("traffic", {}).get("month", []):
+    months = iface.get("traffic", {}).get("month", [])
+    if not months:
+        return 0
+    # 优先取标签等于当前自然月的桶; 匹配不到(例如配了 vnstat MonthRotate、
+    # 账期跨入新自然月的前半段)就退回最后一个桶。vnstat 按时间升序输出,
+    # 最后一个桶就是当前账期, 对自然月和 MonthRotate 都成立。
+    cur = months[-1]
+    for m in months:
         d = m.get("date", {})
         if d.get("year") == now.year and d.get("month") == now.month:
-            rx = m.get("rx", 0)
-            tx = m.get("tx", 0)
+            cur = m
             break
+    rx = cur.get("rx", 0)
+    tx = cur.get("tx", 0)
     if mode == "rx+tx":
         return rx + tx  # 仅商家真按"进+出"计费才用; 代理 rx≈tx, 这是真实用量的约 2 倍
     if mode == "max":

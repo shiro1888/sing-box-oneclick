@@ -411,6 +411,28 @@ assert m.decide_enforcement(50, 100, False, True) == ("start", False)
 assert m.decide_enforcement(50, 100, False, False) == (None, False)
 PYT
 then echo "PASS  内嵌 traffic_limit.py 持久标记+手动停机状态机正确"; else echo "FAIL  traffic 状态机"; cat "$TMP/e"; fail=1; fi
+if python - "$TMP/traffic_limit.py" <<'PYT' 2>"$TMP/e"
+import importlib.util, sys, datetime
+spec = importlib.util.spec_from_file_location("traffic_limit", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+f = m.current_month_used
+now = datetime.datetime(2026, 7, 27)
+# 自然月: 命中当前 year/month 桶
+nat = {"interfaces": [{"name": "eth0", "traffic": {"month": [
+    {"date": {"year": 2026, "month": 6}, "rx": 100, "tx": 200},
+    {"date": {"year": 2026, "month": 7}, "rx": 300, "tx": 400}]}}]}
+assert f(nat, "eth0", "tx", now) == 400
+assert f(nat, "eth0", "rx+tx", now) == 700
+assert f(nat, "eth0", "max", now) == 400
+# MonthRotate: 当前自然月无对应桶, 退回最后一个(当前账期)桶, 不再恒为 0
+rot = {"interfaces": [{"name": "eth0", "traffic": {"month": [
+    {"date": {"year": 2026, "month": 6}, "rx": 100, "tx": 200}]}}]}
+assert f(rot, "eth0", "tx", now) == 200, "MonthRotate 账期桶应退回最后一个, 不是 0"
+# 边界: 网卡不存在返回 None; 无月桶返回 0
+assert f({"interfaces": []}, "eth0", "tx", now) is None
+assert f({"interfaces": [{"name": "eth0", "traffic": {"month": []}}]}, "eth0", "tx", now) == 0
+PYT
+then echo "PASS  内嵌 traffic_limit.py 账期桶匹配(自然月命中/MonthRotate 退回/边界)"; else echo "FAIL  traffic 账期桶"; cat "$TMP/e"; fail=1; fi
 if grep -q 'server_name _;' install.sh && grep -q 'listen 80 default_server' install.sh; then
   echo "PASS  nginx 使用默认 404 server + 订阅精确 server"; else echo "FAIL  nginx 双 server 静态检查"; fail=1; fi
 
