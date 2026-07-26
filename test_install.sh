@@ -492,6 +492,76 @@ if [ "$rc" != "rc=0" ] && ! grep -q '^PasswordAuthentication no' "$HD/sshd_confi
 else echo "FAIL  do_harden 兜底分支未还原主文件 ($rc)"; sed -n '1,5p' "$HD/sshd_config" 2>/dev/null; fail=1; fi
 
 echo
+echo "=== 4l) 机型协议组合开关 ENABLE_HY2 / SS_UDP(对齐文档「按机型选协议组合」) ==="
+# 默认: 四协议齐全
+render 'render_singbox_config' > "$TMP/sb_all.json"
+if python -c "import json,sys; d=json.load(open(sys.argv[1])); t=[i['tag'] for i in d['inbounds']]; sys.exit(0 if 'hy2-in' in t else 1)" "$TMP/sb_all.json" 2>/dev/null; then
+  echo "PASS  默认含 hy2-in 入站"; else echo "FAIL  默认应含 hy2-in"; fail=1; fi
+# ENABLE_HY2=0: 服务端不应有 hy2 入站, 且 JSON 仍合法
+out=$(ENABLE_HY2=0 render 'render_singbox_config')
+if printf '%s' "$out" | python -c "import json,sys; d=json.load(sys.stdin); t=[i['tag'] for i in d['inbounds']]; sys.exit(0 if ('hy2-in' not in t and 'vless-in' in t and 'ss-in' in t) else 1)" 2>/dev/null; then
+  echo "PASS  ENABLE_HY2=0 服务端去掉 hy2-in 且 JSON 合法(其余协议保留)"
+else echo "FAIL  ENABLE_HY2=0 服务端配置不正确"; fail=1; fi
+# ENABLE_HY2=0: 订阅 YAML 不应有 Hysteria2 节点, 代理组也不能引用它(否则 mihomo 报错)
+out=$(ENABLE_HY2=0 render 'render_subscription_yaml')
+if ! printf '%s' "$out" | grep -q 'Hysteria2'; then
+  echo "PASS  ENABLE_HY2=0 订阅不含 Hysteria2(节点与代理组均已去掉)"
+else echo "FAIL  ENABLE_HY2=0 订阅仍残留 Hysteria2"; fail=1; fi
+if printf '%s' "$out" | grep -q '"Vless"' && printf '%s' "$out" | grep -q '"SS2022"'; then
+  echo "PASS  ENABLE_HY2=0 其余节点仍在订阅内"; else echo "FAIL  ENABLE_HY2=0 误删了其它节点"; fail=1; fi
+# ENABLE_HY2=0: 通用分享链接不应有 hysteria2://
+out=$(ENABLE_HY2=0 render 'render_share_links')
+if ! printf '%s' "$out" | grep -q 'hysteria2://'; then
+  echo "PASS  ENABLE_HY2=0 分享链接不含 hysteria2://"; else echo "FAIL  分享链接仍含 hysteria2://"; fail=1; fi
+# SS_UDP=0: TCP-only 稳定版, 订阅应写 udp: false
+out=$(SS_UDP=0 render 'render_subscription_yaml')
+if printf '%s' "$out" | grep -A6 '"SS2022"' | grep -q 'udp: false'; then
+  echo "PASS  SS_UDP=0 订阅 SS2022 写成 udp: false"; else echo "FAIL  SS_UDP=0 未生效"; fail=1; fi
+out=$(render 'render_subscription_yaml')
+if printf '%s' "$out" | grep -A6 '"SS2022"' | grep -q 'udp: true'; then
+  echo "PASS  默认 SS2022 仍是 udp: true"; else echo "FAIL  默认 SS udp 不应变"; fail=1; fi
+# SS_UDP=0 服务端必须真的不收 UDP: 只改订阅等于"客户端不走、端口还开着", 清洗敏感机风险仍在
+out=$(SS_UDP=0 render 'render_singbox_config')
+if printf '%s' "$out" | python -c "
+import sys,json; d=json.load(sys.stdin)
+ss=[i for i in d['inbounds'] if i['tag']=='ss-in'][0]
+sys.exit(0 if ss.get('network')=='tcp' else 1)" 2>/dev/null; then
+  echo "PASS  SS_UDP=0 服务端 ss-in 加 network:tcp(真的不收 UDP)"
+else echo "FAIL  SS_UDP=0 服务端仍收 UDP"; fail=1; fi
+out=$(render 'render_singbox_config')
+if printf '%s' "$out" | python -c "
+import sys,json; d=json.load(sys.stdin)
+ss=[i for i in d['inbounds'] if i['tag']=='ss-in'][0]
+sys.exit(0 if 'network' not in ss else 1)" 2>/dev/null; then
+  echo "PASS  默认 ss-in 不限制 network(TCP+UDP)"; else echo "FAIL  默认不该限制 SS network"; fail=1; fi
+# AnyTLS 订阅节点必须有 udp: true 和 client-fingerprint(与手搓文档模板一致);
+# 缺 udp 会让 mihomo 默认不走 UDP, AnyTLS 作为 HY2 替补时 UDP 流量静默失败
+out=$(render 'render_subscription_yaml')
+if printf '%s' "$out" | grep -A8 '"AnyTLS"' | grep -q 'udp: true' \
+   && printf '%s' "$out" | grep -A8 '"AnyTLS"' | grep -q 'client-fingerprint: chrome'; then
+  echo "PASS  AnyTLS 节点含 udp: true 与 client-fingerprint(对齐文档模板)"
+else echo "FAIL  AnyTLS 节点缺 udp/client-fingerprint"; fail=1; fi
+
+echo
+echo "=== 4m) SS2022 密钥长度随 SS_METHOD 自适应(改方法不再让 check 失败) ==="
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  r=""
+  for m in 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305; do
+    SS_METHOD=$m; k=$(gen_ss_password)
+    [ "$(ss_key_bytes "$k")" = "$(ss_need_bytes)" ] || r="$r BAD:$m"
+  done
+  # 同方法重跑必须判定为一致(否则会无谓地重新生成密钥、把客户端踢下线)
+  SS_METHOD=2022-blake3-aes-128-gcm; k=$(gen_ss_password)
+  [ "$(ss_key_bytes "$k")" = "$(ss_need_bytes)" ] || r="$r SAME_METHOD_MISDETECT"
+  # 换成 256 位方法必须判定为不一致(触发重新生成)
+  SS_METHOD=2022-blake3-aes-256-gcm
+  [ "$(ss_key_bytes "$k")" != "$(ss_need_bytes)" ] || r="$r CHANGE_NOT_DETECTED"
+  echo "${r:-OK}"' 2>/dev/null)
+if [ "$out" = "OK" ]; then
+  echo "PASS  SS 密钥长度与 SS_METHOD 匹配; 同方法不误重生成, 换方法能检出"
+else echo "FAIL  SS 密钥长度逻辑有问题: $out"; fail=1; fi
+
+echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
 render 'render_header "2026-12-31 23:59:59 +0800"' > "$TMP/hdr.txt"
 if grep -q 'add_header Subscription-Userinfo "upload=0; download=0; total=214748364800; expire=1798732799" always;' "$TMP/hdr.txt"; then
@@ -512,6 +582,11 @@ assert m.decide_enforcement(100, 100, False, False) == (None, False)
 assert m.decide_enforcement(100, 100, False, True) == (None, True)
 assert m.decide_enforcement(50, 100, False, True) == ("start", False)
 assert m.decide_enforcement(50, 100, False, False) == (None, False)
+# LIMIT_GB=0 => limit_bytes=0 表示"不限量", 不能被当成 0 字节配额而立刻永久停机
+assert m.decide_enforcement(0, 0, True, False) == (None, False), "limit=0 在跑时不该停"
+assert m.decide_enforcement(10**12, 0, True, False) == (None, False), "limit=0 无论用量多大都不该停"
+assert m.decide_enforcement(0, 0, False, True) == ("start", False), "limit=0 应把此前配额停机的服务拉回来"
+assert m.decide_enforcement(0, 0, False, False) == (None, False), "limit=0 不该拉起用户手动停的服务"
 PYT
 then echo "PASS  内嵌 traffic_limit.py 持久标记+手动停机状态机正确"; else echo "FAIL  traffic 状态机"; cat "$TMP/e"; fail=1; fi
 if python - "$TMP/traffic_limit.py" <<'PYT' 2>"$TMP/e"

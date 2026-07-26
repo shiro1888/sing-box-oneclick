@@ -15,7 +15,7 @@
 #    COUNT_MODE=tx           计费方式 tx(默认,匹配多数商家)|max|rx+tx(仅真双向计费)
 #    EXPIRE_AT="..."         到期时间(默认安装日+365天)
 #    DOMAIN=node.example.com 订阅域名(留空=用公网IP,无需域名)
-#    AIRPORT_NAME=MyNode     客户端订阅显示名
+#    AIRPORT_NAME=US-01     客户端订阅显示名
 #    PUBLIC_IP=1.2.3.4       手动指定公网IP(探测失败时)
 #    HY2_PORT/ANYTLS_PORT/VLESS_PORT/SS_PORT  端口(默认 4433/4434/443/4435)
 #    SS_METHOD=2022-blake3-aes-128-gcm  SS2022 加密方法(可改 256-gcm/chacha)
@@ -56,7 +56,7 @@ PY="${PYTHON:-python3}"
 # 用途: 重装(二次运行 install)时, 已存在的 $ENVFILE 里的值应作为默认被沿用,
 # 但本次命令行显式传的 env 仍要赢 —— 见 do_install 里的 merge_env_defaults。
 for _v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
-          HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS; do
+          HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP; do
   eval "_CLI_$_v=\"\${$_v:-}\""
 done
 unset _v
@@ -76,6 +76,11 @@ TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
 ENABLE_OBFS="${ENABLE_OBFS:-1}"      # HY2 salamander 混淆(默认开, 抗 QUIC 识别; 0 关)
+ENABLE_HY2="${ENABLE_HY2:-1}"        # 是否部署 Hysteria2(默认开)。0=不装 HY2:
+                                     #   甲骨文小机 / 已被 DDoS 清洗过的机器按文档「按机型选协议组合」走 TCP 组合时用。
+                                     #   关掉后: 不写 hy2 入站、订阅与分享链接不含 HY2、不放行 UDP 端口、不配端口跳跃。
+SS_UDP="${SS_UDP:-1}"                # SS2022 是否走 UDP(默认开)。0=TCP-only 稳定版:
+                                     #   订阅写 udp: false 且不放行 SS 的 UDP 端口(服务端仍监听, 客户端不走 UDP)。
 ENABLE_BLOCK_BT="${ENABLE_BLOCK_BT:-1}"    # 拦截 BT/PT(默认开, 防被商家封机收滥用投诉; 0 关)
 ENABLE_BLOCK_ADS="${ENABLE_BLOCK_ADS:-1}"  # geosite 拦广告(默认开; 用远程 rule_set; 0 关)
 KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"  # Komari 探针面板地址(install.sh komari 用)
@@ -255,9 +260,20 @@ detect_net() {
 }
 
 # SS2022 密钥: base64, 长度按方法自适应(128-gcm=16字节, 256/chacha=32字节)
+# 当前 SS_METHOD 要求的密钥字节数(128-gcm=16, 256-gcm/chacha20=32)
+ss_need_bytes() {
+  case "$SS_METHOD" in *aes-256*|*chacha*) printf 32 ;; *) printf 16 ;; esac
+}
+
+# 已有 base64 密钥解码后的实际字节数(解不出来返回 0, 触发重新生成)
+# -A 不能省: 密钥是单行无换行的, 不加 -A 的 openssl base64 -d 会解出 0 字节,
+# 那样每次重跑都会误判成"长度不符"并重新生成密钥, 把客户端全踢下线。
+ss_key_bytes() {
+  printf '%s' "$1" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' \n' || printf 0
+}
+
 gen_ss_password() {
-  local b=16; case "$SS_METHOD" in *aes-256*|*chacha*) b=32;; esac
-  openssl rand -base64 "$b" | tr -d '\n'
+  openssl rand -base64 "$(ss_need_bytes)" | tr -d '\n'
 }
 
 gen_secrets() {
@@ -270,6 +286,15 @@ gen_secrets() {
       SS_PASSWORD="$(gen_ss_password)"
       printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
       log "已为升级补充 SS2022 密钥"
+    elif [ "$(ss_key_bytes "$SS_PASSWORD")" != "$(ss_need_bytes)" ]; then
+      # SS2022 的密钥长度和加密方法强绑定(128-gcm=16 字节, 256-gcm/chacha=32 字节)。
+      # 用户改了 SS_METHOD 重跑时, 旧密钥长度对不上会让 sing-box check 直接失败,
+      # 这里按新方法重新生成一条并覆盖写回, 只影响 SS2022 一条节点。
+      SS_PASSWORD="$(gen_ss_password)"
+      sed -i '/^SS_PASSWORD=/d' "$SECRETS"
+      printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
+      warn "SS_METHOD 改为 $SS_METHOD, 密钥长度需随之变化: 已重新生成 SS2022 密钥"
+      note "SS2022 密钥已因加密方法变更而更新, 请重新拉取订阅(其它协议不受影响)。"
     fi
     if [ -z "${SUB_B64_PATH:-}" ]; then  # 旧版无通用订阅路径, 升级时补一个
       SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
@@ -359,7 +384,7 @@ merge_env_defaults() {
   # shellcheck disable=SC1090
   . "$ENVFILE" 2>/dev/null || true       # 文件值先进来当默认
   for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
-           HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS; do
+           HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP; do
     eval "cli=\"\${_CLI_$v:-}\""
     [ -n "$cli" ] && eval "$v=\"\$cli\""  # 本次显式传的赢回来
   done
@@ -385,6 +410,8 @@ HY2_UP_MBPS=$HY2_UP_MBPS
 HY2_DOWN_MBPS=$HY2_DOWN_MBPS
 ENABLE_BLOCK_BT=$ENABLE_BLOCK_BT
 ENABLE_BLOCK_ADS=$ENABLE_BLOCK_ADS
+ENABLE_HY2=$ENABLE_HY2
+SS_UDP=$SS_UDP
 EOF
   chmod 600 "$ENVFILE"
 }
@@ -481,10 +508,13 @@ JSON
 JSON
 )"
   fi
-  cat <<JSON
-{
-  "log": { "disabled": false, "level": "warn" },
-  "inbounds": [
+  # SS_UDP=0(TCP-only 稳定版): 服务端也要真的不收 UDP, 否则只改订阅等于"客户端不走、端口还开着"
+  local ss_net_line=""
+  [ "$SS_UDP" = 1 ] || ss_net_line='
+      "network": "tcp",'
+  local hy2_block=""
+  if [ "$ENABLE_HY2" = 1 ]; then
+    hy2_block="$(cat <<JSON
     {
       "type": "hysteria2",
       "tag": "hy2-in",
@@ -493,6 +523,14 @@ JSON
       "users": [ { "password": "$HY2_PASSWORD" } ],$obfs_line$hy2_bw_line
       "tls": { "enabled": true, "certificate_path": "$SB_DIR/server.crt", "key_path": "$SB_DIR/server.key" }
     },
+JSON
+)"
+  fi
+  cat <<JSON
+{
+  "log": { "disabled": false, "level": "warn" },
+  "inbounds": [
+$hy2_block
 $anytls_block
     {
       "type": "vless",
@@ -515,7 +553,7 @@ $anytls_block
       "type": "shadowsocks",
       "tag": "ss-in",
       "listen": "::",
-      "listen_port": $SS_PORT,
+      "listen_port": $SS_PORT,$ss_net_line
       "method": "$SS_METHOD",
       "password": "$SS_PASSWORD"
     }$cf_block
@@ -534,11 +572,14 @@ render_subscription_yaml() {
   SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
   CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
+  ENABLE_HY2="$ENABLE_HY2" SS_UDP="$SS_UDP" \
   "$PY" - <<'PY'
 import os
 ip  = os.environ["PUBLIC_IP"]
 dom = os.environ.get("DOMAIN", "")
 anytls = os.environ["ANYTLS_OK"] == "1"
+hy2_on = os.environ.get("ENABLE_HY2", "1") == "1"
+ss_udp = "true" if os.environ.get("SS_UDP", "1") == "1" else "false"
 
 proxies = []
 hy2 = [
@@ -560,7 +601,8 @@ if os.environ.get("HY2_UP", ""):
 if os.environ.get("HY2_DOWN", ""):
     hy2.append(f'    down: "{os.environ["HY2_DOWN"]} Mbps"')
 hy2 += ['    alpn:', '      - h3']
-proxies.append("\n".join(hy2))
+if hy2_on:
+    proxies.append("\n".join(hy2))
 if anytls:
     proxies.append(f'''  - name: "AnyTLS"
     type: anytls
@@ -568,7 +610,9 @@ if anytls:
     port: {os.environ["ANYTLS_PORT"]}
     password: {os.environ["ANYTLS_PASSWORD"]}
     sni: {os.environ["TLS_SNI"]}
-    skip-cert-verify: true''')
+    skip-cert-verify: true
+    udp: true
+    client-fingerprint: chrome''')
 proxies.append(f'''  - name: "Vless"
     type: vless
     server: {ip}
@@ -589,7 +633,7 @@ proxies.append(f'''  - name: "SS2022"
     port: {os.environ["SS_PORT"]}
     cipher: {os.environ["SS_METHOD"]}
     password: "{os.environ["SS_PASSWORD"]}"
-    udp: true''')
+    udp: {ss_udp}''')
 
 cf_host = os.environ.get("CF_HOSTNAME", "")
 cf_uuid = os.environ.get("CF_VLESS_UUID", "")
@@ -610,7 +654,7 @@ if cf_on:
       headers:
         Host: {cf_host}''')
 
-names = ["Hysteria2"] + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"] + (["CF-Vless"] if cf_on else [])
+names = (["Hysteria2"] if hy2_on else []) + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"] + (["CF-Vless"] if cf_on else [])
 grp = "\n".join(f'      - "{n}"' for n in names)
 
 rules = []
@@ -685,6 +729,7 @@ render_share_links() {
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
+  ENABLE_HY2="$ENABLE_HY2" \
   "$PY" - <<'PY'
 import os, urllib.parse as u
 def q(s): return u.quote(str(s), safe='')
@@ -699,7 +744,8 @@ hop = os.environ.get("HY2_HOP_RANGE", "")
 hy2_port = hop if hop else os.environ["HY2_PORT"]
 if hop:
     hy2q += f"&mport={hop}"
-out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{hy2_port}/?{hy2q}#{q('Hysteria2')}")
+if os.environ.get("ENABLE_HY2", "1") == "1":
+    out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{hy2_port}/?{hy2q}#{q('Hysteria2')}")
 if os.environ["ANYTLS_OK"] == "1":
     out.append(f"anytls://{q(os.environ['ANYTLS_PASSWORD'])}@{ip}:{os.environ['ANYTLS_PORT']}/?insecure=1&sni={q(tls)}#{q('AnyTLS')}")
 vq = u.urlencode({'encryption':'none','flow':'xtls-rprx-vision','security':'reality',
@@ -1319,6 +1365,12 @@ def build_header(used, total, expire):
 
 
 def decide_enforcement(used, limit_bytes, active, flag_exists):
+    # LIMIT_GB=0 表示不限量(只统计显示, 永不配额停机)。
+    # 没有这个特判的话 used >= 0 恒真, 首个 cron 周期就会停掉 sing-box 并打标记,
+    # 之后一直保持停机 —— 而用户填 0 的本意恰恰是"不要限制"。
+    # 若此前被配额停过, 这里顺带把服务拉回来并清标记。
+    if limit_bytes <= 0:
+        return ("start" if (flag_exists and not active) else None, False)
     if used >= limit_bytes:
         if active:
             return ("stop", True)        # 超额且在跑: 停掉并打配额标记
@@ -1365,8 +1417,15 @@ def main():
     active = subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"]).returncode == 0
     action, keep_flag = decide_enforcement(used, limit_bytes, active, os.path.exists(QUOTA_FLAG))
     if action == "stop":
+        # 打日志: cron 已把输出接到 logger -t traffic_limit。
+        # 不打的话, 用户看到的现象是"手动 restart 后 5 分钟内又自己停",
+        # 且 status/doctor 都不显示配额标记, 极易误判成 sing-box 崩溃或被墙。
+        print(f"quota exceeded: used={used} >= limit={limit_bytes}, stopping sing-box",
+              file=sys.stderr)
         subprocess.run(["systemctl", "stop", "sing-box"])
     elif action == "start":
+        print(f"quota restored: used={used} < limit={limit_bytes}, starting sing-box",
+              file=sys.stderr)
         subprocess.run(["systemctl", "start", "sing-box"])
     if keep_flag:
         open(QUOTA_FLAG, "w").close()
@@ -1431,8 +1490,30 @@ EOF
 }
 
 # HY2 端口跳跃: nftables 把一段 UDP 端口重定向到真实 HY2 端口, 抗运营商按端口对 UDP 限速
+# 关闭端口跳跃时的清理: 只删本脚本自己建的表和服务, 不碰用户其它 nft 规则。
+# 没有它的话, 把 HY2_HOP_RANGE 置空(或 ENABLE_HY2=0)重跑 install 只是"不再配置",
+# 旧的整段 UDP -> HY2 重定向和开机自启服务仍然留着, 等于关不掉。
+porthop_cleanup() {
+  local svc=/etc/systemd/system/sing-box-porthop.service
+  local had=0
+  [ -f "$svc" ] && had=1
+  if [ "$had" = 0 ] && command -v nft >/dev/null 2>&1; then
+    nft list table inet sb_hophy2 >/dev/null 2>&1 && had=1
+  fi
+  [ "$had" = 1 ] || return 0          # 本来就没配过端口跳跃, 什么都不做
+  log "清理旧的 HY2 端口跳跃配置..."
+  systemctl disable --now sing-box-porthop >/dev/null 2>&1 || true
+  rm -f "$svc" "$SB_DIR/porthop.nft"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if command -v nft >/dev/null 2>&1; then nft delete table inet sb_hophy2 >/dev/null 2>&1 || true; fi
+  ok "已关闭 HY2 端口跳跃(删除 nft 表与自启服务)"
+  return 0
+}
+
 config_porthop() {
-  [ -n "$HY2_HOP_RANGE" ] || return 0
+  # HY2 关掉时端口跳跃无意义: 顺带清掉上一次可能留下的表和服务, 否则整段 UDP 重定向会继续生效
+  if [ "$ENABLE_HY2" != 1 ]; then porthop_cleanup; return 0; fi
+  if [ -z "$HY2_HOP_RANGE" ]; then porthop_cleanup; return 0; fi
   log "配置 HY2 端口跳跃(UDP $HY2_HOP_RANGE -> $HY2_PORT)..."
   if ! command -v nft >/dev/null 2>&1; then
     case "$PKG" in apt) apt-get install -y nftables >/dev/null 2>&1 || true ;; dnf|yum) "$PKG" install -y nftables >/dev/null 2>&1 || true ;; esac
@@ -1474,7 +1555,18 @@ EOF
 }
 
 config_firewall() {
-  note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $SS_PORT/tcp+udp $HY2_PORT/udp —— 尤其 UDP($HY2_PORT、$SS_PORT)。本脚本改不了云端安全组, 这是'HY2/SS 连不上、Vless 却正常'的头号原因。"
+  # 提示要跟着 ENABLE_HY2 / SS_UDP 走: 关掉的协议不该再让用户去云安全组放行对应 UDP
+  local _ss_p="$SS_PORT/tcp" _hy2_p="" _udp_hint=""
+  [ "$SS_UDP" = 1 ] && { _ss_p="$SS_PORT/tcp+udp"; _udp_hint="$SS_PORT"; }
+  if [ "$ENABLE_HY2" = 1 ]; then
+    _hy2_p=" $HY2_PORT/udp"
+    _udp_hint="$HY2_PORT${_udp_hint:+、$_udp_hint}"
+  fi
+  if [ -n "$_udp_hint" ]; then
+    note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $_ss_p$_hy2_p —— 尤其 UDP($_udp_hint)。本脚本改不了云端安全组, 这是'HY2/SS 连不上、Vless 却正常'的头号原因。"
+  else
+    note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $_ss_p(本机按 TCP-only 组合部署, 无需放行 UDP)。本脚本改不了云端安全组。"
+  fi
   if ! command -v ufw >/dev/null 2>&1; then return 0; fi
   if [ "$ENABLE_UFW" = 1 ]; then
     log "配置并启用 ufw..."
@@ -1482,9 +1574,9 @@ config_firewall() {
     ufw allow 80/tcp >/dev/null 2>&1 || true
     ufw allow "$VLESS_PORT"/tcp  >/dev/null 2>&1 || true
     ufw allow "$ANYTLS_PORT"/tcp >/dev/null 2>&1 || true
-    ufw allow "$HY2_PORT"/udp    >/dev/null 2>&1 || true
+    if [ "$ENABLE_HY2" = 1 ]; then ufw allow "$HY2_PORT"/udp >/dev/null 2>&1 || true; fi
     ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
-    ufw allow "$SS_PORT"/udp     >/dev/null 2>&1 || true
+    if [ "$SS_UDP" = 1 ]; then ufw allow "$SS_PORT"/udp >/dev/null 2>&1 || true; fi
     [ -n "$HY2_HOP_RANGE" ] && ufw allow "${HY2_HOP_RANGE%-*}":"${HY2_HOP_RANGE#*-}"/udp >/dev/null 2>&1 || true
     # 启用前确认 22 已放行, 否则不启用以免把自己 SSH 关在门外
     if ufw status 2>/dev/null | grep -q '22/tcp'; then
@@ -1500,9 +1592,9 @@ config_firewall() {
     ufw allow 80/tcp >/dev/null 2>&1 || true
     ufw allow "$VLESS_PORT"/tcp  >/dev/null 2>&1 || true
     ufw allow "$ANYTLS_PORT"/tcp >/dev/null 2>&1 || true
-    ufw allow "$HY2_PORT"/udp    >/dev/null 2>&1 || true
+    if [ "$ENABLE_HY2" = 1 ]; then ufw allow "$HY2_PORT"/udp >/dev/null 2>&1 || true; fi
     ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
-    ufw allow "$SS_PORT"/udp     >/dev/null 2>&1 || true
+    if [ "$SS_UDP" = 1 ]; then ufw allow "$SS_PORT"/udp >/dev/null 2>&1 || true; fi
     [ -n "$HY2_HOP_RANGE" ] && ufw allow "${HY2_HOP_RANGE%-*}":"${HY2_HOP_RANGE#*-}"/udp >/dev/null 2>&1 || true
     ok "已在现有 ufw 中放行端口"
   else
@@ -1522,10 +1614,11 @@ print_summary() {
   [ -n "${PANEL_PATH:-}" ]   && printf '  可视化看板页:      http://%s%s   (浏览器打开, 看订阅+扫码+复制)\n' "$SUB_HOST" "$PANEL_PATH"
   echo
   printf '  节点(客户端里显示名):\n'
-  printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
+  [ "$ENABLE_HY2" = 1 ] && printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
   [ "$ANYTLS_OK" = 1 ] && printf '    - AnyTLS     (TCP %s)\n' "$ANYTLS_PORT"
   printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
-  printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
+  if [ "$SS_UDP" = 1 ]; then printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
+  else printf '    - SS2022     (TCP %s, TCP-only)\n' "$SS_PORT"; fi
   [ -n "$CF_HOSTNAME" ] && printf '    - CF-Vless   (WS via %s, Argo 大保底)\n' "$CF_HOSTNAME"
   [ -n "$WARP_PRIVATE_KEY" ] && printf '    * WARP 解锁分流已开 (%s 走 WARP)\n' "${WARP_SITES:-$WARP_DEFAULT_SITES}"
   echo
@@ -1898,11 +1991,13 @@ do_doctor() {
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo)"
   [ "$cc" = bbr ] && P "拥塞控制 = bbr" || W "拥塞控制 = ${cc:-未知}(非 bbr): 重跑 install 开 BBR"
   # 4) 端口本地监听
-  local p miss=0
-  for p in "$HY2_PORT" "$VLESS_PORT" "$SS_PORT" 80; do
+  # ENABLE_HY2=0 时 4433 本就不该监听, 不能当成故障报出来
+  local p miss=0 want="$VLESS_PORT $SS_PORT 80"
+  [ "$ENABLE_HY2" = 1 ] && want="$HY2_PORT $want"
+  for p in $want; do
     ss -lntuH 2>/dev/null | grep -qE "[:.]$p\b" || { W "端口 $p 本地未监听"; miss=1; }
   done
-  [ "$miss" = 0 ] && P "节点端口本地监听正常 ($HY2_PORT/$VLESS_PORT/$SS_PORT/80)"
+  [ "$miss" = 0 ] && P "节点端口本地监听正常 ($(printf '%s' "$want" | tr ' ' '/'))"
   # 5) 防火墙 / 安全组(头号坑)
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
     W "ufw 已启用: 确认放行 $HY2_PORT/udp、$VLESS_PORT/tcp、$SS_PORT、80/tcp"
@@ -1960,31 +2055,42 @@ do_doctor() {
 
 do_set() {
   [ -f "$ENVFILE" ] || die "未检测到安装(缺 $ENVFILE)"
-  [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE)"
+  [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / HY2_UP_MBPS / HY2_DOWN_MBPS)"
   # shellcheck disable=SC1090
   . "$SECRETS" 2>/dev/null || true
   . "$ENVFILE"
   # 兼容旧 env(可能无 PUBLIC_IP/SUB_HOST): 回填后再让 write_env 重写, 否则会被清空
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
-  local a key val iface_changed=0
+  local a key val iface_changed=0 sb_render=0
   for a in "$@"; do
     key="${a%%=*}"; val="${a#*=}"
     [ "$key" != "$a" ] || die "参数要写成 KEY=VAL: $a"
     case "$key" in
       LIMIT_GB)   case "$val" in ''|.|*.*.*|*[!0-9.]*) die "LIMIT_GB 要是数字(如 200 或 0.5): $val";; esac; LIMIT_GB="$val" ;;
       COUNT_MODE) case "$val" in rx+tx|tx|max) COUNT_MODE="$val" ;; *) die "COUNT_MODE 只能 rx+tx/tx/max";; esac ;;
+      # HY2 服务端带宽护栏: 清洗敏感机最需要它长期生效。放进 set 是为了不用手改 config.json ——
+      # 手改会被下一次 install/cf/warp 的全量重渲染抹掉, 而 env 里的值有 merge_env_defaults 保底。
+      HY2_UP_MBPS|HY2_DOWN_MBPS)
+                  case "$val" in ''|*[!0-9]*) die "$key 要是数字(Mbps, 如 80): $val";; esac
+                  eval "$key=\"\$val\""; sb_render=1 ;;
       INTERFACE)  [ -n "$val" ] || die "INTERFACE 不能空"
                   # 校验网卡真实存在: 打错名字会让 vnstat 取不到数据, traffic_limit.py 提前退出,
                   # 流量头不更新且配额自动停机静默失效。有 ip 命令时落盘前就拦掉(测试机无 ip 则跳过)。
                   if command -v ip >/dev/null 2>&1; then ip -br link show "$val" >/dev/null 2>&1 || die "网卡不存在: $val(用 ip -br link 查真实名)"; fi
                   INTERFACE="$val"; iface_changed=1 ;;
       EXPIRE_AT)  [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || die "EXPIRE_AT 格式须为 'YYYY-MM-DD HH:MM:SS +0800'"; EXPIRE_AT="$val" ;;
-      *) die "不支持的键: $key (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE)" ;;
+      *) die "不支持的键: $key (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / HY2_UP_MBPS / HY2_DOWN_MBPS)" ;;
     esac
     ok "set $key=$val"
   done
   write_env   # 用更新后的全局重写 env(SUB_HOST/PUBLIC_IP 已从 env 读到, 一并保留)
+  # 改了写进 config.json 的键(如 HY2 带宽护栏)要重渲染才生效;
+  # 走 write_singbox_config 的 check + 失败回滚流程, 不裸改正式配置。
+  if [ "$sb_render" = 1 ]; then
+    if [ -f "$SB_DIR/config.json" ]; then write_singbox_config
+    else warn "尚未生成 config.json, 值已存入 env, 下次 install 生效"; fi
+  fi
   [ -f "$TRAFFIC_PY" ] && { "$PY" "$TRAFFIC_PY" >/dev/null 2>&1 && ok "已刷新订阅流量头(限额/到期即时生效)" || warn "流量头刷新失败, 5 分钟后 cron 会自动重试"; }
   # 改了网卡: HY2 端口跳跃的 nft 规则把旧网卡名烤进了 porthop.nft(do_set 不重建以免用错 HY2_PORT),
   # 提示用户重跑 install 刷新, 否则跳跃段仍绑旧网卡、客户端经跳跃端口连不上 HY2(直连 HY2_PORT 不受影响)。

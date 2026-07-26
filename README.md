@@ -83,6 +83,19 @@ sing-box 本体才占 ~20–50MB 内存。一台 **1 核 / 512MB / 10GB 的最�
 
 ---
 
+## 按机型选协议组合
+
+默认四协议全开，适合大多数 KVM 小鸡。但有些机器不适合跑 UDP/QUIC，按下表调整（与 `节点搭建文档.md` 的同名表一致）：
+
+| 机型 | 推荐组合 | 装法 |
+|---|---|---|
+| **普通 KVM / 大多数 VPS** | 四协议全开（默认） | `bash install.sh` |
+| **甲骨文 ARM / 小内存机** | AnyTLS + Vless + SS2022(TCP) | `ENABLE_HY2=0 SS_UDP=0 bash install.sh` |
+| **被 DDoS 清洗过的机器** | 稳定优先去 HY2；速度优先可留但**必须限速** | `ENABLE_HY2=0 bash install.sh`<br>或 `HY2_UP_MBPS=80 HY2_DOWN_MBPS=160 bash install.sh` |
+| **纯 IPv6 机** | 同上再叠加，CF-Vless 当重要保底 | 按上 + `install.sh cf` |
+
+> 已经装过的机器改主意也可以：重跑时带上开关即可（如 `ENABLE_HY2=0 bash install.sh`），脚本会去掉 HY2 入站、从订阅和分享链接里移除该节点，并清理端口跳跃的 nft 表与自启服务。密钥、订阅路径、其它协议都不受影响。
+
 ## 常用环境变量
 
 全部可选，覆盖默认值即可。例：
@@ -91,18 +104,22 @@ sing-box 本体才占 ~20–50MB 内存。一台 **1 核 / 512MB / 10GB 的最�
 LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 ```
 
+> 重装保参数：二次运行 `install.sh` 会沿用 `/etc/sing-box-node.env` 里已有的 `LIMIT_GB`/`EXPIRE_AT`/`COUNT_MODE`/HY2 护栏等；本次显式传入的环境变量仍然优先。所以升级重跑不会把你 `set` 过的配置打回默认值。
+
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LIMIT_GB` | `200` | 每月显示/限流额度（GB） |
 | `COUNT_MODE` | `tx` | 计费方式：`tx` 只算出站(默认,匹配多数商家) / `max` 取较大 / `rx+tx` 双向相加(仅真按进+出计费才用) |
 | `EXPIRE_AT` | 安装日 +365 天 | 到期时间，**必须**是 `YYYY-MM-DD HH:MM:SS +0800` 格式（四位时区偏移，不能写 `+08:00` 或省略）。格式不对脚本会在开头直接报错退出，不会装到一半才崩。 |
 | `DOMAIN` | 空（用 IP） | 订阅域名（仅支持单个）；填了需自己把 DNS A 记录指向本机 IP。脚本只处理一个订阅域名，需要备用域名请手动改 nginx 的 `server_name` 与订阅 `rules`。 |
-| `AIRPORT_NAME` | `MyNode` | 客户端里的订阅显示名 |
+| `AIRPORT_NAME` | `US-01` | 客户端里的订阅显示名 |
 | `PUBLIC_IP` | 自动探测 | 探测失败时手动指定 |
 | `HY2_PORT` / `ANYTLS_PORT` / `VLESS_PORT` / `SS_PORT` | `4433`/`4434`/`443`/`4435` | 各协议端口（SS2022 同时用 TCP+UDP） |
 | `SS_METHOD` | `2022-blake3-aes-128-gcm` | SS2022 加密方法（可改 `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`，密钥长度脚本自动适配） |
 | `REALITY_SNI` | `www.bing.com` | Reality 伪装域名（服务端 handshake + 客户端 servername，必须一致） |
 | `TLS_SNI` | `www.bing.com` | HY2/AnyTLS 自签证书 SNI |
+| `ENABLE_HY2` | `1` | 是否部署 **Hysteria2**。`0` = 不装：不写 hy2 入站、订阅与分享链接不含 HY2、不放行其 UDP 端口、不配端口跳跃。甲骨文小机、或被 DDoS 清洗过的机器走 TCP 组合时用（见下方「按机型选协议组合」） |
+| `SS_UDP` | `1` | SS2022 是否走 UDP。`0` = TCP-only 稳定版：订阅写 `udp: false` 且不放行 SS 的 UDP 端口 |
 | `ENABLE_BBR` | `1` | 开启 BBR（纯 sysctl，安全） |
 | `ENABLE_UFW` | `0` | 自动配置并**启用** ufw（默认关，避免把自己 SSH 关在外面） |
 | `ENABLE_OBFS` | `1` | HY2 **salamander 混淆**，让 Hysteria2 不像 QUIC（默认开，抗 QUIC 整体识别/限速；`0` 关） |
