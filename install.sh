@@ -261,7 +261,7 @@ detect_net() {
   fi
   INTERFACE="${INTERFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)}"
   # 纯 IPv6 机器 IPv4 探测会失败, 再用 IPv6 兜底; 否则网卡被误写成 eth0 会让 vnstat 取不到数据、限流首次报错
-  [ -z "$INTERFACE" ] && INTERFACE="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [ -z "$INTERFACE" ] && INTERFACE="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
   INTERFACE="${INTERFACE:-eth0}"
   SUB_HOST="${DOMAIN:-$PUBLIC_IP}"
   # 纯 IPv6 机: 客户端要走 AAAA/IPv6, 订阅必须 ipv6: true, 分流规则要用 IP-CIDR6/128,
@@ -276,6 +276,22 @@ detect_net() {
   ok "公网 IP: $PUBLIC_IP   网卡: $INTERFACE"
   [ -n "$DOMAIN" ] && note "订阅域名 $DOMAIN: 请确认已把它的 DNS A 记录解析到 $PUBLIC_IP(本脚本无法替你改 DNS)。"
   return 0
+}
+
+# URL authority / HTTP Host 中的 IPv6 字面量必须带方括号；SUB_HOST 本身仍保存原始 IP 或域名，
+# 避免把方括号误写进 DNS/地址判断。Nginx 的 server_name 也要和标准 Host 值一致。
+url_host() {
+  local host="${1:-}"
+  case "$host" in
+    \[*\]) printf '%s' "$host" ;;
+    *:*)   printf '[%s]' "$host" ;;
+    *)     printf '%s' "$host" ;;
+  esac
+}
+
+subscription_url() {
+  local path="${1:-$SUB_PATH}"
+  printf 'http://%s%s' "$(url_host "$SUB_HOST")" "$path"
 }
 
 # SS2022 密钥: base64, 长度按方法自适应(128-gcm=16字节, 256/chacha=32字节)
@@ -295,12 +311,132 @@ gen_ss_password() {
   openssl rand -base64 "$(ss_need_bytes)" | tr -d '\n'
 }
 
+# 这些文件由 root 持久化后会在后续管理命令和 restore 中重新读取。不能 source：备份或被篡改的
+# KEY=VALUE 文件会变成 root shell。只接受本脚本会写出的键和值格式，并按字面量赋值。
+valid_state_value() {
+  local key="$1" value="$2"
+  case "$key" in
+    HY2_PASSWORD|ANYTLS_PASSWORD|OBFS_PASSWORD|REALITY_SHORT_ID)
+      [[ -z "$value" || "$value" =~ ^[A-Za-z0-9]+$ ]]
+      ;;
+    VLESS_UUID|CF_VLESS_UUID)
+      [[ "$value" =~ ^[0-9A-Fa-f-]{36}$ ]]
+      ;;
+    REALITY_PRIVATE_KEY|REALITY_PUBLIC_KEY|WARP_PRIVATE_KEY)
+      [[ "$value" =~ ^[A-Za-z0-9+/=_-]+$ ]]
+      ;;
+    SS_PASSWORD)
+      [[ -z "$value" || "$value" =~ ^[A-Za-z0-9+/=_-]+$ ]]
+      ;;
+    SUB_PATH|SUB_B64_PATH|PANEL_PATH)
+      [[ "$value" =~ ^/[A-Za-z0-9._/-]+$ && "$value" != *..* ]]
+      ;;
+    LIMIT_GB)
+      [[ "$value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
+      ;;
+    EXPIRE_AT)
+      [[ -z "$value" || "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]]
+      ;;
+    INTERFACE)
+      [[ "$value" =~ ^[A-Za-z0-9_.:-]+$ ]]
+      ;;
+    COUNT_MODE)
+      case "$value" in rx+tx|tx|max) return 0 ;; esac; return 1
+      ;;
+    SUB_HOST)
+      [[ "$value" =~ ^[A-Za-z0-9:.-]+$ ]]
+      ;;
+    PUBLIC_IP)
+      [[ "$value" =~ ^[0-9A-Fa-f:.]+$ ]]
+      ;;
+    HY2_HOP_RANGE)
+      [[ -z "$value" || "$value" =~ ^[0-9]+-[0-9]+$ ]]
+      ;;
+    HY2_UP|HY2_DOWN|HY2_UP_MBPS|HY2_DOWN_MBPS|CF_PORT|ADMIN_PORT)
+      [[ -z "$value" || "$value" =~ ^[0-9]+$ ]]
+      ;;
+    ENABLE_BLOCK_BT|ENABLE_BLOCK_ADS|ENABLE_HY2|SS_UDP|CF_VERIFIED)
+      [[ "$value" = 0 || "$value" = 1 ]]
+      ;;
+    CF_HOSTNAME)
+      [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]]
+      ;;
+    CF_WS_PATH)
+      [[ "$value" =~ ^/[A-Za-z0-9/_.-]*$ ]]
+      ;;
+    WARP_ADDR_V4)
+      [[ "$value" =~ ^[0-9.]+/[0-9]+$ ]]
+      ;;
+    WARP_ADDR_V6)
+      [[ "$value" =~ ^[0-9A-Fa-f:]+/[0-9]+$ ]]
+      ;;
+    WARP_RESERVED)
+      [[ -z "$value" || "$value" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]
+      ;;
+    WARP_SITES)
+      [[ "$value" =~ ^[a-z0-9,-]+$ ]]
+      ;;
+    ADMIN_TOKEN)
+      [[ "$value" =~ ^[0-9A-Fa-f]+$ ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+load_state_file() {
+  local file="$1" line key value
+  shift
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in ''|\#*) continue ;; esac
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || { err "状态文件格式非法: $file"; return 1; }
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    case " $* " in *" $key "*) ;; *) err "状态文件含未识别键 $key: $file"; return 1 ;; esac
+    if [[ "$value" == \"* ]]; then
+      [ "${#value}" -ge 2 ] && [ "${value: -1}" = '"' ] || { err "状态文件引号不完整: $file"; return 1; }
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'* ]]; then
+      [ "${#value}" -ge 2 ] && [ "${value: -1}" = "'" ] || { err "状态文件引号不完整: $file"; return 1; }
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == *\"* || "$value" == *\'* ]]; then
+      err "状态文件含不支持的引号: $file"
+      return 1
+    fi
+    valid_state_value "$key" "$value" || { err "状态文件中 $key 的值非法: $file"; return 1; }
+    printf -v "$key" '%s' "$value"
+  done <"$file"
+}
+
+load_secrets() {
+  load_state_file "$SECRETS" HY2_PASSWORD ANYTLS_PASSWORD VLESS_UUID REALITY_PRIVATE_KEY \
+    REALITY_PUBLIC_KEY REALITY_SHORT_ID SUB_PATH SUB_B64_PATH PANEL_PATH SS_PASSWORD OBFS_PASSWORD
+}
+
+load_node_env() {
+  load_state_file "$ENVFILE" LIMIT_GB EXPIRE_AT INTERFACE COUNT_MODE SUB_HOST PUBLIC_IP HY2_HOP_RANGE \
+    HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP
+}
+
+load_cf_env() {
+  load_state_file "$CF_ENV" CF_HOSTNAME CF_PORT CF_VLESS_UUID CF_WS_PATH CF_VERIFIED
+}
+
+load_warp_env() {
+  load_state_file "$WARP_ENV" WARP_PRIVATE_KEY WARP_ADDR_V4 WARP_ADDR_V6 WARP_RESERVED WARP_SITES
+}
+
+load_admin_env() {
+  load_state_file "$ADMIN_ENV" ADMIN_TOKEN ADMIN_PORT
+}
+
 gen_secrets() {
   mkdir -p "$SB_DIR"; chmod 700 "$SB_DIR" 2>/dev/null || true   # 目录对非 root 封闭
   if [ -f "$SECRETS" ]; then
     log "检测到已有密钥, 复用(不破坏现有客户端)"
-    # shellcheck disable=SC1090
-    . "$SECRETS"
+    load_secrets || die "密钥文件格式非法, 为保护现有节点拒绝继续: $SECRETS"
     if [ -z "${SS_PASSWORD:-}" ]; then   # 旧版安装无 SS2022 密钥, 升级时补一个(不影响其它节点)
       SS_PASSWORD="$(gen_ss_password)"
       printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
@@ -408,13 +544,17 @@ check_reality_sni() {
 # HY2 带宽护栏(up/down_mbps)被清空 —— 静默丢掉用户 set 过的配置。
 merge_env_defaults() {
   [ -f "$ENVFILE" ] || return 0
-  local v cli
-  # shellcheck disable=SC1090
-  . "$ENVFILE" 2>/dev/null || true       # 文件值先进来当默认
+  local restoring="${1:-0}" v cli current_public="$PUBLIC_IP" current_host="$SUB_HOST" current_interface="$INTERFACE"
+  load_node_env || die "运行参数文件格式非法, 为保护现有节点拒绝继续: $ENVFILE"
+  # 常规重装沿用原来的订阅 Host/IP 行为；只有跨机 restore 才必须保留新机探测结果，
+  # 不能让备份机器的 IP、订阅 Host 或网卡覆盖新机。
+  if [ "$restoring" = 1 ]; then
+    PUBLIC_IP="$current_public"; SUB_HOST="$current_host"; INTERFACE="$current_interface"
+  fi
   for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
-           HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP; do
+            HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP; do
     eval "cli=\"\${_CLI_$v:-}\""
-    [ -n "$cli" ] && eval "$v=\"\$cli\""  # 本次显式传的赢回来
+    [ -n "$cli" ] && printf -v "$v" '%s' "$cli"  # 本次显式传的赢回来
   done
   log "检测到已有运行参数, 沿用(LIMIT_GB=$LIMIT_GB, EXPIRE_AT=${EXPIRE_AT:-未设})"
   return 0
@@ -824,7 +964,9 @@ PY
 
 # 自包含可视化看板页(只读: 看订阅/扫码/复制; 服务器管理仍走 SSH)
 render_panel_html() {
-  local clash_url="http://$SUB_HOST$SUB_PATH" b64_url="http://$SUB_HOST$SUB_B64_PATH"
+  local clash_url b64_url
+  clash_url="$(subscription_url "$SUB_PATH")"
+  b64_url="$(subscription_url "$SUB_B64_PATH")"
   local qr_clash="" qr_b64=""
   if command -v qrencode >/dev/null 2>&1; then
     # || true: qrencode 运行时失败也只是没二维码, 不能因 set -e/pipefail 中断整个安装
@@ -1296,7 +1438,8 @@ config_nginx() {
   rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
   # 看板页可选登录(nginx 真鉴权, 不是网页里的 JS 假门): 存在 map 片段时, nginx 用 \$sb_ok 校验 cookie 是否
   # 等于密码(密码只在 600 root 的 \$PANEL_MAP 里, 由 nginx master 加载, 从不下发浏览器); 不对就 302 跳登录页。
-  local panel_login="${PANEL_PATH%.html}-login.html"
+  local sub_server_name panel_login="${PANEL_PATH%.html}-login.html"
+  sub_server_name="$(url_host "$SUB_HOST")"
   local panel_inc="" panel_guard="" login_loc=""
   if [ -s "$PANEL_MAP" ]; then
     panel_inc="include $PANEL_MAP;"$'\n'
@@ -1313,7 +1456,7 @@ ${panel_inc}server {
 server {
     listen 80;$v6_named
     root $WWW;
-    server_name $SUB_HOST;
+    server_name $sub_server_name;
 
     location = $SUB_PATH {
         include $NGINX_SNIPPET;
@@ -1665,14 +1808,15 @@ config_firewall() {
 
 # ----------------------------------------------------------------- 输出
 print_summary() {
-  local sub_url="http://$SUB_HOST$SUB_PATH"
+  local sub_url
+  sub_url="$(subscription_url "$SUB_PATH")"
   echo
   ok "================= 部署完成 ================="
   echo
   printf '  订阅名称:         %s\n' "$AIRPORT_NAME"
   printf '  Clash/Mihomo 订阅: %s\n' "$sub_url"
-  [ -n "${SUB_B64_PATH:-}" ] && printf '  通用(base64)订阅:  http://%s%s   (v2rayN/Shadowrocket/NekoBox)\n' "$SUB_HOST" "$SUB_B64_PATH"
-  [ -n "${PANEL_PATH:-}" ]   && printf '  可视化看板页:      http://%s%s   (浏览器打开, 看订阅+扫码+复制)\n' "$SUB_HOST" "$PANEL_PATH"
+  [ -n "${SUB_B64_PATH:-}" ] && printf '  通用(base64)订阅:  %s   (v2rayN/Shadowrocket/NekoBox)\n' "$(subscription_url "$SUB_B64_PATH")"
+  [ -n "${PANEL_PATH:-}" ]   && printf '  可视化看板页:      %s   (浏览器打开, 看订阅+扫码+复制)\n' "$(subscription_url "$PANEL_PATH")"
   echo
   printf '  节点(客户端里显示名):\n'
   [ "$ENABLE_HY2" = 1 ] && printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
@@ -1712,10 +1856,9 @@ print_summary() {
 
 do_info() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS"
-  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
-  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true   # 接入过 CF-Vless 则一并显示
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   # 优先用安装时存下的 SUB_HOST(纯读, 不崩); 老版本无此字段才回退探测且探测失败不致命
   [ -n "${SUB_HOST:-}" ] || SOFT_DETECT=1 detect_net
   command -v sing-box >/dev/null 2>&1 && SB_VER="$(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
@@ -1725,10 +1868,9 @@ do_info() {
 
 do_links() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS"
-  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
-  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
@@ -1736,21 +1878,24 @@ do_links() {
   render_share_links
   echo
   echo "===== 订阅 URL ====="
-  printf 'Clash/Mihomo:  http://%s%s\n' "$SUB_HOST" "$SUB_PATH"
-  [ -n "${SUB_B64_PATH:-}" ] && printf '通用(base64):  http://%s%s\n' "$SUB_HOST" "$SUB_B64_PATH"
+  local clash_url b64_url
+  clash_url="$(subscription_url "$SUB_PATH")"
+  b64_url="$(subscription_url "$SUB_B64_PATH")"
+  printf 'Clash/Mihomo:  %s\n' "$clash_url"
+  [ -n "${SUB_B64_PATH:-}" ] && printf '通用(base64):  %s\n' "$b64_url"
   echo
   echo "===== 一键导入深链(在装了客户端的设备上点开即可导入) ====="
-  local _cu="http://$SUB_HOST$SUB_PATH"
+  local _cu="$clash_url"
   printf 'Clash/Mihomo:  clash://install-config?url=%s&name=%s\n' \
     "$("$PY" -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$_cu")" \
     "$("$PY" -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$AIRPORT_NAME")"
   [ -n "${SUB_B64_PATH:-}" ] && printf 'Shadowrocket:  shadowrocket://add/sub://%s\n' \
-    "$("$PY" -c 'import base64,sys;print(base64.b64encode(sys.argv[1].encode()).decode())' "http://$SUB_HOST$SUB_B64_PATH")"
+    "$("$PY" -c 'import base64,sys;print(base64.b64encode(sys.argv[1].encode()).decode())' "$b64_url")"
   if ! command -v qrencode >/dev/null 2>&1; then
     echo "(装 qrencode 后这里会出二维码: apt install -y qrencode)"
   elif [ -n "${SUB_B64_PATH:-}" ]; then
     echo; echo "===== 通用订阅二维码(扫码导入 v2rayN/Shadowrocket) ====="
-    qrencode -t ANSIUTF8 "http://$SUB_HOST$SUB_B64_PATH"
+    qrencode -t ANSIUTF8 "$b64_url"
   else
     echo "(无通用订阅路径, 重跑 install 升级后即可生成二维码)"
   fi
@@ -1758,15 +1903,16 @@ do_links() {
 
 do_panel() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true; [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   [ -n "${PANEL_PATH:-}" ] || die "本安装无看板页, 重跑 install 升级后生成"
   mkdir -p "$WWW"; chmod 755 "$WWW"
   render_panel_html >"$WWW$PANEL_PATH"; chmod 644 "$WWW$PANEL_PATH"
-  ok "可视化看板页: http://$SUB_HOST$PANEL_PATH"
+  ok "可视化看板页: $(subscription_url "$PANEL_PATH")"
   echo "  浏览器打开即可看两种订阅 + 扫码导入 + 一键复制; 手机扫码最方便。"
   if [ -s "$PANEL_MAP" ]; then
     render_panel_login_html >"$WWW${PANEL_PATH%.html}-login.html"; chmod 644 "$WWW${PANEL_PATH%.html}-login.html"
@@ -1779,15 +1925,15 @@ do_panel() {
 # 给看板页加登录: 自定义好看登录页 + nginx 用 cookie==密码 服务端校验(真鉴权, 不是网页里的 JS 假门)。off 关闭。
 do_panel_pass() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
   [ -n "${PANEL_PATH:-}" ] || die "本安装无看板页, 先重跑 install 升级再设密码"
   command -v nginx >/dev/null 2>&1 || die "未检测到 nginx"
   # config_nginx 需要的派生变量(单独跑该函数时补齐)
   # 同 write_env: 不捏造到期日, 留空即 expire=0("无到期"), 也避免 panel-pass 顺手把假日期写进流量头
   EXPIRE_VALUE="${EXPIRE_AT:-}"
   SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
-  [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   local login_file="$WWW${PANEL_PATH%.html}-login.html"
   # 重渲染看板, 让"退出"按钮随登录开关即时出现/消失(render_panel_html 按 $PANEL_MAP 判断)
@@ -1820,7 +1966,7 @@ EOF
   config_nginx
   _repanel   # 看板加上"退出"按钮
   ok "看板页已加密码登录(自定义登录页 + nginx 服务端校验)。"
-  echo "  打开 http://$SUB_HOST$PANEL_PATH 会先跳到登录页, 输入你设的密码即可。"
+  echo "  打开 $(subscription_url "$PANEL_PATH") 会先跳到登录页, 输入你设的密码即可。"
   note "登录是 cookie==密码、nginx 服务端校验(密码只存 600 root 的 $PANEL_MAP, 不下发浏览器)。明文 HTTP 下 cookie 不加密(同网段可嗅探), 只挡'知道链接的人'; 要真加密走 HTTPS(CF Tunnel)。"
   note "无登录限速, 请用强密码。$PANEL_MAP / 登录页不随 backup 迁移, 换机后重跑 panel-pass。"
 }
@@ -1844,8 +1990,8 @@ do_admin() {
   [ -f "$SECRETS" ] || die "请先安装(bash install.sh)再开管理面板"
   command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
   command -v python3   >/dev/null 2>&1 || die "需要 python3"
-  # shellcheck disable=SC1090
-  . "$SECRETS" 2>/dev/null || true; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
 
   if [ "${1:-}" = "off" ]; then
     systemctl disable --now singbox-admin >/dev/null 2>&1 || true
@@ -1857,7 +2003,7 @@ do_admin() {
 
   [ -n "${SUB_HOST:-}" ] || { SOFT_DETECT=1 detect_net; SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"; }
   # token + 端口(复用已有 token, 避免每次换)
-  [ -f "$ADMIN_ENV" ] && . "$ADMIN_ENV" 2>/dev/null || true
+  if [ -f "$ADMIN_ENV" ]; then load_admin_env || die "管理面板状态文件格式非法: $ADMIN_ENV"; fi
   local token; token="${ADMIN_TOKEN:-$(openssl rand -hex 24)}"
   ( umask 077; printf 'ADMIN_TOKEN=%s\nADMIN_PORT=%s\n' "$token" "$ADMIN_PORT" >"$ADMIN_ENV" )
 
@@ -1935,13 +2081,14 @@ do_restore() {
   mkdir -p "$SB_DIR"
   tar xzf "$bf" -C / 2>/dev/null || die "解包失败(文件损坏?)"
   [ -f "$SECRETS" ] || die "备份里没有密钥文件, 无法恢复"
-  # 载入用户偏好(限额/到期/计费/HY2 进阶); 机器相关(IP/网卡/订阅host)清空让新机重新探测
-  # shellcheck disable=SC1090
-  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
+  # 载入用户偏好(限额/到期/计费/HY2 进阶); 机器相关(IP/网卡/订阅host)清空让新机重新探测。
+  # 状态文件只能按字面量解析，备份内的 KEY=VALUE 绝不能作为 root shell 执行。
+  if [ -f "$ENVFILE" ]; then load_node_env || die "备份中的运行参数文件格式非法: $ENVFILE"; fi
   INTERFACE=""; PUBLIC_IP=""; SUB_HOST=""
   # CF-Vless 隧道是跟机器走的(cloudflared+token), 备份只带了节点参数, 新机要重接
   [ -f "$CF_ENV" ] && note "CF-Vless 第5节点: 新机需重跑 'CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf' 重装 cloudflared 并接隧道, 否则该节点连不上。"
   ok "凭证已就位, 按新机重建(IP/网卡自动适配; 用域名的话加 DOMAIN= 重跑或重指 DNS)..."
+  local RESTORING=1
   do_install
 }
 
@@ -1997,8 +2144,10 @@ EOF
 
 do_status() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true; [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true; [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
+  if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
   local cf_svc=""; [ -f "$CF_ENV" ] && cf_svc="cloudflared"
   echo "===== 服务 ====="
   local s
@@ -2016,19 +2165,21 @@ do_status() {
   printf '  限额 %s GB | 计费 %s | 到期 %s\n' "${LIMIT_GB:-?}" "${COUNT_MODE:-?}" "${EXPIRE_AT:-?}"
   [ -n "$WARP_PRIVATE_KEY" ] && printf '  WARP 解锁分流: 已开 (OpenAI/Netflix/Disney 走 WARP; 关闭: install.sh warp off)\n'
   if [ -f /etc/systemd/system/singbox-admin.service ]; then
-    local ap=8088; [ -f "$ADMIN_ENV" ] && ap="$(. "$ADMIN_ENV" 2>/dev/null; echo "${ADMIN_PORT:-8088}")"
+    local ap=8088
+    if [ -f "$ADMIN_ENV" ]; then load_admin_env || die "管理面板状态文件格式非法: $ADMIN_ENV"; ap="${ADMIN_PORT:-8088}"; fi
     printf '  网页管理面板: %s (127.0.0.1:%s; 取访问方式: install.sh admin)\n' "$(systemctl is-active singbox-admin 2>/dev/null || echo inactive)" "$ap"
   fi
   # 同 doctor: 不带 Host 会命中默认 server 得到 404, 让健康机看起来像订阅坏了
-  curl -s -o /dev/null -H "Host: $SUB_HOST" -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
+  curl -s -o /dev/null -H "Host: $(url_host "$SUB_HOST")" -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
   echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
 }
 
 do_doctor() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS"; [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
-  [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true; [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
+  if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
   local issues=0
@@ -2092,12 +2243,12 @@ do_doctor() {
   # 8) 订阅可达
   # 必须带 Host: 订阅 server 绑的是 server_name $SUB_HOST, 不带 Host 会命中默认 server(return 404),
   # 于是每台完全正常的机器都会被报成"订阅本机不可达", 真故障反而被这条噪声淹没。
-  curl -fsS -o /dev/null -m 5 -H "Host: $SUB_HOST" "http://127.0.0.1$SUB_PATH" 2>/dev/null \
+  curl -fsS -o /dev/null -m 5 -H "Host: $(url_host "$SUB_HOST")" "http://127.0.0.1$SUB_PATH" 2>/dev/null \
     && P "订阅本机可达" \
     || F "订阅本机不可达: 看 nginx -t / $WWW 权限(若手改过 server_name, Host 不匹配也会 404)"
   if [ -n "${PUBLIC_IP:-}" ]; then
-    curl -fsS -o /dev/null -m 6 "http://$PUBLIC_IP$SUB_PATH" 2>/dev/null && P "订阅经公网 IP 可达" \
-      || W "订阅经公网 IP 不可达(可能是 hairpin 不支持, 不一定是真问题): 用手机流量/外部网络测 http://$SUB_HOST$SUB_PATH"
+    curl -fsS -o /dev/null -m 6 "http://$(url_host "$PUBLIC_IP")$SUB_PATH" 2>/dev/null && P "订阅经公网 IP 可达" \
+      || W "订阅经公网 IP 不可达(可能是 hairpin 不支持, 不一定是真问题): 用手机流量/外部网络测 $(subscription_url "$SUB_PATH")"
   fi
   # 9) 可选组件
   [ -f "$CF_ENV" ] && { [ "$(systemctl is-active cloudflared 2>/dev/null)" = active ] && P "cloudflared(CF-Vless) 运行中" || W "cloudflared 未运行: systemctl status cloudflared"; }
@@ -2136,9 +2287,8 @@ do_doctor() {
 do_set() {
   [ -f "$ENVFILE" ] || die "未检测到安装(缺 $ENVFILE)"
   [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / HY2_UP_MBPS / HY2_DOWN_MBPS)"
-  # shellcheck disable=SC1090
-  . "$SECRETS" 2>/dev/null || true
-  . "$ENVFILE"
+  if [ -f "$SECRETS" ]; then load_secrets || die "密钥文件格式非法: $SECRETS"; fi
+  load_node_env || die "运行参数文件格式非法: $ENVFILE"
   # 兼容旧 env(可能无 PUBLIC_IP/SUB_HOST): 回填后再让 write_env 重写, 否则会被清空
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
@@ -2181,21 +2331,24 @@ do_set() {
 do_update() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   log "更新 sing-box(官方脚本)..."
-  curl -fsSL https://sing-box.app/install.sh | sh || true
+  curl -fsSL https://sing-box.app/install.sh | sh || die "sing-box 更新失败(网络或官方脚本异常)"
   command -v sing-box >/dev/null 2>&1 || die "sing-box 安装/更新失败"
   ok "sing-box 版本: $(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
   if sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1; then
-    systemctl restart sing-box && ok "已重启 sing-box" || warn "重启失败, 看 systemctl status sing-box"
+    systemctl restart sing-box && ok "已重启 sing-box" || die "更新后 sing-box 重启失败, 看 systemctl status sing-box"
   else
-    warn "更新后配置校验未过, 未重启。请跑 sing-box check -c $SB_DIR/config.json 看详情"
+    die "更新后配置校验未过, 未重启。请跑 sing-box check -c $SB_DIR/config.json 看详情"
   fi
 }
 
 do_restart() {
-  systemctl restart sing-box 2>/dev/null && ok "sing-box 已重启" || warn "sing-box 重启失败"
-  systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-  ok "nginx 已重载"
-  if [ -f "$CF_ENV" ]; then systemctl restart cloudflared 2>/dev/null && ok "cloudflared 已重启" || warn "cloudflared 重启失败"; fi
+  local failed=0
+  if systemctl restart sing-box 2>/dev/null; then ok "sing-box 已重启"; else err "sing-box 重启失败"; failed=1; fi
+  if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then ok "nginx 已重载"; else err "nginx 重载失败"; failed=1; fi
+  if [ -f "$CF_ENV" ]; then
+    if systemctl restart cloudflared 2>/dev/null; then ok "cloudflared 已重启"; else err "cloudflared 重启失败"; failed=1; fi
+  fi
+  return "$failed"
 }
 
 do_menu() {
@@ -2264,7 +2417,7 @@ do_uninstall() {
     ok "已备份密钥/参数到 $bdir"
   fi
   systemctl disable --now sing-box >/dev/null 2>&1 || true
-  [ -f "$SECRETS" ] && . "$SECRETS" 2>/dev/null || true
+  if [ -f "$SECRETS" ] && ! load_secrets; then warn "密钥文件格式非法, 将按通配路径清理订阅/看板文件"; fi
   rm -f "$SB_DIR/config.json" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$SECRETS" 2>/dev/null || true
   rm -f "$ENVFILE" "$TRAFFIC_PY" "$CRON" "$NGINX_SNIPPET" "$NGINX_CONF" 2>/dev/null || true
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
@@ -2341,10 +2494,9 @@ cf_restore_service() {
 do_cf() {
   umask 077
   [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再加 CF-Vless"
-  # shellcheck disable=SC1090
-  . "$SECRETS"
-  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
-  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   CF_PORT="${CF_PORT:-28080}"
 
   if [ -z "${CF_TOKEN:-}" ] || [ -z "${CF_HOSTNAME:-}" ]; then
@@ -2486,12 +2638,21 @@ install_wgcf() {
   chmod 755 /usr/local/bin/wgcf
 }
 
+parse_wgcf_addresses() {
+  local profile="$1" addresses
+  # wgcf 当前会把 IPv4 与 IPv6 写在同一个 Address 行，以逗号分隔；先拆分再分别取值，
+  # 否则 sing-box 会收到一个含逗号的无效 address 字符串。
+  addresses="$(sed -n 's#^Address[[:space:]]*=[[:space:]]*##p' "$profile" | tr ',' '\n' | tr -d ' \r' || true)"
+  WARP_ADDR_V4="$(printf '%s\n' "$addresses" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | head -n1 || true)"
+  WARP_ADDR_V6="$(printf '%s\n' "$addresses" | grep -E '^[0-9A-Fa-f:]+/[0-9]+$' | head -n1 || true)"
+  [ -n "$WARP_ADDR_V4" ] && [ -n "$WARP_ADDR_V6" ]
+}
+
 do_warp() {
   [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再开 WARP 分流"
-  # shellcheck disable=SC1090
-  . "$SECRETS"
-  [ -f "$ENVFILE" ] && . "$ENVFILE" 2>/dev/null || true
-  [ -f "$CF_ENV" ]  && . "$CF_ENV"  2>/dev/null || true   # 保留已接入的 CF-Vless 节点
+  load_secrets || die "密钥文件格式非法: $SECRETS"
+  if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi   # 保留已接入的 CF-Vless 节点
   CF_PORT="${CF_PORT:-28080}"
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   detect_net
@@ -2519,8 +2680,7 @@ do_warp() {
 
   if [ -f "$WARP_ENV" ]; then
     log "复用已注册的 WARP 账号(避免重复注册被 Cloudflare 限流)..."
-    # shellcheck disable=SC1090
-    . "$WARP_ENV"
+    load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"
   else
     install_wgcf
     log "注册 Cloudflare WARP 账号(wgcf)..."
@@ -2535,10 +2695,7 @@ do_warp() {
     [ -f "$prof" ] || { rm -rf "$wd"; die "未生成 wgcf-profile.conf"; }
     # base64 私钥可能以 '=' 结尾, 不能用 -F= 切; 用 sed 去前缀
     WARP_PRIVATE_KEY="$(sed -n 's/^PrivateKey[[:space:]]*=[[:space:]]*//p' "$prof" | tr -d ' \r' | head -n1 || true)"
-    WARP_ADDR_V4="$(sed -n 's#^Address[[:space:]]*=[[:space:]]*##p' "$prof" | grep -E '^[0-9]+\.' | head -n1 | tr -d ' \r' || true)"
-    WARP_ADDR_V6="$(sed -n 's#^Address[[:space:]]*=[[:space:]]*##p' "$prof" | grep ':' | head -n1 | tr -d ' \r' || true)"
-    [ -n "$WARP_ADDR_V4" ] || WARP_ADDR_V4="172.16.0.2/32"
-    [ -n "$WARP_ADDR_V6" ] || WARP_ADDR_V6="2606:4700:110:8a36:df92:102a:9602:fa18/128"
+    parse_wgcf_addresses "$prof" || { rm -rf "$wd"; die "无法从 wgcf-profile.conf 解析 IPv4/IPv6 Address"; }
     WARP_RESERVED=""   # 单账号专用默认不带; 如解锁不生效再手动填
     rm -rf "$wd"
     ok "WARP 账号已注册"
@@ -2546,13 +2703,13 @@ do_warp() {
   [ -n "$WARP_PRIVATE_KEY" ] || die "WARP 私钥为空, 删 $WARP_ENV 后重试注册"
   # 站点优先级: 本次显式传入 > warp.env 记录 > 默认; 统一在此回写 warp.env(支持改站点后重跑)
   WARP_SITES="${req_sites:-${WARP_SITES:-$WARP_DEFAULT_SITES}}"
-  # 落盘前清洗成安全字符集(只留 小写字母/数字/逗号/连字符), 防引号等破坏 warp.env 的 source
+  # 落盘前清洗成安全字符集(只留 小写字母/数字/逗号/连字符), 保持状态文件可安全按字面量读取。
   WARP_SITES="$(printf '%s' "$WARP_SITES" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9,-')"
   [ -n "$WARP_SITES" ] || WARP_SITES="$WARP_DEFAULT_SITES"
 
   # 安全护栏: 渲染到临时文件 -> sing-box check 通过才替换正式 config, 失败保留原配置(节点不受影响)。
   # WARP_ENV 状态也等"校验+重启都成功"后再落盘: 否则校验失败(如 sing-box<1.12 不支持 wireguard endpoint)
-  # 却留下"已启用"状态文件, 会让后续 install/重启 source 它继续尝试启用 WARP 而反复失败。
+  # 却留下"已启用"状态文件, 会让后续 install/重启继续尝试启用 WARP 而反复失败。
   log "生成带 WARP 分流的配置并校验..."
   local tmpc; tmpc="$(mktemp)"
   render_singbox_config >"$tmpc"
@@ -2593,12 +2750,11 @@ do_install() {
   detect_net
   check_reality_sni   # best-effort 探测偷证书目标是否支持 TLS1.3+H2, 填错只提示
   gen_secrets
-  # shellcheck disable=SC1090
-  [ -f "$CF_ENV" ] && . "$CF_ENV" 2>/dev/null || true   # 已接入过 CF-Vless 则重装时保留
-  [ -f "$WARP_ENV" ] && . "$WARP_ENV" 2>/dev/null || true   # 已接入过 WARP 则重装/更新时保留分流
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi   # 已接入过 CF-Vless 则重装时保留
+  if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi   # 已接入过 WARP 则重装/更新时保留分流
   gen_cert
   config_sysctl   # 在 sing-box 启动前应用, 这样 HY2/QUIC 一启动就拿到大 UDP 缓冲
-  merge_env_defaults   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT/HY2 护栏等, 显式传入的仍优先
+  merge_env_defaults "${RESTORING:-0}"   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT/HY2 护栏等, 显式传入的仍优先
   write_env
   write_singbox_config
   write_subscription

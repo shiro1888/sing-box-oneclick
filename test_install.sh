@@ -412,7 +412,18 @@ out=$(LIMIT_GB=999 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./ins
 if [ "$out" = '999|max' ]; then
   echo "PASS  显式传入 env 优先于文件值(LIMIT_GB=999 覆盖, 其余仍沿用)"
 else echo "FAIL  显式 env 未优先: got '$out'"; fail=1; fi
-# c) detect_net 在纯 IPv6(ip -4 route get 失败)时不能被 set -e 静默打断, 要走到 die 提示
+# c) restore 必须保留新机探测到的网络值，不能将备份机器的 IP/订阅 Host/网卡写回。
+cat >"$MENV" <<'ENVEOF'
+LIMIT_GB=500
+INTERFACE=eth-old
+SUB_HOST=203.0.113.10
+PUBLIC_IP=203.0.113.10
+ENVEOF
+out=$(unset LIMIT_GB COUNT_MODE EXPIRE_AT HY2_UP_MBPS HY2_DOWN_MBPS; PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$MENV"'"; PUBLIC_IP=198.51.100.20; SUB_HOST=198.51.100.20; INTERFACE=eth-new; merge_env_defaults 1 >/dev/null 2>&1; echo "$LIMIT_GB|$PUBLIC_IP|$SUB_HOST|$INTERFACE"' 2>/dev/null)
+if [ "$out" = '500|198.51.100.20|198.51.100.20|eth-new' ]; then
+  echo "PASS  restore 保留新机 IP/订阅 Host/网卡，同时沿用用户参数"
+else echo "FAIL  restore 网络参数被旧备份覆盖: got '$out'"; fail=1; fi
+# d) detect_net 在纯 IPv6(ip -4 route get 失败)时不能被 set -e 静默打断, 要走到 die 提示
 #    unset PUBLIC_IP: 顶部 export 了 1.2.3.4, 不清掉 detect_net 会短路、测不到这条路径
 out=$(unset PUBLIC_IP INTERFACE; PYTHON="$PYTHON_BIN" bash -c '
   source ./install.sh >/dev/null 2>&1
@@ -563,14 +574,14 @@ else echo "FAIL  SS 密钥长度逻辑有问题: $out"; fail=1; fi
 
 echo
 echo "=== 4n) doctor/status 订阅探测必须带 Host 头(否则健康机误报) ==="
-# nginx 是双 server 结构: 默认 server(server_name _)一律 404, 订阅 server 绑 server_name $SUB_HOST。
+# nginx 是双 server 结构: 默认 server(server_name _)一律 404, 订阅 server 绑 IPv6-safe Host 值。
 # 不带 Host 的 curl 会命中默认 server 拿到 404, 让每台正常机器都报"订阅本机不可达"。
-if grep -q 'curl -fsS -o /dev/null -m 5 -H "Host: \$SUB_HOST" "http://127.0.0.1\$SUB_PATH"' install.sh; then
+if grep -q 'curl -fsS -o /dev/null -m 5 -H "Host: \$(url_host "\$SUB_HOST")" "http://127.0.0.1\$SUB_PATH"' install.sh; then
   echo "PASS  doctor 订阅探测带 Host 头"; else echo "FAIL  doctor 订阅探测缺 Host 头(健康机会误报不可达)"; fail=1; fi
-if grep -q 'curl -s -o /dev/null -H "Host: \$SUB_HOST"' install.sh; then
+if grep -q 'curl -s -o /dev/null -H "Host: \$(url_host "\$SUB_HOST")"' install.sh; then
   echo "PASS  status 订阅探测带 Host 头"; else echo "FAIL  status 订阅探测缺 Host 头"; fail=1; fi
-# 确认 nginx 确实是"默认 server 404 + 订阅 server 绑 SUB_HOST"这个结构(上面结论的前提)
-if grep -q 'server_name _;' install.sh && grep -q 'server_name \$SUB_HOST;' install.sh; then
+# 确认 nginx 确实是"默认 server 404 + 订阅 server 绑 IPv6-safe Host"这个结构(上面结论的前提)
+if grep -q 'server_name _;' install.sh && grep -q 'server_name \$sub_server_name;' install.sh; then
   echo "PASS  nginx 双 server 结构成立(默认404 + 订阅绑 SUB_HOST)"; else echo "FAIL  nginx server 结构与预期不符"; fail=1; fi
 
 echo
@@ -613,7 +624,7 @@ CF_PORT=28080
 CF_VLESS_UUID=11111111-1111-1111-1111-111111111111
 CF_WS_PATH=/w
 ' > "$TMP/old-cf.env"
-out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; . "'"$TMP"'/old-cf.env"; render_subscription_yaml' 2>/dev/null)
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; CF_ENV="'"$TMP"'/old-cf.env"; load_cf_env; render_subscription_yaml' 2>/dev/null)
 if printf '%s' "$out" | grep -q 'CF-Vless'; then
   echo "PASS  旧 cf.env 无 CF_VERIFIED 时按已验证处理(向后兼容)"; else echo "FAIL  升级会让老用户 CF 节点消失"; fail=1; fi
 
@@ -657,6 +668,64 @@ if printf '%s' "$out" | grep -q '^ipv6: false' && printf '%s' "$out" | grep -q '
    && ! printf '%s' "$out" | grep -q 'IP-CIDR6'; then
   echo "PASS  IPv4 机行为不变(ipv6:false + IP-CIDR/32 + 无 IPv6 规则)"
 else echo "FAIL  IPv4 默认行为被改动"; fail=1; fi
+
+# 订阅 URL 和 Host 必须使用 IPv6 方括号，否则 URL 语法无效且 nginx 命中默认 404 server。
+out=$(PUBLIC_IP=2001:db8::1 SUB_HOST=2001:db8::1 SUB_PATH=/sub.yaml PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; subscription_url')
+if [ "$out" = 'http://[2001:db8::1]/sub.yaml' ]; then
+  echo "PASS  IPv6 订阅 URL 使用方括号"
+else echo "FAIL  IPv6 订阅 URL 格式错误: $out"; fail=1; fi
+out=$(SUB_HOST=2001:db8::1 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; url_host "$SUB_HOST"')
+if [ "$out" = '[2001:db8::1]' ]; then
+  echo "PASS  IPv6 HTTP Host/server_name 使用方括号"
+else echo "FAIL  IPv6 Host 格式错误: $out"; fail=1; fi
+
+echo
+echo "=== 4s) 状态文件字面量解析 / WARP 地址拆分 / 失败状态 ==="
+# 状态文件曾被 source，备份或被篡改的文件能以 root 身份执行。合法旧格式仍需兼容。
+ST="$TMP/state-load"; rm -rf "$ST"; mkdir -p "$ST"
+cat >"$ST/secrets.env" <<'ENVEOF'
+HY2_PASSWORD=abc123
+ANYTLS_PASSWORD=def456
+VLESS_UUID=11111111-1111-1111-1111-111111111111
+REALITY_PRIVATE_KEY=private_key
+REALITY_PUBLIC_KEY=public_key
+REALITY_SHORT_ID=abcdef0123456789
+SUB_PATH=/sub.yaml
+SUB_B64_PATH=/sub.txt
+PANEL_PATH=/panel.html
+SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="
+OBFS_PASSWORD=obfs123
+ENVEOF
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SECRETS="'"$ST"'/secrets.env"; load_secrets; printf "%s|%s|%s" "$HY2_PASSWORD" "$SS_PASSWORD" "$PANEL_PATH"' 2>/dev/null)
+if [ "$out" = 'abc123|MTIzNDU2Nzg5MGFiY2RlZg==|/panel.html' ]; then
+  echo "PASS  合法旧 secrets 格式按字面量兼容读取"
+else echo "FAIL  合法 secrets 未正确读取: $out"; fail=1; fi
+printf 'HY2_PASSWORD=$(touch %s/pwned)\n' "$ST" > "$ST/malicious.env"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SECRETS="'"$ST"'/malicious.env"; load_secrets' >/dev/null 2>&1; then
+  echo "FAIL  恶意状态文件意外被接受"; fail=1
+elif [ -e "$ST/pwned" ]; then
+  echo "FAIL  恶意状态文件执行了 shell"; fail=1
+else echo "PASS  恶意状态文件被拒且不会执行 shell"; fi
+
+# wgcf 新版本会将两种地址写在同一 Address 行；提取后必须得到两个独立 CIDR。
+cat >"$ST/wgcf-profile.conf" <<'WGEOF'
+[Interface]
+PrivateKey = cHJpdmtleTEyMw==
+Address = 172.16.0.2/32, 2606:4700:110:8a36::2/128
+WGEOF
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; parse_wgcf_addresses "'"$ST"'/wgcf-profile.conf"; printf "%s|%s" "$WARP_ADDR_V4" "$WARP_ADDR_V6"' 2>/dev/null)
+if [ "$out" = '172.16.0.2/32|2606:4700:110:8a36::2/128' ]; then
+  echo "PASS  wgcf 单行双地址正确拆分为 IPv4/IPv6"
+else echo "FAIL  wgcf 单行地址拆分错误: $out"; fail=1; fi
+
+# update/restart 必须传播失败，而不是输出成功退出码 0。
+UT="$TMP/update-state"; rm -rf "$UT"; mkdir -p "$UT"; : > "$UT/secrets"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SECRETS="'"$UT"'/secrets"; curl(){ return 1; }; do_update' >/dev/null 2>&1; then
+  echo "FAIL  do_update 吞掉下载失败"; fail=1
+else echo "PASS  do_update 正确传播下载失败"; fi
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; CF_ENV="'"$UT"'/no-cf"; systemctl(){ return 1; }; do_restart' >/dev/null 2>&1; then
+  echo "FAIL  do_restart 吞掉服务失败"; fail=1
+else echo "PASS  do_restart 正确传播服务失败"; fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="
