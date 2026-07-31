@@ -13,7 +13,7 @@
 #  常用环境变量(可选,覆盖默认):
 #    LIMIT_GB=200            每月显示/限流额度
 #    COUNT_MODE=tx           计费方式 tx(默认,匹配多数商家)|max|rx+tx(仅真双向计费)
-#    EXPIRE_AT="..."         到期时间(默认安装日+365天)
+#    EXPIRE_AT="..."         到期时间(默认留空, 不显示到期)
 #    DOMAIN=node.example.com 订阅域名(留空=用公网IP,无需域名)
 #    AIRPORT_NAME=US-01     客户端订阅显示名
 #    PUBLIC_IP=1.2.3.4       手动指定公网IP(探测失败时)
@@ -30,7 +30,7 @@
 #    HY2_UP_MBPS=80 HY2_DOWN_MBPS=160  HY2 服务端带宽护栏(给套餐峰值留余量, 防压测打爆 UDP 队列)
 #
 #  可选第5节点 CF-Vless(大保底, 需先在 CF 后台建 Tunnel 拿 token+域名):
-#    CF_TOKEN=... CF_HOSTNAME=cf.example.com  bash install.sh cf
+#    CF_TOKEN=... CF_HOSTNAME=cf.example.com CF_NAME=CF-US-WS bash install.sh cf
 #
 #  适配: Debian/Ubuntu(完整) ; RHEL系 dnf/yum(尽力,nginx 默认站点可能需手动处理)
 # =============================================================================
@@ -55,11 +55,20 @@ PY="${PYTHON:-python3}"
 # 先记录"用户本次是否显式传入"这些运行参数, 再套默认值。
 # 用途: 重装(二次运行 install)时, 已存在的 $ENVFILE 里的值应作为默认被沿用,
 # 但本次命令行显式传的 env 仍要赢 —— 见 do_install 里的 merge_env_defaults。
-for _v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
-          HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP; do
+for _v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
+          HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI \
+          HY2_HOP_RANGE HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS \
+          ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
   eval "_CLI_$_v=\"\${$_v:-}\""
 done
 unset _v
+
+# CF 参数也要在载入 cf.env 前保留本次显式值；否则换 token/域名时会被旧状态静默覆盖。
+_CLI_CF_HOSTNAME="${CF_HOSTNAME:-}"
+_CLI_CF_PORT="${CF_PORT:-}"
+_CLI_CF_VLESS_UUID="${CF_VLESS_UUID:-}"
+_CLI_CF_WS_PATH="${CF_WS_PATH:-}"
+_CLI_CF_NAME="${CF_NAME:-}"
 
 LIMIT_GB="${LIMIT_GB:-200}"
 COUNT_MODE="${COUNT_MODE:-tx}"
@@ -71,6 +80,7 @@ VLESS_PORT="${VLESS_PORT:-443}"
 SS_PORT="${SS_PORT:-4435}"
 SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
 CF_PORT="${CF_PORT:-28080}"   # CF-Vless 本地 WS 入站端口(只听 127.0.0.1)
+CF_NAME="${CF_NAME:-CF-Vless}" # 客户端显示名；写入 cf.env，避免重生成订阅时退回默认名
 REALITY_SNI="${REALITY_SNI:-www.bing.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
@@ -98,16 +108,24 @@ ENVFILE=/etc/sing-box-node.env
 WWW=/var/www/html
 NGINX_SNIPPET=/etc/nginx/snippets/sub_headers.conf
 NGINX_CONF=/etc/nginx/conf.d/00-singbox-sub.conf
+NGINX_MAIN="${NGINX_MAIN:-/etc/nginx/nginx.conf}"
+NGINX_DEFAULT_SITE="${NGINX_DEFAULT_SITE:-/etc/nginx/sites-enabled/default}"
+NGINX_DEFAULT_CONF="${NGINX_DEFAULT_CONF:-/etc/nginx/conf.d/default.conf}"
+CF_SERVICE="${CF_SERVICE:-/etc/systemd/system/cloudflared.service}"
+RESTORE_ROOT="${RESTORE_ROOT:-/}"
+PORTHOP_SERVICE="${PORTHOP_SERVICE:-/etc/systemd/system/sing-box-porthop.service}"
 PANEL_MAP=/etc/nginx/.singbox_panel_map.conf   # 看板页登录: nginx map 片段(600 root, 校验 cookie==密码; 存在=已开登录; panel-pass 管理)
 TRAFFIC_PY=/usr/local/bin/traffic_limit.py
 CRON=/etc/cron.d/traffic_limit
 SYSCTL_CONF=/etc/sysctl.d/99-singbox.conf
+BBR_MODULE_CONF=/etc/modules-load.d/singbox-bbr.conf
 # SSH 加固(harden)相关路径 —— 提成变量只为可测试(测试里指到临时目录);
 # 生产默认值与原来的写死路径完全一致, 不要在真机上覆盖它们。
 AKEYS="${AKEYS:-/root/.ssh/authorized_keys}"
 SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
 SSHD_DROPIN_DIR="${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
 CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
+CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env" # 跨机恢复后的待重接 CF 参数；不会直接进订阅/接管服务
 WARP_ENV="$SB_DIR/warp.env"   # WARP 解锁状态(存在=已接入; 由 warp 子命令写入)
 # 管理面板(admin 子命令; 仅监听 127.0.0.1, 经 SSH 隧道访问, Token 鉴权)
 ADMIN_ENV="$SB_DIR/admin.env"           # ADMIN_TOKEN / ADMIN_PORT
@@ -130,6 +148,9 @@ OBFS_PASSWORD="${OBFS_PASSWORD:-}" # HY2 obfs 密码(非空=启用 obfs; gen_sec
 PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secrets 生成)
 # CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
+CF_TRANSACTION_PATHS=()
+RESTORE_TX_TARGETS=(); RESTORE_TX_STAGE=""; RESTORE_TX_BACKUP=""; RESTORE_TX_OLD_SINGBOX_ACTIVE=0; RESTORE_TX_OLD_NGINX_ACTIVE=0; RESTORE_TX_ROLLBACK_STARTED=0
+INSTALL_TX_PATHS=(); INSTALL_TX_BACKUP=""; INSTALL_TX_OLD_SUB_PATH=""; INSTALL_TX_OLD_B64_PATH=""; INSTALL_TX_OLD_PANEL_PATH=""; INSTALL_TX_OLD_SINGBOX_ACTIVE=0; INSTALL_TX_OLD_NGINX_ACTIVE=0; INSTALL_TX_OLD_PORTHOP_ACTIVE=0; INSTALL_TX_ROLLBACK_STARTED=0
 # 1=公网隧道已验证 101, 才允许把 CF-Vless 写进订阅。
 # 旧版 cf.env 没有这个字段, 默认按 1 处理以保持向后兼容。
 CF_VERIFIED="${CF_VERIFIED:-1}"
@@ -141,6 +162,189 @@ WARP_SITES="${WARP_SITES:-}"   # 走 WARP 的 geosite 列表(逗号分隔, 可�
 
 # ----------------------------------------------------------------- 工具
 need_root() { [ "$(id -u)" = 0 ] || die "请用 root 运行(sudo bash install.sh)"; }
+
+# 同一时刻只允许一个修改型管理动作，避免 install/cf/warp/set 并发时各自基于旧快照覆盖对方。
+with_maintenance_lock() {
+  if [ "${MAINT_LOCK_HELD:-0}" = 1 ] || ! command -v flock >/dev/null 2>&1; then
+    "$@"
+    return
+  fi
+  # 单独子 shell 持锁：无论动作成功、return 还是 die，进程退出都会关闭 FD 释放锁。
+  # 菜单是长生命周期进程，若 FD 留在父 shell，下一次维护会被上一次自己锁住。
+  (
+    set -eEuo pipefail
+    mkdir -p "$SB_DIR"
+    local lock_fd
+    exec {lock_fd}>"$SB_DIR/.maintenance.lock"
+    flock -w "${MAINT_LOCK_WAIT:-30}" "$lock_fd" || die "另一项维护操作仍在运行，请稍后重试"
+    MAINT_LOCK_HELD=1 "$@"
+  )
+}
+
+# 菜单动作必须在真正启用 errexit 的独立子 shell 中执行；不能用 `( action ) || true`，
+# 否则 Bash 会在整个 action 调用链里禁用 set -e，让失败后继续覆盖文件并误报成功。
+run_menu_action() {
+  local rc had_errexit=0
+  case $- in *e*) had_errexit=1 ;; esac
+  set +e
+  ( set -eEuo pipefail; "$@" )
+  rc=$?
+  if [ "$had_errexit" = 1 ]; then set -e; else set +e; fi
+  [ "$rc" -eq 0 ] || warn "操作失败（退出码 $rc），已返回菜单；请查看上方错误"
+  return 0
+}
+
+# 从 stdin 完整写入同目录临时文件，再原子替换目标；任何写入/chmod/mv 失败都保留旧文件。
+atomic_write_file() {
+  local target="$1" mode="${2:-600}" dir base tmp
+  dir="$(dirname "$target")"; base="$(basename "$target")"
+  mkdir -p "$dir" || return 1
+  tmp="$(mktemp "$dir/.${base}.tmp.XXXXXX")" || return 1
+  if ! cat >"$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+snapshot_files() {
+  local dir="$1" i=0 path
+  shift
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  for path in "$@"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      cp -a "$path" "$dir/$i" || return 1
+      printf '1' >"$dir/$i.exists"
+    else
+      printf '0' >"$dir/$i.exists"
+    fi
+    i=$((i+1))
+  done
+}
+
+restore_files() {
+  local dir="$1" i=0 path existed rc=0
+  shift
+  # 先完整校验快照元数据，再删除任何目标。否则备份目录已被前一次回滚删除时，
+  # 缺失的 *.exists 会被误当成 0，第二次回滚反而把刚恢复的正式文件全部删掉。
+  for path in "$@"; do
+    [ -f "$dir/$i.exists" ] || { err "回滚快照不完整，缺少: $dir/$i.exists"; return 1; }
+    existed="$(cat "$dir/$i.exists" 2>/dev/null)" || return 1
+    case "$existed" in
+      0) ;;
+      1) [ -e "$dir/$i" ] || [ -L "$dir/$i" ] || { err "回滚快照不完整，缺少: $dir/$i"; return 1; } ;;
+      *) err "回滚快照标记非法: $dir/$i.exists"; return 1 ;;
+    esac
+    i=$((i+1))
+  done
+  i=0
+  for path in "$@"; do
+    existed="$(cat "$dir/$i.exists")"
+    rm -rf "$path" || rc=1
+    if [ "$existed" = 1 ]; then
+      mkdir -p "$(dirname "$path")" || rc=1
+      cp -a "$dir/$i" "$path" || rc=1
+    fi
+    i=$((i+1))
+  done
+  return "$rc"
+}
+
+# 对一组已完整生成的文件做带回滚的提交。单个 rename 原子；整组若中途失败则恢复旧快照。
+publish_files_transaction() {
+  [ $(( $# % 2 )) -eq 0 ] || return 1
+  local backup i rc=0
+  local -a sources=() targets=()
+  while [ "$#" -gt 0 ]; do
+    sources+=("$1"); targets+=("$2"); shift 2
+  done
+  mkdir -p "$(dirname "${targets[0]}")" || return 1
+  backup="$(mktemp -d "$(dirname "${targets[0]}")/.publish-backup.XXXXXX")" || return 1
+  snapshot_files "$backup" "${targets[@]}" || { rm -rf "$backup"; return 1; }
+
+  # 提交窗口很短；暂时屏蔽可捕获信号，避免只切换了半组文件。SIGKILL/掉电仍靠下次校验修复。
+  trap '' HUP INT TERM
+  for ((i=0; i<${#sources[@]}; i++)); do
+    if [ "${sources[$i]}" = - ]; then
+      if ! rm -f "${targets[$i]}"; then rc=1; break; fi
+    elif ! mv -f "${sources[$i]}" "${targets[$i]}"; then
+      rc=1; break
+    fi
+  done
+  if [ "$rc" -ne 0 ]; then
+    if ! restore_files "$backup" "${targets[@]}"; then
+      err "发布失败且旧文件回滚不完整，备份保留在: $backup"
+      trap - HUP INT TERM
+      return 1
+    fi
+  fi
+  trap - HUP INT TERM
+  rm -rf "$backup"
+  return "$rc"
+}
+
+state_has_key() {
+  local key="$1" file="${2:-$ENVFILE}"
+  [ -f "$file" ] && grep -qE "^${key}=" "$file"
+}
+
+# 老版本没有持久化端口/SNI/NODE_ADDR/订阅名。首次升级时从现有订阅和看板回填，
+# 避免单独运行 panel/set 时拿默认值重生成出与真实服务不一致的链接。
+hydrate_legacy_runtime_state() {
+  [ -n "${PUBLIC_IP:-}" ] || return 0
+  NODE_ADDR="${NODE_ADDR:-$PUBLIC_IP}"
+  if [ -z "${DOMAIN:-}" ] && [ -n "${SUB_HOST:-}" ] && [ "$SUB_HOST" != "$PUBLIC_IP" ]; then DOMAIN="$SUB_HOST"; fi
+  [ -n "${PANEL_PATH:-}" ] || return 0
+
+  local yaml="$WWW$SUB_PATH" panel="$WWW$PANEL_PATH" key value cli
+  while IFS='=' read -r key value; do
+    [ -n "$key" ] || continue
+    eval "cli=\${_CLI_$key:-}"
+    state_has_key "$key" && continue
+    [ -n "$cli" ] && continue
+    case "$key" in
+      AIRPORT_NAME|NODE_ADDR|HY2_PORT|ANYTLS_PORT|VLESS_PORT|SS_PORT|SS_METHOD|REALITY_SNI|TLS_SNI)
+        [ -n "$value" ] && printf -v "$key" '%s' "$value"
+        ;;
+    esac
+  done < <("$PY" - "$yaml" "$panel" <<'PY' 2>/dev/null || true
+import html
+import re
+import sys
+from pathlib import Path
+
+yaml_path, panel_path = map(Path, sys.argv[1:])
+if yaml_path.exists():
+    text = yaml_path.read_text(encoding="utf-8", errors="ignore")
+    blocks = {}
+    for m in re.finditer(r'^  - name:\s*["\']?([^"\'\n]+)["\']?\s*\n(.*?)(?=^  - name:|^proxy-groups:)', text, re.M | re.S):
+        fields = dict(re.findall(r'^\s{4}([A-Za-z0-9_-]+):\s*["\']?([^"\'\n]+)', m.group(2), re.M))
+        blocks[m.group(1).strip()] = fields
+    direct = next((blocks.get(n, {}).get("server", "") for n in ("Hysteria2", "AnyTLS", "Vless", "SS2022") if blocks.get(n, {}).get("server")), "")
+    values = {
+        "NODE_ADDR": direct,
+        "HY2_PORT": blocks.get("Hysteria2", {}).get("port", ""),
+        "ANYTLS_PORT": blocks.get("AnyTLS", {}).get("port", ""),
+        "VLESS_PORT": blocks.get("Vless", {}).get("port", ""),
+        "SS_PORT": blocks.get("SS2022", {}).get("port", ""),
+        "SS_METHOD": blocks.get("SS2022", {}).get("cipher", ""),
+        "REALITY_SNI": blocks.get("Vless", {}).get("servername", ""),
+        "TLS_SNI": blocks.get("Hysteria2", {}).get("sni", "") or blocks.get("AnyTLS", {}).get("sni", ""),
+    }
+    for key, value in values.items():
+        if value:
+            print(f"{key}={value.strip()}")
+if panel_path.exists():
+    text = panel_path.read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"<title>(.*?)</title>", text, re.S)
+    if m:
+        title = html.unescape(m.group(1)).strip().rsplit(" ", 1)[0]
+        if title:
+            print(f"AIRPORT_NAME={title}")
+PY
+  )
+  case "$PUBLIC_IP" in *:*) IS_IPV6=1 ;; *) IS_IPV6=0 ;; esac
+}
 
 ver_ge() { # ver_ge A B  -> A >= B ?
   [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
@@ -197,7 +401,9 @@ install_deps() {
     apt)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
-      apt-get install -y curl wget tar jq nginx vnstat openssl cron python3 iproute2 ca-certificates ufw qrencode
+      local apt_packages=(curl wget tar jq nginx vnstat openssl cron python3 iproute2 ca-certificates qrencode)
+      [ "$ENABLE_UFW" = 1 ] && apt_packages+=(ufw)
+      apt-get install -y "${apt_packages[@]}"
       ;;
     dnf|yum)
       # vnstat / jq 在 RHEL 系常在 EPEL(+CRB), 先尝试启用, 否则流量统计会装不上
@@ -289,6 +495,30 @@ url_host() {
   esac
 }
 
+# 节点连接地址只能是 IPv4、IPv6 字面量或普通 DNS 名。渲染前统一校验，避免维护命令
+# 误把 shell 分隔符/占位符写进全部订阅，导致服务端正常但客户端导入后四条直连节点全坏。
+valid_node_address() {
+  local value="${1:-}"
+  [ -n "$value" ] || return 1
+  "$PY" - "$value" <<'PY' >/dev/null 2>&1
+import ipaddress
+import re
+import sys
+
+value = sys.argv[1]
+try:
+    ipaddress.ip_address(value)
+except ValueError:
+    if (len(value) > 253 or not re.fullmatch(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", value)):
+        raise SystemExit(1)
+PY
+}
+
+require_node_address() {
+  local value="${NODE_ADDR:-${PUBLIC_IP:-}}"
+  valid_node_address "$value" || { err "节点连接地址非法，拒绝生成订阅: '${value:-空}'"; return 1; }
+}
+
 subscription_url() {
   local path="${1:-$SUB_PATH}"
   printf 'http://%s%s' "$(url_host "$SUB_HOST")" "$path"
@@ -343,8 +573,11 @@ valid_state_value() {
     COUNT_MODE)
       case "$value" in rx+tx|tx|max) return 0 ;; esac; return 1
       ;;
-    SUB_HOST)
+    SUB_HOST|NODE_ADDR)
       [[ "$value" =~ ^[A-Za-z0-9:.-]+$ ]]
+      ;;
+    DOMAIN)
+      [[ -z "$value" || "$value" =~ ^[A-Za-z0-9.-]+$ ]]
       ;;
     PUBLIC_IP)
       [[ "$value" =~ ^[0-9A-Fa-f:.]+$ ]]
@@ -352,14 +585,23 @@ valid_state_value() {
     HY2_HOP_RANGE)
       [[ -z "$value" || "$value" =~ ^[0-9]+-[0-9]+$ ]]
       ;;
-    HY2_UP|HY2_DOWN|HY2_UP_MBPS|HY2_DOWN_MBPS|CF_PORT|ADMIN_PORT)
+    HY2_PORT|ANYTLS_PORT|VLESS_PORT|SS_PORT|HY2_UP|HY2_DOWN|HY2_UP_MBPS|HY2_DOWN_MBPS|CF_PORT|ADMIN_PORT)
       [[ -z "$value" || "$value" =~ ^[0-9]+$ ]]
       ;;
-    ENABLE_BLOCK_BT|ENABLE_BLOCK_ADS|ENABLE_HY2|SS_UDP|CF_VERIFIED)
+    ENABLE_BLOCK_BT|ENABLE_BLOCK_ADS|ENABLE_HY2|ENABLE_OBFS|SS_UDP|CF_VERIFIED)
       [[ "$value" = 0 || "$value" = 1 ]]
+      ;;
+    AIRPORT_NAME)
+      [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *"\""* && "$value" != *"'"* && "$value" != *\\* ]]
+      ;;
+    SS_METHOD|REALITY_SNI|TLS_SNI)
+      [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]]
       ;;
     CF_HOSTNAME)
       [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]]
+      ;;
+    CF_NAME)
+      [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]
       ;;
     CF_WS_PATH)
       [[ "$value" =~ ^/[A-Za-z0-9/_.-]*$ ]]
@@ -416,12 +658,17 @@ load_secrets() {
 }
 
 load_node_env() {
-  load_state_file "$ENVFILE" LIMIT_GB EXPIRE_AT INTERFACE COUNT_MODE SUB_HOST PUBLIC_IP HY2_HOP_RANGE \
-    HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP
+  load_state_file "$ENVFILE" LIMIT_GB EXPIRE_AT INTERFACE COUNT_MODE SUB_HOST PUBLIC_IP DOMAIN AIRPORT_NAME NODE_ADDR \
+    HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI HY2_HOP_RANGE \
+    HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP
 }
 
 load_cf_env() {
-  load_state_file "$CF_ENV" CF_HOSTNAME CF_PORT CF_VLESS_UUID CF_WS_PATH CF_VERIFIED
+  load_state_file "$CF_ENV" CF_HOSTNAME CF_PORT CF_VLESS_UUID CF_WS_PATH CF_VERIFIED CF_NAME
+}
+
+load_cf_pending_env() {
+  load_state_file "$CF_PENDING_ENV" CF_HOSTNAME CF_PORT CF_VLESS_UUID CF_WS_PATH CF_NAME
 }
 
 load_warp_env() {
@@ -439,14 +686,12 @@ gen_secrets() {
     load_secrets || die "密钥文件格式非法, 为保护现有节点拒绝继续: $SECRETS"
     if [ -z "${SS_PASSWORD:-}" ]; then   # 旧版安装无 SS2022 密钥, 升级时补一个(不影响其它节点)
       SS_PASSWORD="$(gen_ss_password)"
-      printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
       log "已为升级补充 SS2022 密钥"
     fi
     # ENABLE_OBFS=0 要能在已装机器上真的关掉 obfs。渲染只看 OBFS_PASSWORD 是否为空,
     # 而复用分支以前从不清它, 于是"装过一次就永远关不掉"(清洗敏感机想减少 UDP 特征时会踩)。
     if [ "$ENABLE_OBFS" != 1 ] && [ -n "${OBFS_PASSWORD:-}" ]; then
       OBFS_PASSWORD=""
-      sed -i '/^OBFS_PASSWORD=/d' "$SECRETS"
       warn "ENABLE_OBFS=0: 已关闭 HY2 salamander 混淆(清除 OBFS_PASSWORD)"
       note "HY2 混淆已关闭, 客户端需重新拉取订阅, 否则仍按旧的 obfs 参数连接会失败。"
     fi
@@ -455,24 +700,20 @@ gen_secrets() {
       # 用户改了 SS_METHOD 重跑时, 旧密钥长度对不上会让 sing-box check 直接失败,
       # 这里按新方法重新生成一条并覆盖写回, 只影响 SS2022 一条节点。
       SS_PASSWORD="$(gen_ss_password)"
-      sed -i '/^SS_PASSWORD=/d' "$SECRETS"
-      printf 'SS_PASSWORD="%s"\n' "$SS_PASSWORD" >>"$SECRETS"
       warn "SS_METHOD 改为 $SS_METHOD, 密钥长度需随之变化: 已重新生成 SS2022 密钥"
       note "SS2022 密钥已因加密方法变更而更新, 请重新拉取订阅(其它协议不受影响)。"
     fi
     if [ -z "${SUB_B64_PATH:-}" ]; then  # 旧版无通用订阅路径, 升级时补一个
       SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
-      printf 'SUB_B64_PATH=%s\n' "$SUB_B64_PATH" >>"$SECRETS"
     fi
     if [ -z "${PANEL_PATH:-}" ]; then    # 旧版无看板页, 升级时补一个
       PANEL_PATH="/panel-$(openssl rand -hex 8).html"
-      printf 'PANEL_PATH=%s\n' "$PANEL_PATH" >>"$SECRETS"
     fi
     if [ -z "${OBFS_PASSWORD:-}" ] && [ "$ENABLE_OBFS" = 1 ]; then  # 升级开启 HY2 obfs
       OBFS_PASSWORD="$(openssl rand -hex 12)"
-      printf 'OBFS_PASSWORD=%s\n' "$OBFS_PASSWORD" >>"$SECRETS"
       log "已为升级补充 HY2 obfs 密码"
     fi
+    write_secrets || die "更新密钥文件失败，已保留旧文件: $SECRETS"
     return
   fi
   log "生成密钥与随机参数..."
@@ -488,8 +729,12 @@ gen_secrets() {
   PANEL_PATH="/panel-$(openssl rand -hex 8).html"
   SS_PASSWORD="$(gen_ss_password)"
   [ "$ENABLE_OBFS" = 1 ] && OBFS_PASSWORD="$(openssl rand -hex 12)"
-  ( umask 077
-    cat >"$SECRETS" <<EOF
+  write_secrets || die "写入密钥文件失败: $SECRETS"
+  ok "密钥已生成并保存到 $SECRETS (600)"
+}
+
+write_secrets() {
+  atomic_write_file "$SECRETS" 600 <<EOF
 HY2_PASSWORD=$HY2_PASSWORD
 ANYTLS_PASSWORD=$ANYTLS_PASSWORD
 VLESS_UUID=$VLESS_UUID
@@ -502,9 +747,6 @@ PANEL_PATH=$PANEL_PATH
 SS_PASSWORD="$SS_PASSWORD"
 OBFS_PASSWORD=$OBFS_PASSWORD
 EOF
-  )
-  chmod 600 "$SECRETS"
-  ok "密钥已生成并保存到 $SECRETS (600)"
 }
 
 gen_cert() {
@@ -544,15 +786,18 @@ check_reality_sni() {
 # HY2 带宽护栏(up/down_mbps)被清空 —— 静默丢掉用户 set 过的配置。
 merge_env_defaults() {
   [ -f "$ENVFILE" ] || return 0
-  local restoring="${1:-0}" v cli current_public="$PUBLIC_IP" current_host="$SUB_HOST" current_interface="$INTERFACE"
+  local restoring="${1:-0}" v cli current_public="$PUBLIC_IP" current_host="$SUB_HOST" current_interface="$INTERFACE" current_node="$NODE_ADDR" current_domain="$DOMAIN"
   load_node_env || die "运行参数文件格式非法, 为保护现有节点拒绝继续: $ENVFILE"
   # 常规重装沿用原来的订阅 Host/IP 行为；只有跨机 restore 才必须保留新机探测结果，
   # 不能让备份机器的 IP、订阅 Host 或网卡覆盖新机。
   if [ "$restoring" = 1 ]; then
     PUBLIC_IP="$current_public"; SUB_HOST="$current_host"; INTERFACE="$current_interface"
+    DOMAIN="$current_domain"; NODE_ADDR="${current_node:-$current_public}"
   fi
-  for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE HY2_HOP_RANGE HY2_UP HY2_DOWN \
-            HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 SS_UDP; do
+  for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
+            HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI \
+            HY2_HOP_RANGE HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS \
+            ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
     eval "cli=\"\${_CLI_$v:-}\""
     [ -n "$cli" ] && printf -v "$v" '%s' "$cli"  # 本次显式传的赢回来
   done
@@ -566,7 +811,7 @@ write_env() {
   # 留空 -> 流量头 expire=0, 客户端普遍视为"无到期", 比一个编出来的日期诚实。
   EXPIRE_VALUE="${EXPIRE_AT:-}"   # 单一来源, config_nginx 复用, 不再二次 grep
   [ -n "$EXPIRE_VALUE" ] || note "未设置 EXPIRE_AT: 订阅不显示到期(expire=0)。要显示续费日请用: bash install.sh set EXPIRE_AT='2026-12-31 23:59:59 +0800'"
-  cat >"$ENVFILE" <<EOF
+  atomic_write_file "$ENVFILE" 600 <<EOF || die "写入运行参数失败，已保留旧文件: $ENVFILE"
 # 由 install.sh 生成 —— 运行参数单一来源
 LIMIT_GB=$LIMIT_GB
 EXPIRE_AT="$EXPIRE_VALUE"
@@ -574,6 +819,16 @@ INTERFACE=$INTERFACE
 COUNT_MODE=$COUNT_MODE
 SUB_HOST="$SUB_HOST"
 PUBLIC_IP="$PUBLIC_IP"
+DOMAIN="$DOMAIN"
+AIRPORT_NAME="$AIRPORT_NAME"
+NODE_ADDR="$NODE_ADDR"
+HY2_PORT=$HY2_PORT
+ANYTLS_PORT=$ANYTLS_PORT
+VLESS_PORT=$VLESS_PORT
+SS_PORT=$SS_PORT
+SS_METHOD=$SS_METHOD
+REALITY_SNI=$REALITY_SNI
+TLS_SNI=$TLS_SNI
 HY2_HOP_RANGE=$HY2_HOP_RANGE
 HY2_UP=$HY2_UP
 HY2_DOWN=$HY2_DOWN
@@ -582,9 +837,9 @@ HY2_DOWN_MBPS=$HY2_DOWN_MBPS
 ENABLE_BLOCK_BT=$ENABLE_BLOCK_BT
 ENABLE_BLOCK_ADS=$ENABLE_BLOCK_ADS
 ENABLE_HY2=$ENABLE_HY2
+ENABLE_OBFS=$ENABLE_OBFS
 SS_UDP=$SS_UDP
 EOF
-  chmod 600 "$ENVFILE"
 }
 
 # ---- 渲染函数(纯输出, 便于测试) -------------------------------------------
@@ -735,13 +990,14 @@ JSON
 }
 
 render_subscription_yaml() {
+  require_node_address || return 1
   ANYTLS_OK="$ANYTLS_OK" PUBLIC_IP="$PUBLIC_IP" DOMAIN="$DOMAIN" \
   HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" VLESS_PORT="$VLESS_PORT" \
   HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" VLESS_UUID="$VLESS_UUID" \
   REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
   SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
-  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" CF_NAME="$CF_NAME" \
   CF_VERIFIED="$CF_VERIFIED" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   ENABLE_HY2="$ENABLE_HY2" SS_UDP="$SS_UDP" \
@@ -811,9 +1067,10 @@ proxies.append(f'''  - name: "SS2022"
 
 cf_host = os.environ.get("CF_HOSTNAME", "")
 cf_uuid = os.environ.get("CF_VLESS_UUID", "")
+cf_name = os.environ.get("CF_NAME") or "CF-Vless"
 cf_on = bool(cf_host and cf_uuid) and (os.environ.get("CF_VERIFIED") or "1") == "1"
 if cf_on:
-    proxies.append(f'''  - name: "CF-Vless"
+    proxies.append(f'''  - name: "{cf_name}"
     type: vless
     server: {cf_host}
     port: 443
@@ -828,7 +1085,7 @@ if cf_on:
       headers:
         Host: {cf_host}''')
 
-names = (["Hysteria2"] if hy2_on else []) + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"] + (["CF-Vless"] if cf_on else [])
+names = (["Hysteria2"] if hy2_on else []) + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"] + ([cf_name] if cf_on else [])
 grp = "\n".join(f'      - "{n}"' for n in names)
 
 rules = []
@@ -911,13 +1168,14 @@ PY
 
 # 各节点的分享链接(vless:// hysteria2:// anytls:// ss://), 一行一条; 通用订阅就是它的 base64
 render_share_links() {
+  require_node_address || return 1
   ANYTLS_OK="$ANYTLS_OK" PUBLIC_IP="$PUBLIC_IP" \
   HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" VLESS_PORT="$VLESS_PORT" SS_PORT="$SS_PORT" \
   HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" VLESS_UUID="$VLESS_UUID" \
   SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
   REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
   REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
-  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" \
+  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" CF_NAME="$CF_NAME" \
   CF_VERIFIED="$CF_VERIFIED" \
   OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
   ENABLE_HY2="$ENABLE_HY2" \
@@ -956,7 +1214,7 @@ if (os.environ.get("CF_VERIFIED") or "1") != "1":
 if cfh and cfu:
     cq = u.urlencode({'encryption':'none','security':'tls','sni':cfh,'fp':'chrome',
                       'type':'ws','host':cfh,'path':os.environ['CF_WS_PATH']})
-    out.append(f"vless://{cfu}@{cfh}:443?{cq}#{q('CF-Vless')}")
+    out.append(f"vless://{cfu}@{cfh}:443?{cq}#{q(os.environ.get('CF_NAME') or 'CF-Vless')}")
 import sys
 sys.stdout.write("\n".join(out) + "\n")
 PY
@@ -975,14 +1233,15 @@ render_panel_html() {
   fi
   # 每节点分享链接 + 各自二维码(服务端 qrencode 生成); 用 \t 分隔 名字\t链接\t二维码base64, \n 分隔多节点
   # 进程替换 < <(...) 而非管道: 管道会开子shell 导致 node_data 丢失
-  local node_data="" link nm qr1
+  local node_data="" link nm qr1 links_output
+  links_output="$(render_share_links)" || return 1
   while IFS= read -r link; do
     [ -n "$link" ] || continue
     nm="${link##*#}"          # # 后是 URL 编码的节点名
     qr1=""
     command -v qrencode >/dev/null 2>&1 && qr1="$(printf '%s' "$link" | qrencode -t PNG -o - 2>/dev/null | base64 -w0 || true)"
     node_data="${node_data}${nm}"$'\t'"${link}"$'\t'"${qr1}"$'\n'
-  done < <(render_share_links)
+  done <<<"$links_output"
   local login_path=""; [ -s "$PANEL_MAP" ] && login_path="${PANEL_PATH%.html}-login.html"   # 开了登录才在看板显示"退出"
   AIRPORT_NAME="$AIRPORT_NAME" CLASH_URL="$clash_url" B64_URL="$b64_url" \
   QR_CLASH="$qr_clash" QR_B64="$qr_b64" NODE_DATA="$node_data" \
@@ -1001,7 +1260,7 @@ clash_js = json.dumps(clash_raw)   # 安全的 JS 字符串字面量, 供 fetch 
 limit_gb = e(os.environ.get("LIMIT_GB", "") or "—")
 login_path = os.environ.get("PANEL_LOGIN", "")   # 非空=已开登录, 显示"退出"按钮(清 cookie 回登录页)
 logout_btn = '<button class="tg" onclick="lo()">退出</button>' if login_path else ''
-logout_js = f"function lo(){{document.cookie='sbauth=; path=/; max-age=0; samesite=lax';document.body.style.opacity='0';setTimeout(function(){{location.replace({json.dumps(login_path)})}},220);}}" if login_path else ""
+logout_js = f"function lo(){{document.cookie='sbauth=; path=/; max-age=0; samesite=lax'+(location.protocol==='https:'?'; secure':'');document.body.style.opacity='0';setTimeout(function(){{location.replace({json.dumps(login_path)})}},220);}}" if login_path else ""
 try:
     _exp = os.environ.get("EXP", "")
     exp_disp = e(datetime.datetime.strptime(_exp, "%Y-%m-%d %H:%M:%S %z").strftime("%Y-%m-%d")) if _exp else "—"
@@ -1167,7 +1426,7 @@ button:hover{{transform:translateY(-1px);filter:brightness(1.06)}}button:active{
 <script>
 var P={panel};
 window.addEventListener('pageshow',function(e){{if(e.persisted)document.body.classList.remove('leaving')}});  // bfcache 返回时清除淡出态, 别卡在透明
-function go(){{var v=document.getElementById('pw').value;if(!v)return;try{{sessionStorage.setItem('sbt','1')}}catch(e){{}}document.cookie='sbauth='+v+'; path=/; max-age=604800; samesite=lax';document.body.classList.add('leaving');setTimeout(function(){{location.replace(P)}},200);}}
+function go(){{var v=document.getElementById('pw').value;if(!v)return;try{{sessionStorage.setItem('sbt','1')}}catch(e){{}}document.cookie='sbauth='+v+'; path=/; max-age=604800; samesite=lax'+(location.protocol==='https:'?'; secure':'');document.body.classList.add('leaving');setTimeout(function(){{location.replace(P)}},200);}}
 document.getElementById('go').onclick=go;
 document.getElementById('pw').addEventListener('keydown',function(e){{if(e.key==='Enter')go();}});
 try{{if(sessionStorage.getItem('sbt')){{sessionStorage.removeItem('sbt');document.getElementById('err').style.display='block';document.getElementById('pw').focus();}}}}catch(e){{}}
@@ -1396,10 +1655,10 @@ write_singbox_config() {
   systemctl enable sing-box >/dev/null 2>&1 || true
   # 重装已有节点时也走回滚护栏: 先临时文件 sing-box check, 再经 apply_singbox_config 落地;
   # restart 失败时回滚旧配置, 不把原本可用的节点丢在新配置/停服状态(首次安装无旧配置可回滚)。
-  local tmpc; tmpc="$(mktemp)"
-  render_singbox_config >"$tmpc"
-  sing-box check -c "$tmpc" || { rm -f "$tmpc"; die "sing-box 配置校验失败(请把上面报错贴出来)"; }
-  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; die "sing-box 重启失败, 已回滚到旧配置(首次安装则无旧配置); 看 systemctl status sing-box"; }
+  local tmpc; tmpc="$(mktemp)" || return 1
+  render_singbox_config >"$tmpc" || { rm -f "$tmpc"; return 1; }
+  sing-box check -c "$tmpc" || { rm -f "$tmpc"; return 1; }
+  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; return 1; }
   rm -f "$tmpc"
   ok "sing-box 已启动"
 }
@@ -1408,26 +1667,149 @@ write_subscription() {
   log "生成 Clash/Mihomo 订阅 + 通用(base64)订阅..."
   mkdir -p "$WWW"
   chmod 755 "$WWW"   # 防止 umask 077 下新建的 web 根变 700, 导致 nginx(www-data) 无法遍历→订阅 403
-  render_subscription_yaml >"$WWW$SUB_PATH"
-  chmod 644 "$WWW$SUB_PATH"
-  if [ -n "${SUB_B64_PATH:-}" ]; then   # 通用订阅: 各节点分享链接的 base64, 供 v2rayN/Shadowrocket/NekoBox 等
-    render_share_links | base64 -w0 >"$WWW$SUB_B64_PATH"
-    chmod 644 "$WWW$SUB_B64_PATH"
+  require_node_address || return 1
+
+  # 所有产物先写同目录临时文件。只有整组渲染和校验都成功才逐个原子替换；任何一步失败时，
+  # 已发布订阅保持原样，不会因 shell 重定向先截断目标文件而把可用节点变成空/坏配置。
+  local tmp_yaml="" tmp_b64="" tmp_panel="" tmp_login=""
+  local out_yaml="$WWW$SUB_PATH" out_b64="$WWW$SUB_B64_PATH" out_panel="$WWW$PANEL_PATH"
+  local out_login="$WWW${PANEL_PATH%.html}-login.html"
+  local -a publish_pairs=()
+  _cleanup_subscription_tmp() { rm -f "$tmp_yaml" "$tmp_b64" "$tmp_panel" "$tmp_login"; }
+  tmp_yaml="$(mktemp "$WWW/.singbox-sub-yaml.XXXXXX")" || return 1
+  if ! render_subscription_yaml >"$tmp_yaml"; then _cleanup_subscription_tmp; return 1; fi
+  if [ -n "${SUB_B64_PATH:-}" ]; then
+    tmp_b64="$(mktemp "$WWW/.singbox-sub-b64.XXXXXX")" || { _cleanup_subscription_tmp; return 1; }
+    if ! render_share_links | base64 -w0 >"$tmp_b64"; then _cleanup_subscription_tmp; return 1; fi
   fi
-  if [ -n "${PANEL_PATH:-}" ]; then     # 可视化看板页(订阅+二维码+节点)
-    render_panel_html >"$WWW$PANEL_PATH"
-    chmod 644 "$WWW$PANEL_PATH"
-    # 开了登录就同步刷新登录页(重装/换 CF 后保持在位且最新; 失败不致命)
-    [ -s "$PANEL_MAP" ] && { render_panel_login_html >"$WWW${PANEL_PATH%.html}-login.html" 2>/dev/null && chmod 644 "$WWW${PANEL_PATH%.html}-login.html" || true; }
+  if [ -n "${PANEL_PATH:-}" ]; then
+    tmp_panel="$(mktemp "$WWW/.singbox-panel.XXXXXX")" || { _cleanup_subscription_tmp; return 1; }
+    if ! render_panel_html >"$tmp_panel"; then _cleanup_subscription_tmp; return 1; fi
+    if [ -s "$PANEL_MAP" ]; then
+      tmp_login="$(mktemp "$WWW/.singbox-panel-login.XXXXXX")" || { _cleanup_subscription_tmp; return 1; }
+      if ! render_panel_login_html >"$tmp_login"; then _cleanup_subscription_tmp; return 1; fi
+    fi
   fi
+
+  SUB_YAML="$tmp_yaml" SUB_B64="$tmp_b64" PANEL_HTML="$tmp_panel" NODE_IP="${NODE_ADDR:-$PUBLIC_IP}" \
+    EXPECTED_CF_NAME="$CF_NAME" EXPECTED_CF="$([ -n "$CF_HOSTNAME" ] && [ -n "$CF_VLESS_UUID" ] && [ "${CF_VERIFIED:-1}" = 1 ] && printf 1 || printf 0)" \
+    EXPECTED_HY2="$ENABLE_HY2" EXPECTED_ANYTLS="$ANYTLS_OK" "$PY" - <<'PY' || { _cleanup_subscription_tmp; return 1; }
+import base64
+import os
+import re
+
+node_ip = os.environ["NODE_IP"]
+expected_cf = os.environ["EXPECTED_CF"] == "1"
+expected_cf_name = os.environ.get("EXPECTED_CF_NAME") or "CF-Vless"
+expected_direct = 2 + (os.environ["EXPECTED_HY2"] == "1") + (os.environ["EXPECTED_ANYTLS"] == "1")
+expected_total = expected_direct + expected_cf
+
+yaml_text = open(os.environ["SUB_YAML"], encoding="utf-8").read()
+servers = re.findall(r"^\s+server:\s*(\S+)\s*$", yaml_text, re.M)
+if len(servers) != expected_total or servers[:expected_direct] != [node_ip] * expected_direct:
+    raise SystemExit("invalid direct server fields in rendered subscription")
+if expected_cf and (servers[-1] in {"", ";"} or expected_cf_name not in yaml_text):
+    raise SystemExit("invalid CF node in rendered subscription")
+
+b64_path = os.environ.get("SUB_B64", "")
+if b64_path:
+    encoded = open(b64_path, encoding="ascii").read().strip()
+    links = base64.b64decode(encoded, validate=True).decode("utf-8").splitlines()
+    if len(links) != expected_total:
+        raise SystemExit("unexpected share-link count")
+    for link in links[:expected_direct]:
+        match = re.match(r"^[a-z0-9]+://[^@]+@(?P<host>\[[^\]]+\]|[^:/?#]+)", link)
+        if not match or match.group("host").strip("[]") != node_ip:
+            raise SystemExit("invalid direct host in share links")
+    if "@;:" in "\n".join(links):
+        raise SystemExit("placeholder host in share links")
+
+panel_path = os.environ.get("PANEL_HTML", "")
+if panel_path:
+    panel = open(panel_path, encoding="utf-8").read()
+    if "@;:" in panel or panel.count('class="ncard"') != expected_total:
+        raise SystemExit("invalid dashboard node links")
+PY
+
+  chmod 644 "$tmp_yaml" || { _cleanup_subscription_tmp; return 1; }
+  publish_pairs+=("$tmp_yaml" "$out_yaml")
+  if [ -n "$tmp_b64" ]; then chmod 644 "$tmp_b64" || { _cleanup_subscription_tmp; return 1; }; publish_pairs+=("$tmp_b64" "$out_b64"); fi
+  if [ -n "$tmp_panel" ]; then chmod 644 "$tmp_panel" || { _cleanup_subscription_tmp; return 1; }; publish_pairs+=("$tmp_panel" "$out_panel"); fi
+  if [ -n "$tmp_login" ]; then
+    chmod 644 "$tmp_login" || { _cleanup_subscription_tmp; return 1; }
+    publish_pairs+=("$tmp_login" "$out_login")
+  elif [ -n "${PANEL_PATH:-}" ]; then
+    publish_pairs+=("-" "$out_login")
+  fi
+  [ $(( $# % 2 )) -eq 0 ] || { _cleanup_subscription_tmp; err "write_subscription 额外发布参数必须是 source/target 对"; return 1; }
+  publish_pairs+=("$@")
+  if ! publish_files_transaction "${publish_pairs[@]}"; then _cleanup_subscription_tmp; return 1; fi
+  tmp_yaml=""; tmp_b64=""; tmp_panel=""; tmp_login=""
+}
+
+validate_panel_file() {
+  local panel="$1"
+  EXPECTED_CF="$([ -n "$CF_HOSTNAME" ] && [ -n "$CF_VLESS_UUID" ] && [ "${CF_VERIFIED:-1}" = 1 ] && printf 1 || printf 0)" \
+    EXPECTED_HY2="$ENABLE_HY2" EXPECTED_ANYTLS="$ANYTLS_OK" "$PY" - "$panel" <<'PY'
+import os
+import sys
+
+expected = 2 + (os.environ["EXPECTED_HY2"] == "1") + (os.environ["EXPECTED_ANYTLS"] == "1") + (os.environ["EXPECTED_CF"] == "1")
+text = open(sys.argv[1], encoding="utf-8").read()
+if "@;:" in text or text.count('class="ncard"') != expected:
+    raise SystemExit(1)
+PY
+}
+
+write_panel_files() {
+  require_node_address || return 1
+  mkdir -p "$WWW" || return 1
+  chmod 755 "$WWW" || return 1
+  local tmp_panel="" tmp_login="" panel_file="$WWW$PANEL_PATH" login_file="$WWW${PANEL_PATH%.html}-login.html"
+  local -a pairs=()
+  tmp_panel="$(mktemp "$WWW/.singbox-panel.XXXXXX")" || return 1
+  if ! render_panel_html >"$tmp_panel" || ! validate_panel_file "$tmp_panel" || ! chmod 644 "$tmp_panel"; then
+    rm -f "$tmp_panel"; return 1
+  fi
+  pairs+=("$tmp_panel" "$panel_file")
+  if [ -s "$PANEL_MAP" ]; then
+    tmp_login="$(mktemp "$WWW/.singbox-panel-login.XXXXXX")" || { rm -f "$tmp_panel"; return 1; }
+    if ! render_panel_login_html >"$tmp_login" || ! chmod 644 "$tmp_login"; then
+      rm -f "$tmp_panel" "$tmp_login"; return 1
+    fi
+    pairs+=("$tmp_login" "$login_file")
+  else
+    pairs+=("-" "$login_file")
+  fi
+  if ! publish_files_transaction "${pairs[@]}"; then rm -f "$tmp_panel" "$tmp_login"; return 1; fi
 }
 
 config_nginx() {
   log "配置 nginx 订阅服务..."
-  mkdir -p /etc/nginx/snippets /etc/nginx/conf.d
+  mkdir -p "$(dirname "$NGINX_SNIPPET")" "$(dirname "$NGINX_CONF")" "$(dirname "$NGINX_MAIN")" || return 1
+  local backup tmp_header tmp_conf tmp_main terr nginx_was_active=0
+  backup="$(mktemp -d "$SB_DIR/.nginx-backup.XXXXXX")" || return 1
+  snapshot_files "$backup" "$NGINX_SNIPPET" "$NGINX_CONF" "$NGINX_MAIN" "$NGINX_DEFAULT_SITE" "$NGINX_DEFAULT_CONF" \
+    || { rm -rf "$backup"; return 1; }
+  systemctl is-active --quiet nginx 2>/dev/null && nginx_was_active=1 || true
+  _rollback_nginx() {
+    local rollback_rc=0
+    restore_files "$backup" "$NGINX_SNIPPET" "$NGINX_CONF" "$NGINX_MAIN" "$NGINX_DEFAULT_SITE" "$NGINX_DEFAULT_CONF" || rollback_rc=1
+    if nginx -t >/dev/null 2>&1 && [ "$nginx_was_active" = 1 ]; then
+      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || rollback_rc=1
+    elif ! nginx -t >/dev/null 2>&1; then
+      rollback_rc=1
+    fi
+    if [ "$rollback_rc" -eq 0 ]; then
+      rm -rf "$backup"
+    else
+      err "Nginx 回滚不完整，备份保留在: $backup"
+    fi
+    return "$rollback_rc"
+  }
   # 流量头单独放 snippets, 只在订阅 location 内 include(首页/404 不会带头); 数值用 env 单一来源
-  render_header "$EXPIRE_VALUE" >"$NGINX_SNIPPET"
-  chmod 644 "$NGINX_SNIPPET"
+  tmp_header="$(mktemp "$(dirname "$NGINX_SNIPPET")/.sub-headers.XXXXXX")" || { _rollback_nginx; return 1; }
+  if ! render_header "$EXPIRE_VALUE" >"$tmp_header" || ! chmod 644 "$tmp_header"; then rm -f "$tmp_header"; _rollback_nginx; return 1; fi
 
   # 双 server: 默认 Host/IP 一律 404; 只有订阅域名/IP 的精确随机路径返回内容。
   local v6_default="" v6_named=""
@@ -1435,7 +1817,7 @@ config_nginx() {
     v6_default=$'\n    listen [::]:80 default_server;'
     v6_named=$'\n    listen [::]:80;'
   fi
-  rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+  rm -f "$NGINX_DEFAULT_SITE" "$NGINX_DEFAULT_CONF" 2>/dev/null || true
   # 看板页可选登录(nginx 真鉴权, 不是网页里的 JS 假门): 存在 map 片段时, nginx 用 \$sb_ok 校验 cookie 是否
   # 等于密码(密码只在 600 root 的 \$PANEL_MAP 里, 由 nginx master 加载, 从不下发浏览器); 不对就 302 跳登录页。
   local sub_server_name panel_login="${PANEL_PATH%.html}-login.html"
@@ -1446,7 +1828,8 @@ config_nginx() {
     panel_guard=$'\n        if ($sb_ok = 0) { return 302 '"$panel_login"'; }'
     login_loc=$'    location = '"$panel_login"$' {\n        default_type text/html;\n        try_files $uri =404;\n    }\n'
   fi
-  cat >"$NGINX_CONF" <<EOF
+  tmp_conf="$(mktemp "$(dirname "$NGINX_CONF")/.singbox-sub.XXXXXX")" || { rm -f "$tmp_header"; _rollback_nginx; return 1; }
+  cat >"$tmp_conf" <<EOF
 ${panel_inc}server {
     listen 80 default_server;$v6_default
     server_name _;
@@ -1457,6 +1840,8 @@ server {
     listen 80;$v6_named
     root $WWW;
     server_name $sub_server_name;
+    # 若该 vhost 后续放到内部 TLS 端口后面，保持相对 Location，避免把内部端口泄漏给浏览器。
+    absolute_redirect off;
 
     location = $SUB_PATH {
         include $NGINX_SNIPPET;
@@ -1480,11 +1865,18 @@ $login_loc
     }
 }
 EOF
+  chmod 644 "$tmp_conf" || { rm -f "$tmp_header" "$tmp_conf"; _rollback_nginx; return 1; }
 
-  if grep -q 'server_tokens' /etc/nginx/nginx.conf; then
-    sed -i 's/^\([[:space:]]*\)#\?[[:space:]]*server_tokens .*/\1server_tokens off;/' /etc/nginx/nginx.conf
+  tmp_main="$(mktemp "$(dirname "$NGINX_MAIN")/.nginx-main.XXXXXX")" || { rm -f "$tmp_header" "$tmp_conf"; _rollback_nginx; return 1; }
+  cp -a "$NGINX_MAIN" "$tmp_main" || { rm -f "$tmp_header" "$tmp_conf" "$tmp_main"; _rollback_nginx; return 1; }
+  if grep -q 'server_tokens' "$tmp_main"; then
+    sed -i 's/^\([[:space:]]*\)#\?[[:space:]]*server_tokens .*/\1server_tokens off;/' "$tmp_main" || { rm -f "$tmp_header" "$tmp_conf" "$tmp_main"; _rollback_nginx; return 1; }
   else
-    sed -i '0,/http[[:space:]]*{/s//http {\n    server_tokens off;/' /etc/nginx/nginx.conf
+    sed -i '0,/http[[:space:]]*{/s//http {\n    server_tokens off;/' "$tmp_main" || { rm -f "$tmp_header" "$tmp_conf" "$tmp_main"; _rollback_nginx; return 1; }
+  fi
+
+  if ! mv -f "$tmp_header" "$NGINX_SNIPPET" || ! mv -f "$tmp_conf" "$NGINX_CONF" || ! mv -f "$tmp_main" "$NGINX_MAIN"; then
+    rm -f "$tmp_header" "$tmp_conf" "$tmp_main"; _rollback_nginx; return 1
   fi
 
   # 不用 /tmp/xxx.$$: 文件名由 PID 决定可预测, root 写入会跟随他人预置的符号链接
@@ -1494,10 +1886,11 @@ EOF
     if grep -qi 'duplicate default server' "$terr" 2>/dev/null; then
       err "→ 机器上已有别的 default_server 站点。请在 /etc/nginx/ 下找到并移除冲突的 default_server, 然后重跑。"
     fi
-    rm -f "$terr"; die "nginx 未通过校验"
+    rm -f "$terr"; _rollback_nginx; return 1
   fi
   rm -f "$terr"
-  systemctl reload nginx || systemctl restart nginx
+  if ! systemctl reload nginx && ! systemctl restart nginx; then _rollback_nginx; return 1; fi
+  rm -rf "$backup"
   ok "nginx 订阅就绪"
 }
 
@@ -1678,6 +2071,11 @@ net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_tw_reuse=1
 EOF
   if [ "$ENABLE_BBR" = 1 ]; then
+    mkdir -p "$(dirname "$BBR_MODULE_CONF")"
+    printf 'tcp_bbr\n' >"$BBR_MODULE_CONF"
+    chmod 644 "$BBR_MODULE_CONF"
+    # Oracle 等内核可能把 BBR 编译成模块；先加载再应用 sysctl，否则会继续停在 cubic。
+    modprobe tcp_bbr >/dev/null 2>&1 || true
     cat >>"$SYSCTL_CONF" <<'EOF'
 # BBR 拥塞控制 + fq 队列(只作用于 TCP: AnyTLS/Vless; HY2 走 UDP 不受影响)
 net.core.default_qdisc=fq
@@ -1698,7 +2096,7 @@ EOF
 # 没有它的话, 把 HY2_HOP_RANGE 置空(或 ENABLE_HY2=0)重跑 install 只是"不再配置",
 # 旧的整段 UDP -> HY2 重定向和开机自启服务仍然留着, 等于关不掉。
 porthop_cleanup() {
-  local svc=/etc/systemd/system/sing-box-porthop.service
+  local svc="$PORTHOP_SERVICE"
   local had=0
   [ -f "$svc" ] && had=1
   if [ "$had" = 0 ] && command -v nft >/dev/null 2>&1; then
@@ -1740,7 +2138,7 @@ EOF
   if ! "$nftbin" -f "$rules" 2>/dev/null; then
     warn "nft 应用失败, 端口跳跃未生效"; note "端口跳跃: 'nft -f $rules' 报错, 请手动排查。"; return 0
   fi
-  cat >/etc/systemd/system/sing-box-porthop.service <<EOF
+  cat >"$PORTHOP_SERVICE" <<EOF
 [Unit]
 Description=sing-box HY2 port hopping (nftables redirect)
 After=network-online.target
@@ -1824,7 +2222,7 @@ print_summary() {
   printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
   if [ "$SS_UDP" = 1 ]; then printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
   else printf '    - SS2022     (TCP %s, TCP-only)\n' "$SS_PORT"; fi
-  [ -n "$CF_HOSTNAME" ] && printf '    - CF-Vless   (WS via %s, Argo 大保底)\n' "$CF_HOSTNAME"
+  [ -n "$CF_HOSTNAME" ] && printf '    - %-14s (WS via %s, Argo 大保底)\n' "$CF_NAME" "$CF_HOSTNAME"
   [ -n "$WARP_PRIVATE_KEY" ] && printf '    * WARP 解锁分流已开 (%s 走 WARP)\n' "${WARP_SITES:-$WARP_DEFAULT_SITES}"
   echo
   printf '  管理命令:\n'
@@ -1908,14 +2306,13 @@ do_panel() {
   if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
+  hydrate_legacy_runtime_state
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   [ -n "${PANEL_PATH:-}" ] || die "本安装无看板页, 重跑 install 升级后生成"
-  mkdir -p "$WWW"; chmod 755 "$WWW"
-  render_panel_html >"$WWW$PANEL_PATH"; chmod 644 "$WWW$PANEL_PATH"
+  write_panel_files || die "看板渲染/校验/发布失败，已保留旧看板"
   ok "可视化看板页: $(subscription_url "$PANEL_PATH")"
   echo "  浏览器打开即可看两种订阅 + 扫码导入 + 一键复制; 手机扫码最方便。"
   if [ -s "$PANEL_MAP" ]; then
-    render_panel_login_html >"$WWW${PANEL_PATH%.html}-login.html"; chmod 644 "$WWW${PANEL_PATH%.html}-login.html"
     echo "  (已开密码登录: 打开会先到登录页。改密码/关闭: bash install.sh panel-pass <密码> | panel-pass off)"
   else
     echo "  想加密码登录(自定义登录页): bash install.sh panel-pass <密码>"
@@ -1934,14 +2331,34 @@ do_panel_pass() {
   EXPIRE_VALUE="${EXPIRE_AT:-}"
   SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
   if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
+  hydrate_legacy_runtime_state
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   local login_file="$WWW${PANEL_PATH%.html}-login.html"
-  # 重渲染看板, 让"退出"按钮随登录开关即时出现/消失(render_panel_html 按 $PANEL_MAP 判断)
-  _repanel() { mkdir -p "$WWW"; render_panel_html >"$WWW$PANEL_PATH" 2>/dev/null && chmod 644 "$WWW$PANEL_PATH" || true; }
+  local panel_file="$WWW$PANEL_PATH" state_bak nginx_was_active=0
+  mkdir -p "$(dirname "$PANEL_MAP")" || die "无法创建 panel-pass 状态目录"
+  state_bak="$(mktemp -d "$(dirname "$PANEL_MAP")/.panel-pass-backup.XXXXXX")" || die "无法创建 panel-pass 回滚目录"
+  snapshot_files "$state_bak" "$PANEL_MAP" "$login_file" "$panel_file" "$NGINX_CONF" "$NGINX_SNIPPET" "$NGINX_MAIN" "$NGINX_DEFAULT_SITE" "$NGINX_DEFAULT_CONF" \
+    || { rm -rf "$state_bak"; die "无法备份现有看板/Nginx 状态"; }
+  systemctl is-active --quiet nginx 2>/dev/null && nginx_was_active=1 || true
+  _rollback_panel_pass() {
+    local rollback_rc=0
+    restore_files "$state_bak" "$PANEL_MAP" "$login_file" "$panel_file" "$NGINX_CONF" "$NGINX_SNIPPET" "$NGINX_MAIN" "$NGINX_DEFAULT_SITE" "$NGINX_DEFAULT_CONF" || rollback_rc=1
+    if nginx -t >/dev/null 2>&1; then
+      if [ "$nginx_was_active" = 1 ]; then systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || rollback_rc=1; fi
+    else
+      rollback_rc=1
+    fi
+    if [ "$rollback_rc" -eq 0 ]; then
+      rm -rf "$state_bak"
+    else
+      err "看板认证回滚不完整，备份保留在: $state_bak"
+    fi
+    return "$rollback_rc"
+  }
   if [ "${1:-}" = "off" ]; then
-    rm -f "$PANEL_MAP" "$login_file"
-    config_nginx
-    _repanel   # 去掉"退出"按钮
+    rm -f "$PANEL_MAP"
+    if ! write_panel_files || ! config_nginx; then _rollback_panel_pass || true; die "关闭看板登录失败，已尝试恢复旧认证状态"; fi
+    rm -rf "$state_bak"
     ok "已关闭看板页登录(恢复为随机路径直达)。"
     return 0
   fi
@@ -1950,21 +2367,18 @@ do_panel_pass() {
   # 密码会进 cookie 和 nginx map, 限安全字符集(免转义/免 cookie 截断); 长度 >=6
   # nginx map 字符串匹配大小写不敏感(官方: strings are matched ignoring the case), 故限小写,
   # 免得大写密码被误以为区分大小写、实际白丢这部分熵。免转义/免 cookie 截断字符集。
-  case "$pass" in *[!a-z0-9._~-]*) die "密码只能含 小写字母/数字/. _ ~ -(nginx 匹配不分大小写, 故限小写; 例: openssl rand -hex 12)";; esac
-  [ "${#pass}" -ge 6 ] || die "密码至少 6 位(建议 openssl rand -hex 12)"
+  case "$pass" in '~'*|default|hostnames|volatile|include|*[!a-z0-9._~-]*) rm -rf "$state_bak"; die "密码不能以 ~ 开头或使用 nginx map 保留字，只允许小写字母/数字/. _ ~ -(例: openssl rand -hex 12)";; esac
+  [ "${#pass}" -ge 6 ] || { rm -rf "$state_bak"; die "密码至少 6 位(建议 openssl rand -hex 12)"; }
   # nginx map 片段: 校验 cookie sbauth 是否等于密码。600 root —— 由 nginx master(root)加载, 密码从不下发浏览器。
-  ( umask 077; cat >"$PANEL_MAP" <<EOF
+  atomic_write_file "$PANEL_MAP" 600 <<EOF || { rm -rf "$state_bak"; die "写入看板密码 map 失败"; }
 map \$cookie_sbauth \$sb_ok {
     default 0;
     "$pass" 1;
 }
 EOF
-  )
   chown root:root "$PANEL_MAP" 2>/dev/null || true; chmod 600 "$PANEL_MAP"
-  mkdir -p "$WWW"; chmod 755 "$WWW"
-  render_panel_login_html >"$login_file"; chmod 644 "$login_file"   # 登录页不含密码, 可公开
-  config_nginx
-  _repanel   # 看板加上"退出"按钮
+  if ! write_panel_files || ! config_nginx; then _rollback_panel_pass || true; die "设置看板登录失败，已尝试恢复旧认证状态"; fi
+  rm -rf "$state_bak"
   ok "看板页已加密码登录(自定义登录页 + nginx 服务端校验)。"
   echo "  打开 $(subscription_url "$PANEL_PATH") 会先跳到登录页, 输入你设的密码即可。"
   note "登录是 cookie==密码、nginx 服务端校验(密码只存 600 root 的 $PANEL_MAP, 不下发浏览器)。明文 HTTP 下 cookie 不加密(同网段可嗅探), 只挡'知道链接的人'; 要真加密走 HTTPS(CF Tunnel)。"
@@ -2005,7 +2419,10 @@ do_admin() {
   # token + 端口(复用已有 token, 避免每次换)
   if [ -f "$ADMIN_ENV" ]; then load_admin_env || die "管理面板状态文件格式非法: $ADMIN_ENV"; fi
   local token; token="${ADMIN_TOKEN:-$(openssl rand -hex 24)}"
-  ( umask 077; printf 'ADMIN_TOKEN=%s\nADMIN_PORT=%s\n' "$token" "$ADMIN_PORT" >"$ADMIN_ENV" )
+  atomic_write_file "$ADMIN_ENV" 600 <<EOF || die "写入管理面板状态失败"
+ADMIN_TOKEN=$token
+ADMIN_PORT=$ADMIN_PORT
+EOF
 
   # 后端要调用的 install.sh 副本: 优先复制自身, 管道运行(curl|bash)则从仓库下载
   local self; self="$(readlink -f "$0" 2>/dev/null || true)"
@@ -2045,7 +2462,7 @@ EOF
 do_backup() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   local bf="${BACKUP_DIR:-/root}/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz" f files=""
-  for f in "$SECRETS" "$ENVFILE" "$CF_ENV" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key"; do
+  for f in "$SECRETS" "$ENVFILE" "$CF_ENV" "$CF_PENDING_ENV" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key"; do
     [ -f "$f" ] && files="$files $f"
   done
   # shellcheck disable=SC2086
@@ -2078,18 +2495,115 @@ do_restore() {
       *) die "备份含预期之外的成员, 拒绝恢复(可能不是本脚本的备份): $m" ;;
     esac
   done < <(tar tzf "$bf" 2>/dev/null)
-  mkdir -p "$SB_DIR"
-  tar xzf "$bf" -C / 2>/dev/null || die "解包失败(文件损坏?)"
-  [ -f "$SECRETS" ] || die "备份里没有密钥文件, 无法恢复"
+  RESTORE_TX_STAGE="$(mktemp -d)" || die "无法创建恢复暂存目录"
+  tar xzf "$bf" -C "$RESTORE_TX_STAGE" 2>/dev/null || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "解包失败(文件损坏?)"; }
+
+  local restore_root_prefix="${RESTORE_ROOT%/}" rel
+  _restore_rel() {
+    local path="$1"
+    if [ "$RESTORE_ROOT" = / ]; then
+      printf '%s' "${path#/}"
+    elif [[ "$path" == "$restore_root_prefix/"* ]]; then
+      printf '%s' "${path#"$restore_root_prefix/"}"
+    else
+      return 1
+    fi
+  }
+  rel="$(_restore_rel "$SECRETS")" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "密钥路径不在 RESTORE_ROOT 内: $SECRETS"; }
+  [ -f "$RESTORE_TX_STAGE/$rel" ] || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "备份里没有密钥文件, 无法恢复"; }
+
+  mkdir -p "$SB_DIR" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "无法创建 sing-box 状态目录"; }
+  RESTORE_TX_BACKUP="$(mktemp -d "$SB_DIR/.restore-backup.XXXXXX")" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "无法创建 restore 回滚目录"; }
+  RESTORE_TX_TARGETS=("$SECRETS" "$ENVFILE" "$CF_ENV" "$CF_PENDING_ENV" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key")
+  snapshot_files "$RESTORE_TX_BACKUP" "${RESTORE_TX_TARGETS[@]}" || { rm -rf "$RESTORE_TX_STAGE" "$RESTORE_TX_BACKUP"; RESTORE_TX_STAGE=""; RESTORE_TX_BACKUP=""; die "无法备份恢复前状态"; }
+  RESTORE_TX_OLD_SINGBOX_ACTIVE=0; RESTORE_TX_OLD_NGINX_ACTIVE=0; RESTORE_TX_ROLLBACK_STARTED=0
+  systemctl is-active --quiet sing-box 2>/dev/null && RESTORE_TX_OLD_SINGBOX_ACTIVE=1 || true
+  systemctl is-active --quiet nginx 2>/dev/null && RESTORE_TX_OLD_NGINX_ACTIVE=1 || true
+  _rollback_restore() {
+    [ "$RESTORE_TX_ROLLBACK_STARTED" = 0 ] || return 1
+    RESTORE_TX_ROLLBACK_STARTED=1
+    local rollback_rc=0
+    restore_files "$RESTORE_TX_BACKUP" "${RESTORE_TX_TARGETS[@]}" || rollback_rc=1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$RESTORE_TX_OLD_SINGBOX_ACTIVE" = 1 ]; then
+      systemctl reset-failed sing-box >/dev/null 2>&1 || true
+      systemctl restart sing-box >/dev/null 2>&1 || rollback_rc=1
+      systemctl is-active --quiet sing-box >/dev/null 2>&1 || rollback_rc=1
+    else
+      systemctl stop sing-box >/dev/null 2>&1 || true
+    fi
+    if [ "$RESTORE_TX_OLD_NGINX_ACTIVE" = 1 ]; then
+      nginx -t >/dev/null 2>&1 || rollback_rc=1
+      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || rollback_rc=1
+    else
+      systemctl stop nginx >/dev/null 2>&1 || true
+    fi
+    if [ "$rollback_rc" -eq 0 ]; then rm -rf "$RESTORE_TX_BACKUP"; RESTORE_TX_BACKUP=""; else err "restore 回滚不完整，备份保留在: $RESTORE_TX_BACKUP"; fi
+    return "$rollback_rc"
+  }
+
+  _restore_exit_trap() {
+    local rc=$?
+    trap - EXIT
+    [ -n "$RESTORE_TX_STAGE" ] && rm -rf "$RESTORE_TX_STAGE"
+    RESTORE_TX_STAGE=""
+    if [ "$rc" -ne 0 ]; then _rollback_restore || true; fi
+    exit "$rc"
+  }
+  trap '_restore_exit_trap' EXIT
+
+  local target source tmp
+  local -a restore_publish=() restore_tmps=()
+  for target in "${RESTORE_TX_TARGETS[@]}"; do
+    rel="$(_restore_rel "$target")" || die "恢复目标不在 RESTORE_ROOT 内: $target"
+    source="$RESTORE_TX_STAGE/$rel"
+    mkdir -p "$(dirname "$target")" || die "无法创建恢复目标目录"
+    if [ -f "$source" ]; then
+      tmp="$(mktemp "$(dirname "$target")/.restore-stage.XXXXXX")" || die "无法创建恢复临时文件"
+      rm -f "$tmp"
+      cp -a "$source" "$tmp" || { rm -f "$tmp"; die "暂存恢复文件失败: $target"; }
+      restore_tmps+=("$tmp")
+      restore_publish+=("$tmp" "$target")
+    else
+      restore_publish+=("-" "$target")
+    fi
+  done
+  publish_files_transaction "${restore_publish[@]}" || { rm -f "${restore_tmps[@]}"; die "提交恢复状态文件组失败"; }
+  rm -rf "$RESTORE_TX_STAGE"
+  RESTORE_TX_STAGE=""
+
   # 载入用户偏好(限额/到期/计费/HY2 进阶); 机器相关(IP/网卡/订阅host)清空让新机重新探测。
   # 状态文件只能按字面量解析，备份内的 KEY=VALUE 绝不能作为 root shell 执行。
   if [ -f "$ENVFILE" ]; then load_node_env || die "备份中的运行参数文件格式非法: $ENVFILE"; fi
   INTERFACE=""; PUBLIC_IP=""; SUB_HOST=""
   # CF-Vless 隧道是跟机器走的(cloudflared+token), 备份只带了节点参数, 新机要重接
-  [ -f "$CF_ENV" ] && note "CF-Vless 第5节点: 新机需重跑 'CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf' 重装 cloudflared 并接隧道, 否则该节点连不上。"
+  if [ -f "$CF_ENV" ]; then
+    load_cf_env || die "备份中的 CF 状态文件格式非法: $CF_ENV"
+    atomic_write_file "$CF_PENDING_ENV" 600 <<EOF || die "无法写入待重接 CF 状态"
+CF_HOSTNAME=$CF_HOSTNAME
+CF_PORT=$CF_PORT
+CF_VLESS_UUID=$CF_VLESS_UUID
+CF_WS_PATH=$CF_WS_PATH
+CF_NAME=$CF_NAME
+EOF
+    rm -f "$CF_ENV" || die "无法移除恢复出的正式 CF 状态"
+    note "CF-Vless 第5节点已保存为待重接状态，不会进入新机订阅。请运行 'CF_TOKEN=.. bash install.sh cf' 重新安装 Connector；原域名/UUID/路径会沿用。"
+  fi
+  # pending 只保存下次重接参数，不代表本机已有 Connector。重建阶段必须显式关闭 CF 入站/订阅。
+  if [ -f "$CF_PENDING_ENV" ]; then
+    CF_HOSTNAME=""; CF_VLESS_UUID=""; CF_WS_PATH=""; CF_VERIFIED=0
+  fi
   ok "凭证已就位, 按新机重建(IP/网卡自动适配; 用域名的话加 DOMAIN= 重跑或重指 DNS)..."
-  local RESTORING=1
-  do_install
+  local install_rc had_errexit=0
+  case $- in *e*) had_errexit=1 ;; esac
+  set +e
+  ( trap - EXIT; set -eEuo pipefail; RESTORING=1 do_install )
+  install_rc=$?
+  if [ "$had_errexit" = 1 ]; then set -e; else set +e; fi
+  [ "$install_rc" -eq 0 ] || die "按新机重建失败，正在恢复迁移前状态"
+  trap - EXIT
+  rm -rf "$RESTORE_TX_BACKUP" || warn "恢复成功，但临时备份目录未能删除: $RESTORE_TX_BACKUP"
+  RESTORE_TX_BACKUP=""; RESTORE_TX_TARGETS=(); RESTORE_TX_ROLLBACK_STARTED=0
 }
 
 do_harden() {
@@ -2253,14 +2767,16 @@ do_doctor() {
   # 9) 可选组件
   [ -f "$CF_ENV" ] && { [ "$(systemctl is-active cloudflared 2>/dev/null)" = active ] && P "cloudflared(CF-Vless) 运行中" || W "cloudflared 未运行: systemctl status cloudflared"; }
   if [ -f "$CF_ENV" ] && [ -n "${CF_WS_PATH:-}" ]; then   # 本机 WS 入站 101: 区分"sing-box 入站坏"还是"cloudflared/隧道坏"
-    local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
-    if curl -isS -m 6 --http1.1 -H "Host: ${CF_HOSTNAME:-localhost}" "${ws_hdr[@]}" "http://127.0.0.1:${CF_PORT:-28080}$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
+    local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13') ws_resp
+    # 101 后 WebSocket 会保持连接，curl 到超时返回 28；先捕获响应再匹配，避免 pipefail 把成功误报成失败。
+    ws_resp="$(curl -isS -m 2 --http1.1 -H "Host: ${CF_HOSTNAME:-localhost}" "${ws_hdr[@]}" "http://127.0.0.1:${CF_PORT:-28080}$CF_WS_PATH" 2>/dev/null || true)"
+    if printf '%s' "$ws_resp" | grep -qi '101'; then
       P "CF-Vless 本机 WS 入站 101(sing-box 侧 OK; 公网不通则查 cloudflared/DNS/Tunnel)"
     else
       W "CF-Vless 本机 WS 入站未拿到 101: 查 sing-box 的 cf-vless-ws-in / CF_WS_PATH / CF_VLESS_UUID"
     fi
   fi
-  if [ -f /etc/systemd/system/sing-box-porthop.service ]; then
+  if [ -f "$PORTHOP_SERVICE" ]; then
     { command -v nft >/dev/null 2>&1 && nft list table inet sb_hophy2 >/dev/null 2>&1 && P "端口跳跃 nftables 表在位"; } || W "端口跳跃服务装了但 nft 表缺失: systemctl restart sing-box-porthop"
   fi
   [ -n "${WARP_PRIVATE_KEY:-}" ] && P "WARP 解锁分流已配置(站点: ${WARP_SITES:-$WARP_DEFAULT_SITES})"
@@ -2289,9 +2805,14 @@ do_set() {
   [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / HY2_UP_MBPS / HY2_DOWN_MBPS)"
   if [ -f "$SECRETS" ]; then load_secrets || die "密钥文件格式非法: $SECRETS"; fi
   load_node_env || die "运行参数文件格式非法: $ENVFILE"
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
+  if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
   # 兼容旧 env(可能无 PUBLIC_IP/SUB_HOST): 回填后再让 write_env 重写, 否则会被清空
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
+  hydrate_legacy_runtime_state
+  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
+  local tx_bak=""
   local a key val iface_changed=0 sb_render=0
   for a in "$@"; do
     key="${a%%=*}"; val="${a#*=}"
@@ -2314,18 +2835,52 @@ do_set() {
     esac
     ok "set $key=$val"
   done
+  mkdir -p "$(dirname "$ENVFILE")" || die "无法创建运行参数目录"
+  tx_bak="$(mktemp -d "$(dirname "$ENVFILE")/.set-backup.XXXXXX")" || die "无法创建 set 回滚目录"
+  local -a set_paths=("$ENVFILE" "$SB_DIR/config.json" "$NGINX_SNIPPET")
+  if [ -n "${SUB_PATH:-}" ]; then
+    set_paths+=("$WWW$SUB_PATH")
+    [ -n "${SUB_B64_PATH:-}" ] && set_paths+=("$WWW$SUB_B64_PATH")
+    [ -n "${PANEL_PATH:-}" ] && set_paths+=("$WWW$PANEL_PATH" "$WWW${PANEL_PATH%.html}-login.html")
+  fi
+  snapshot_files "$tx_bak" "${set_paths[@]}" || { rm -rf "$tx_bak"; die "无法备份 set 相关状态"; }
+  _rollback_set() {
+    local rollback_rc=0
+    restore_files "$tx_bak" "${set_paths[@]}" || rollback_rc=1
+    if [ -f "$SB_DIR/config.json" ]; then
+      systemctl reset-failed sing-box >/dev/null 2>&1 || true
+      systemctl restart sing-box >/dev/null 2>&1 || rollback_rc=1
+      systemctl is-active --quiet sing-box >/dev/null 2>&1 || rollback_rc=1
+    fi
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || rollback_rc=1
+    else
+      rollback_rc=1
+    fi
+    if [ "$rollback_rc" -eq 0 ]; then
+      rm -rf "$tx_bak"
+    else
+      err "set 回滚不完整，备份保留在: $tx_bak"
+    fi
+    return "$rollback_rc"
+  }
   write_env   # 用更新后的全局重写 env(SUB_HOST/PUBLIC_IP 已从 env 读到, 一并保留)
   # 改了写进 config.json 的键(如 HY2 带宽护栏)要重渲染才生效;
   # 走 write_singbox_config 的 check + 失败回滚流程, 不裸改正式配置。
   if [ "$sb_render" = 1 ]; then
-    if [ -f "$SB_DIR/config.json" ]; then write_singbox_config
+    if [ -f "$SB_DIR/config.json" ]; then write_singbox_config || { _rollback_set; die "应用新 sing-box 参数失败，已恢复旧状态"; }
     else warn "尚未生成 config.json, 值已存入 env, 下次 install 生效"; fi
   fi
+  if [ -n "${SUB_PATH:-}" ]; then
+    write_subscription || { _rollback_set; die "刷新订阅/看板失败，已恢复旧状态"; }
+  fi
   [ -f "$TRAFFIC_PY" ] && { "$PY" "$TRAFFIC_PY" >/dev/null 2>&1 && ok "已刷新订阅流量头(限额/到期即时生效)" || warn "流量头刷新失败, 5 分钟后 cron 会自动重试"; }
+  rm -rf "$tx_bak"
   # 改了网卡: HY2 端口跳跃的 nft 规则把旧网卡名烤进了 porthop.nft(do_set 不重建以免用错 HY2_PORT),
   # 提示用户重跑 install 刷新, 否则跳跃段仍绑旧网卡、客户端经跳跃端口连不上 HY2(直连 HY2_PORT 不受影响)。
-  [ "$iface_changed" = 1 ] && [ -f /etc/systemd/system/sing-box-porthop.service ] && \
+  [ "$iface_changed" = 1 ] && [ -f "$PORTHOP_SERVICE" ] && \
     warn "网卡已改, 但 HY2 端口跳跃 nft 规则仍绑旧网卡; 重跑 'bash install.sh' 刷新端口跳跃(否则跳跃段连不上 HY2)。"
+  return 0
 }
 
 do_update() {
@@ -2370,31 +2925,31 @@ do_menu() {
     # 每个动作放进 ( ) 子shell 并 || true: 这样某个动作内部 die/exit 只结束该动作,
     # 不会因 set -e 把整个菜单退出。
     case "$c" in
-      1) ( do_install ) || true ;;
-      2) ( do_info ) || true ;;
-      3) ( do_links ) || true ;;
-      4) ( do_status ) || true ;;
+      1) run_menu_action with_maintenance_lock do_install ;;
+      2) run_menu_action do_info ;;
+      3) run_menu_action do_links ;;
+      4) run_menu_action do_status ;;
       5) printf '  输入 KEY=VAL(如 LIMIT_GB=500): '; read -r kv || true
-         [ -n "${kv:-}" ] && { ( do_set "$kv" ) || true; } ;;
-      6) ( do_update ) || true ;;
+         [ -n "${kv:-}" ] && run_menu_action with_maintenance_lock do_set "$kv" ;;
+      6) run_menu_action with_maintenance_lock do_update ;;
       7) printf '  CF_TOKEN: '; read -r t || true; printf '  CF_HOSTNAME: '; read -r h || true
-         if [ -n "${t:-}" ] && [ -n "${h:-}" ]; then ( CF_TOKEN="$t" CF_HOSTNAME="$h" do_cf ) || true; else echo "  已取消(token/域名为空)"; fi ;;
-      8) ( do_restart ) || true ;;
-      9) ( do_uninstall ) || true ;;
-      p|P) ( do_panel ) || true ;;
+         if [ -n "${t:-}" ] && [ -n "${h:-}" ]; then run_menu_action env MAINT_LOCK_HELD=0 CF_TOKEN="$t" CF_HOSTNAME="$h" bash "$0" cf; else echo "  已取消(token/域名为空)"; fi ;;
+      8) run_menu_action with_maintenance_lock do_restart ;;
+      9) run_menu_action with_maintenance_lock do_uninstall ;;
+      p|P) run_menu_action with_maintenance_lock do_panel ;;
       # 看板页含全套节点凭证, 随机路径不是登录保护 —— 菜单里必须能直接加密码,
       # 否则只用菜单的人永远不知道有 panel-pass 这回事, 看板就一直裸着。
       s|S) printf '  设置看板登录密码(留空=随机生成, 输入 off=关闭登录): '; read -r pw || true
-           if [ "$pw" = off ]; then ( do_panel_pass off ) || true
-           else ( do_panel_pass "${pw:-$(openssl rand -hex 12)}" ) || true; fi ;;
+           if [ "$pw" = off ]; then run_menu_action with_maintenance_lock do_panel_pass off
+           else run_menu_action with_maintenance_lock do_panel_pass "${pw:-$(openssl rand -hex 12)}"; fi ;;
       k|K) printf '  KOMARI_ENDPOINT: '; read -r ke || true; printf '  KOMARI_TOKEN: '; read -r kt || true
-           if [ -n "${ke:-}" ] && [ -n "${kt:-}" ]; then ( KOMARI_ENDPOINT="$ke" KOMARI_TOKEN="$kt" do_komari ) || true; else echo "  已取消"; fi ;;
-      b|B) ( do_backup ) || true ;;
-      r|R) printf '  备份文件路径: '; read -r rf || true; [ -n "${rf:-}" ] && { ( do_restore "$rf" ) || true; } ;;
-      h|H) ( do_harden ) || true ;;
-      w|W) ( do_warp ) || true ;;
-      d|D) ( do_doctor ) || true ;;
-      a|A) ( do_admin ) || true ;;
+            if [ -n "${ke:-}" ] && [ -n "${kt:-}" ]; then run_menu_action env KOMARI_ENDPOINT="$ke" KOMARI_TOKEN="$kt" bash "$0" komari; else echo "  已取消"; fi ;;
+      b|B) run_menu_action do_backup ;;
+      r|R) printf '  备份文件路径: '; read -r rf || true; [ -n "${rf:-}" ] && run_menu_action with_maintenance_lock do_restore "$rf" ;;
+      h|H) run_menu_action with_maintenance_lock do_harden ;;
+      w|W) run_menu_action with_maintenance_lock do_warp ;;
+      d|D) run_menu_action do_doctor ;;
+      a|A) run_menu_action with_maintenance_lock do_admin ;;
       0) break ;;
       *) echo "  无效选择" ;;
     esac
@@ -2439,9 +2994,9 @@ do_uninstall() {
   else
     warn "未触碰 cloudflared(若你手动搭过 CF, 请自行处理 /etc/cloudflared, 凭证别误删)"
   fi
-  if [ -f /etc/systemd/system/sing-box-porthop.service ]; then
+  if [ -f "$PORTHOP_SERVICE" ]; then
     systemctl disable --now sing-box-porthop >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/sing-box-porthop.service "$SB_DIR/porthop.nft" 2>/dev/null || true
+    rm -f "$PORTHOP_SERVICE" "$SB_DIR/porthop.nft" 2>/dev/null || true
     command -v nft >/dev/null 2>&1 && nft delete table inet sb_hophy2 >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
@@ -2455,19 +3010,33 @@ do_uninstall() {
 # 那时不回滚就会把原本可用的节点留在新配置/停服状态。
 apply_singbox_config() {
   local newc="$1" bak=""
-  [ -f "$SB_DIR/config.json" ] && { bak="$(mktemp)"; cp -a "$SB_DIR/config.json" "$bak"; }
-  install -m600 "$newc" "$SB_DIR/config.json"
+  [ -f "$newc" ] || { err "待应用的 sing-box 配置不存在: $newc"; return 1; }
+  mkdir -p "$SB_DIR" || return 1
+  if [ -f "$SB_DIR/config.json" ]; then
+    bak="$(mktemp "$SB_DIR/.config-backup.XXXXXX")" || return 1
+    if ! cp -a "$SB_DIR/config.json" "$bak"; then rm -f "$bak"; return 1; fi
+  fi
+  if ! install -m600 "$newc" "$SB_DIR/config.json"; then rm -f "$bak"; return 1; fi
   if systemctl restart sing-box; then
     [ -n "$bak" ] && rm -f "$bak"
     return 0
   fi
   warn "sing-box 重启失败, 回滚到旧配置并拉回旧服务..."
   if [ -n "$bak" ]; then
-    install -m600 "$bak" "$SB_DIR/config.json"; rm -f "$bak"
+    if ! install -m600 "$bak" "$SB_DIR/config.json"; then
+      err "回滚旧 sing-box 配置失败，备份保留在 $bak"
+      return 1
+    fi
     systemctl reset-failed sing-box >/dev/null 2>&1 || true   # 清掉 failed 状态, 否则 restart 可能不动
     systemctl restart sing-box >/dev/null 2>&1 || true
     # 回滚后必须确认旧配置真的起来了; 否则别让调用方误报"节点不受影响"
-    systemctl is-active --quiet sing-box || err "回滚后 sing-box 仍未运行! 全部节点可能失联, 手动查: systemctl status sing-box"
+    if systemctl is-active --quiet sing-box; then
+      rm -f "$bak"
+    else
+      err "回滚后 sing-box 仍未运行! 配置备份保留在 $bak；手动查: systemctl status sing-box"
+    fi
+  else
+    rm -f "$SB_DIR/config.json"
   fi
   return 1
 }
@@ -2477,17 +3046,55 @@ apply_singbox_config() {
 #   - 有旧隧道备份: 切回旧隧道, 否则旧 CF 节点会断;
 #   - 首次接入(无备份): 卸掉刚装的新隧道, 否则留下一个连上 CF 却指向无监听端口的孤儿服务(502/530)。
 cf_restore_service() {
-  local b="${1:-}"
+  local b="${1:-}" rc=0
   cloudflared service uninstall >/dev/null 2>&1 || true   # 先清掉当前(可能是新装或装一半的)服务
   if [ -n "$b" ] && [ -f "$b" ]; then
     warn "恢复旧 cloudflared 隧道服务(回滚 token 切换)..."
-    install -m644 "$b" /etc/systemd/system/cloudflared.service
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable --now cloudflared >/dev/null 2>&1 || true
+    install -m644 "$b" "$CF_SERVICE" || rc=1
+    systemctl daemon-reload >/dev/null 2>&1 || rc=1
+    systemctl enable --now cloudflared >/dev/null 2>&1 || rc=1
+    systemctl is-active --quiet cloudflared >/dev/null 2>&1 || rc=1
+    [ "$rc" -eq 0 ] || err "旧 cloudflared 服务未能完整恢复，服务备份保留在: $b"
   else
     warn "首次接入 CF 失败, 已卸载刚装的 cloudflared 隧道(无旧隧道可恢复, 不留孤儿服务)。"
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || rc=1
   fi
+  return "$rc"
+}
+
+websocket_101() {
+  local url="$1" host="${2:-}" resp status
+  local -a args=(-isS -m 8 --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket'
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
+  [ -n "$host" ] && args+=(-H "Host: $host")
+  resp="$(curl "${args[@]}" "$url" 2>/dev/null || true)"
+  status="$(printf '%s\n' "$resp" | tr -d '\r' | awk 'toupper($1) ~ /^HTTP\// {print $2; exit}')"
+  [ "$status" = 101 ]
+}
+
+restore_cf_transaction() {
+  local state_bak="$1" cfbak="$2" rc=0
+  restore_files "$state_bak" "${CF_TRANSACTION_PATHS[@]}" || rc=1
+  cf_restore_service "$cfbak" || rc=1
+  systemctl reset-failed sing-box >/dev/null 2>&1 || true
+  systemctl restart sing-box >/dev/null 2>&1 || rc=1
+  systemctl is-active --quiet sing-box >/dev/null 2>&1 || rc=1
+  if [ "$rc" -eq 0 ]; then
+    rm -rf "$state_bak"
+  else
+    err "CF 回滚不完整，状态备份保留在: $state_bak"
+    [ -n "$cfbak" ] && [ -f "$cfbak" ] && err "cloudflared 服务备份保留在: $cfbak"
+  fi
+  return "$rc"
+}
+
+cf_rollback_or_die() {
+  local state_bak="$1" cfbak="$2" message="$3"
+  if restore_cf_transaction "$state_bak" "$cfbak"; then
+    [ -n "$cfbak" ] && rm -f "$cfbak"
+    die "$message"
+  fi
+  die "$message；自动回滚不完整，已保留上述备份，请先人工恢复后再重试"
 }
 
 # 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
@@ -2496,7 +3103,14 @@ do_cf() {
   [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再加 CF-Vless"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
+  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"
+  elif [ -f "$CF_PENDING_ENV" ]; then load_cf_pending_env || die "待重接 CF 状态文件格式非法: $CF_PENDING_ENV"; fi
+  if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
+  [ -n "$_CLI_CF_HOSTNAME" ] && CF_HOSTNAME="$_CLI_CF_HOSTNAME"
+  [ -n "$_CLI_CF_PORT" ] && CF_PORT="$_CLI_CF_PORT"
+  [ -n "$_CLI_CF_VLESS_UUID" ] && CF_VLESS_UUID="$_CLI_CF_VLESS_UUID"
+  [ -n "$_CLI_CF_WS_PATH" ] && CF_WS_PATH="$_CLI_CF_WS_PATH"
+  [ -n "$_CLI_CF_NAME" ] && CF_NAME="$_CLI_CF_NAME"
   CF_PORT="${CF_PORT:-28080}"
 
   if [ -z "${CF_TOKEN:-}" ] || [ -z "${CF_HOSTNAME:-}" ]; then
@@ -2512,6 +3126,7 @@ EOF
     die "缺少 CF_TOKEN 或 CF_HOSTNAME"
   fi
   case "$CF_HOSTNAME" in *[!A-Za-z0-9.-]*) die "CF_HOSTNAME 含非法字符: $CF_HOSTNAME";; esac
+  case "$CF_NAME" in ''|*[!A-Za-z0-9._-]*) die "CF_NAME 含非法字符(只允许字母数字 . _ -): $CF_NAME";; esac
   case "$CF_PORT" in ''|*[!0-9]*) die "CF_PORT 必须是数字: $CF_PORT";; esac
   { [ "$CF_PORT" -ge 1 ] && [ "$CF_PORT" -le 65535 ]; } || die "CF_PORT 超出范围 1-65535: $CF_PORT"
 
@@ -2545,26 +3160,45 @@ EOF
     chmod 755 /usr/local/bin/cloudflared
   fi
   log "安装 cloudflared 服务(token)..."
-  local cfsvc=/etc/systemd/system/cloudflared.service cfbak=""
+  local cfsvc="$CF_SERVICE" cfbak="" state_bak old_cf_managed=0
+  [ -f "$CF_ENV" ] && old_cf_managed=1
+  if [ -f "$cfsvc" ] && [ "$old_cf_managed" != 1 ]; then
+    die "检测到非本脚本管理的 cloudflared.service；为避免覆盖其它 Tunnel，拒绝接管。请先手动迁移/停用该服务。"
+  fi
+  state_bak="$(mktemp -d "$SB_DIR/.cf-backup.XXXXXX")" || die "无法创建 CF 回滚目录"
+  CF_TRANSACTION_PATHS=("$SB_DIR/config.json" "$CF_ENV" "$CF_PENDING_ENV")
+  [ -n "${SUB_PATH:-}" ] && CF_TRANSACTION_PATHS+=("$WWW$SUB_PATH")
+  [ -n "${SUB_B64_PATH:-}" ] && CF_TRANSACTION_PATHS+=("$WWW$SUB_B64_PATH")
+  [ -n "${PANEL_PATH:-}" ] && CF_TRANSACTION_PATHS+=("$WWW$PANEL_PATH" "$WWW${PANEL_PATH%.html}-login.html")
+  snapshot_files "$state_bak" "${CF_TRANSACTION_PATHS[@]}" \
+    || { rm -rf "$state_bak"; die "无法备份 CF 相关状态"; }
   # 先备份旧隧道服务: 新 token 装失败时能回滚, 不至于把已有隧道(本机其它隧道/旧 CF-Vless)弄丢
-  [ -f "$cfsvc" ] && { cfbak="$(mktemp)"; cp -a "$cfsvc" "$cfbak"; }
+  if [ -f "$cfsvc" ]; then
+    cfbak="$(mktemp)" || { rm -rf "$state_bak"; die "无法创建 cloudflared 服务备份"; }
+    cp -a "$cfsvc" "$cfbak" || { rm -f "$cfbak"; rm -rf "$state_bak"; die "无法备份现有 cloudflared 服务，未执行切换"; }
+  fi
   cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
   if ! cloudflared service install "$CF_TOKEN"; then
-    cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"   # 有旧隧道切回, 首次接入则卸掉装一半的, 不留孤儿
-    die "cloudflared service install 失败(token 错误/过期?)。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
+    cf_rollback_or_die "$state_bak" "$cfbak" "cloudflared service install 失败(token 错误/过期?)。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
   fi
   # cfbak 先保留: 后续 sing-box check / apply_singbox_config 任一失败, 都要把 cloudflared 切回旧隧道(见下)
-  systemctl enable --now cloudflared >/dev/null 2>&1 || true
-  # ③ 低配/丢包机器硬化 cloudflared: 强制 http2(抖动链路比 QUIC 稳) + 放宽启动超时, 避免反复重启失败
+  systemctl enable --now cloudflared >/dev/null 2>&1 || cf_rollback_or_die "$state_bak" "$cfbak" "新 cloudflared 服务未能启动，已恢复旧状态"
+  # 保持 protocol=auto：官方会优先 QUIC，UDP 不通时自动回退 HTTP/2；不要为“稳定”牺牲正常线路性能。
   if [ -f "$cfsvc" ]; then
     cp -a "$cfsvc" "${cfsvc}.singbox-bak.$(date +%s)" 2>/dev/null || true
-    grep -q -- '--protocol' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --protocol http2#' "$cfsvc"
-    grep -q -- '--loglevel' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --loglevel warn#' "$cfsvc"   # 降日志, 省低配机 journald I/O
-    grep -q '^TimeoutStartSec=' "$cfsvc" || sed -i '/^\[Service\]/a TimeoutStartSec=60' "$cfsvc"
-    grep -q '^Type=' "$cfsvc" && sed -i 's/^Type=.*/Type=simple/' "$cfsvc" || sed -i '/^\[Service\]/a Type=simple' "$cfsvc"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart cloudflared >/dev/null 2>&1 || true
-    ok "cloudflared 已硬化: --protocol http2 + --loglevel warn + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
+    sed -i -E 's/[[:space:]]+--protocol[[:space:]]+(http2|quic|auto)//g' "$cfsvc" \
+      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 服务失败，已恢复旧状态"
+    grep -q -- '--loglevel' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --loglevel warn#' "$cfsvc" \
+      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 日志参数失败，已恢复旧状态"
+    grep -q '^TimeoutStartSec=' "$cfsvc" || sed -i '/^\[Service\]/a TimeoutStartSec=60' "$cfsvc" \
+      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 超时参数失败，已恢复旧状态"
+    { grep -q '^Type=' "$cfsvc" && sed -i 's/^Type=.*/Type=simple/' "$cfsvc"; } || sed -i '/^\[Service\]/a Type=simple' "$cfsvc" \
+      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 服务类型失败，已恢复旧状态"
+    systemctl daemon-reload >/dev/null 2>&1 \
+      && systemctl restart cloudflared >/dev/null 2>&1 \
+      && systemctl is-active --quiet cloudflared \
+      || cf_rollback_or_die "$state_bak" "$cfbak" "cloudflared 重启失败，已恢复旧状态"
+    ok "cloudflared 已优化: protocol=auto(QUIC 优先/HTTP2 回退) + --loglevel warn + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
   fi
 
   # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)。
@@ -2572,51 +3206,49 @@ EOF
   # 这之后任一步失败, 除回滚 sing-box 配置外, 还要 cf_restore_service 把 cloudflared 切回旧隧道(token 已换)。
   local tmpc=""
   # mktemp/render 也纳入回滚保护: errexit 下它们若失败(如磁盘满)会直接退出, 不补这层就会跳过 cloudflared 回滚。
-  tmpc="$(mktemp)" || { cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "创建临时文件失败, 已恢复旧隧道"; }
-  render_singbox_config >"$tmpc" || { rm -f "$tmpc"; cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "渲染配置失败, 已恢复旧隧道"; }
-  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "加入 CF 入站后 sing-box 配置校验失败, 已保留原配置并恢复旧隧道; 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
-  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; cf_restore_service "$cfbak"; [ -n "$cfbak" ] && rm -f "$cfbak"; die "加入 CF 入站后 sing-box 重启失败, 已回滚配置并恢复旧隧道; 看 systemctl status sing-box"; }
+  tmpc="$(mktemp)" || cf_rollback_or_die "$state_bak" "$cfbak" "创建临时文件失败, 已恢复旧状态"
+  render_singbox_config >"$tmpc" || { rm -f "$tmpc"; cf_rollback_or_die "$state_bak" "$cfbak" "渲染配置失败, 已恢复旧状态"; }
+  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; cf_rollback_or_die "$state_bak" "$cfbak" "加入 CF 入站后 sing-box 配置校验失败, 已恢复旧状态; 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
+  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; cf_rollback_or_die "$state_bak" "$cfbak" "加入 CF 入站后 sing-box 重启失败, 已恢复旧状态; 看 systemctl status sing-box"; }
   rm -f "$tmpc"
-  [ -n "$cfbak" ] && rm -f "$cfbak"   # 全流程成功, 旧隧道备份不再需要
   # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
   # ② 先验本机 28080 入站, 再验公网隧道: 一眼分清是 sing-box 坏还是 cloudflared/Tunnel 坏。
   # 验证必须排在 write_subscription 之前: 隧道没通就把 CF-Vless 写进订阅 = 客户端多一条死节点,
   # 万一客户端手动选中它, 表现是"所有流量都断", 正是最难自查的场景。
   log "验证(先本机 $CF_PORT, 再公网隧道; 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
-  local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
-  if curl -isS -m 8 --http1.1 -H "Host: $CF_HOSTNAME" "${ws_hdr[@]}" "http://127.0.0.1:$CF_PORT$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
+  local local_ok=0 public_ok=0
+  if websocket_101 "http://127.0.0.1:$CF_PORT$CF_WS_PATH" "$CF_HOSTNAME"; then
+    local_ok=1
     ok "本机 WS 入站 127.0.0.1:$CF_PORT 正常(101) —— sing-box 侧 OK"
   else
-    warn "本机 WS 入站未拿到 101: 先查 sing-box 的 cf-vless-ws-in / CF_WS_PATH / CF_VLESS_UUID(不是 cloudflared 的锅)"
+    warn "本机 WS 入站未拿到严格 HTTP 101"
   fi
-  local cf_verified=0
-  if curl -isS -m 10 "${ws_hdr[@]}" "https://$CF_HOSTNAME$CF_WS_PATH" 2>/dev/null | grep -qi '101'; then
-    cf_verified=1
+  if [ "$local_ok" = 1 ] && websocket_101 "https://$CF_HOSTNAME$CF_WS_PATH"; then
+    public_ok=1
   fi
+  if [ "$local_ok" != 1 ] || [ "$public_ok" != 1 ]; then
+    cf_rollback_or_die "$state_bak" "$cfbak" "新 CF Tunnel 未同时通过本机和公网 HTTP/1.1 101，已恢复此前工作状态；稍后确认 DNS/Tunnel 后重试"
+  fi
+  local cf_verified=1
 
   # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)。
   # CF_VERIFIED 决定该节点是否进订阅: 未验证通过时后续 install/warp 也不会把死节点加回来。
-  ( umask 077; cat >"$CF_ENV" <<EOF
+  atomic_write_file "$CF_ENV" 600 <<EOF || cf_rollback_or_die "$state_bak" "$cfbak" "写入 CF 状态失败，已恢复旧状态"
 CF_HOSTNAME=$CF_HOSTNAME
 CF_PORT=$CF_PORT
 CF_VLESS_UUID=$CF_VLESS_UUID
 CF_WS_PATH=$CF_WS_PATH
 CF_VERIFIED=$cf_verified
+CF_NAME=$CF_NAME
 EOF
-  )
   CF_VERIFIED="$cf_verified"
-  write_subscription   # 同时刷新 Clash 订阅与通用(base64)订阅
+  write_subscription || cf_rollback_or_die "$state_bak" "$cfbak" "发布 CF 订阅失败，已恢复旧状态"
+  rm -f "$CF_PENDING_ENV" || cf_rollback_or_die "$state_bak" "$cfbak" "清理旧 CF 待重接状态失败，已恢复旧状态"
+  rm -rf "$state_bak"
+  [ -n "$cfbak" ] && rm -f "$cfbak"
 
-  if [ "$cf_verified" = 1 ]; then
-    ok "公网隧道连通(101)。CF-Vless 已加入订阅, 客户端重新拉订阅即可看到。"
-    ok "CF-Vless 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
-  else
-    warn "公网未拿到 101: 若上面本机 101 正常, 问题在 cloudflared/DNS/Tunnel(502/530/1033 这类), 不在 sing-box。"
-    warn "按'验证通过才加入订阅'的原则, 本次【未】把 CF-Vless 写进订阅(否则客户端会多一条连不上的死节点)。"
-    echo "  隧道通了之后重跑一次 'bash install.sh cf' 即可加入订阅(参数会自动沿用)。"
-    echo "  复测: systemctl is-active cloudflared sing-box; journalctl -u cloudflared -n 50 --no-pager | grep -Ei 'Registered|timeout|error|quic|http2'"
-    note "CF-Vless 隧道未验证通过, 暂未加入订阅; 隧道正常后重跑 'bash install.sh cf'。"
-  fi
+  ok "公网隧道连通(严格 HTTP/1.1 101)。$CF_NAME 已加入订阅, 客户端重新拉订阅即可看到。"
+  ok "$CF_NAME 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
 }
 
 install_wgcf() {
@@ -2661,15 +3293,35 @@ do_warp() {
   # 失败则保留原配置与状态, 避免"配置仍带 WARP 但状态文件已丢"的不一致。
   if [ "${1:-}" = "off" ]; then
     [ -f "$WARP_ENV" ] || { ok "未启用 WARP 分流, 无需关闭"; return 0; }
+    local warp_off_bak
+    warp_off_bak="$(mktemp -d "$SB_DIR/.warp-off-backup.XXXXXX")" || die "无法创建 WARP 关闭回滚目录"
+    snapshot_files "$warp_off_bak" "$SB_DIR/config.json" "$WARP_ENV" || { rm -rf "$warp_off_bak"; die "无法备份 WARP 关闭前状态"; }
+    _rollback_warp_off() {
+      local rollback_rc=0
+      restore_files "$warp_off_bak" "$SB_DIR/config.json" "$WARP_ENV" || rollback_rc=1
+      systemctl reset-failed sing-box >/dev/null 2>&1 || true
+      systemctl restart sing-box >/dev/null 2>&1 || rollback_rc=1
+      systemctl is-active --quiet sing-box >/dev/null 2>&1 || rollback_rc=1
+      if [ "$rollback_rc" -eq 0 ]; then rm -rf "$warp_off_bak"; else err "WARP 关闭回滚不完整，备份保留在: $warp_off_bak"; fi
+      return "$rollback_rc"
+    }
     WARP_PRIVATE_KEY=""; WARP_ADDR_V4=""; WARP_ADDR_V6=""; WARP_RESERVED=""   # 清空 shell 变量→渲染出无 WARP 配置(暂不删 WARP_ENV)
-    local tmpc; tmpc="$(mktemp)"
-    render_singbox_config >"$tmpc"
+    local tmpc; tmpc="$(mktemp)" || { _rollback_warp_off || true; return 1; }
+    render_singbox_config >"$tmpc" || { rm -f "$tmpc"; _rollback_warp_off || true; return 1; }
     if sing-box check -c "$tmpc" >/dev/null 2>&1 && apply_singbox_config "$tmpc"; then
-      rm -f "$tmpc" "$WARP_ENV"   # 无 WARP 配置已成功落地, 现在才删状态文件
+      rm -f "$tmpc"
+      if ! rm -f "$WARP_ENV"; then
+        warn "无 WARP 配置已生效，但状态文件删除失败，正在恢复旧状态"
+        _rollback_warp_off || true
+        return 1
+      fi
+      rm -rf "$warp_off_bak"
       ok "已关闭 WARP 分流(原解锁站点恢复走 VPS 直连出口)"
     else
       rm -f "$tmpc"
+      _rollback_warp_off || true
       warn "关闭 WARP 失败(校验或重启未通过), 已保留原 WARP 配置与状态不动(WARP_ENV 未删)"
+      return 1
     fi
     return 0
   fi
@@ -2711,29 +3363,43 @@ do_warp() {
   # WARP_ENV 状态也等"校验+重启都成功"后再落盘: 否则校验失败(如 sing-box<1.12 不支持 wireguard endpoint)
   # 却留下"已启用"状态文件, 会让后续 install/重启继续尝试启用 WARP 而反复失败。
   log "生成带 WARP 分流的配置并校验..."
-  local tmpc; tmpc="$(mktemp)"
+  local tmpc warp_state_bak
+  warp_state_bak="$(mktemp -d "$SB_DIR/.warp-backup.XXXXXX")" || die "无法创建 WARP 回滚目录"
+  snapshot_files "$warp_state_bak" "$SB_DIR/config.json" "$WARP_ENV" || { rm -rf "$warp_state_bak"; die "无法备份 WARP 相关状态"; }
+  _rollback_warp_state() {
+    local rollback_rc=0
+    restore_files "$warp_state_bak" "$SB_DIR/config.json" "$WARP_ENV" || rollback_rc=1
+    systemctl reset-failed sing-box >/dev/null 2>&1 || true
+    systemctl restart sing-box >/dev/null 2>&1 || rollback_rc=1
+    systemctl is-active --quiet sing-box >/dev/null 2>&1 || rollback_rc=1
+    if [ "$rollback_rc" -eq 0 ]; then rm -rf "$warp_state_bak"; else err "WARP 回滚不完整，备份保留在: $warp_state_bak"; fi
+    return "$rollback_rc"
+  }
+  tmpc="$(mktemp)" || { _rollback_warp_state || true; return 1; }
   render_singbox_config >"$tmpc"
   if sing-box check -c "$tmpc" >/dev/null 2>&1; then
     if apply_singbox_config "$tmpc"; then
       rm -f "$tmpc"
-      ( umask 077; cat >"$WARP_ENV" <<EOF
+      atomic_write_file "$WARP_ENV" 600 <<EOF || { warn "WARP 配置已生效但状态文件写入失败，正在恢复旧状态"; _rollback_warp_state || true; return 1; }
 WARP_PRIVATE_KEY='$WARP_PRIVATE_KEY'
 WARP_ADDR_V4='$WARP_ADDR_V4'
 WARP_ADDR_V6='$WARP_ADDR_V6'
 WARP_RESERVED='$WARP_RESERVED'
 WARP_SITES='$WARP_SITES'
 EOF
-      )
+      rm -rf "$warp_state_bak"
       ok "WARP 解锁分流已开启 —— 这些站点走 WARP 出口: $WARP_SITES"
       echo "  改站点: WARP_SITES='openai,anthropic,google-gemini,tiktok' bash install.sh warp   |  关闭: bash install.sh warp off"
       echo "  若能连但仍被拦(解锁没生效), 多半是缺 reserved: 编辑 $WARP_ENV 设 WARP_RESERVED='a,b,c' 后重跑 warp"
     else
       rm -f "$tmpc"
+      _rollback_warp_state || true
       warn "带 WARP 的配置重启失败, 已回滚到旧配置(现有节点不受影响); 看 systemctl status sing-box"
       return 1
     fi
   else
     rm -f "$tmpc"
+    rm -rf "$warp_state_bak"
     warn "带 WARP 的配置 sing-box check 未通过, 已保留原配置(现有节点不受影响)。"
     echo "  最可能原因: sing-box < 1.12(wireguard endpoint 需 1.12+) —— 先升级: bash install.sh update 再重跑 warp"
     return 1
@@ -2747,6 +3413,83 @@ do_install() {
   install_deps
   time_sync
   install_singbox
+
+  # 从这里开始会改持久状态。整个后半段作为一笔事务：任何函数 die/返回非零都会触发 EXIT trap，
+  # 恢复升级前的密钥、配置、订阅、Nginx、流量脚本和端口跳跃；包安装与 ufw 放行是幂等外部副作用，
+  # 不做反向卸载。这样不会出现 sing-box 已切新配置、订阅或 Nginx 却只完成一半的混合状态。
+  if [ -f "$SECRETS" ]; then load_secrets || die "密钥文件格式非法, 为保护现有节点拒绝继续: $SECRETS"; fi
+  INSTALL_TX_OLD_SUB_PATH="${SUB_PATH:-}"; INSTALL_TX_OLD_B64_PATH="${SUB_B64_PATH:-}"; INSTALL_TX_OLD_PANEL_PATH="${PANEL_PATH:-}"
+  INSTALL_TX_OLD_SINGBOX_ACTIVE=0; INSTALL_TX_OLD_NGINX_ACTIVE=0; INSTALL_TX_OLD_PORTHOP_ACTIVE=0; INSTALL_TX_ROLLBACK_STARTED=0
+  mkdir -p "$SB_DIR" || die "无法创建 sing-box 状态目录"
+  INSTALL_TX_BACKUP="$(mktemp -d "$SB_DIR/.install-backup.XXXXXX")" || die "无法创建安装回滚目录"
+  INSTALL_TX_PATHS=(
+    "$SECRETS" "$ENVFILE" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$SB_DIR/config.json"
+    "$NGINX_SNIPPET" "$NGINX_CONF" "$NGINX_MAIN" "$NGINX_DEFAULT_SITE" "$NGINX_DEFAULT_CONF"
+    "$TRAFFIC_PY" "$CRON" "$SYSCTL_CONF" "$BBR_MODULE_CONF"
+    "$PORTHOP_SERVICE" "$SB_DIR/porthop.nft"
+  )
+  [ -n "$INSTALL_TX_OLD_SUB_PATH" ] && INSTALL_TX_PATHS+=("$WWW$INSTALL_TX_OLD_SUB_PATH")
+  [ -n "$INSTALL_TX_OLD_B64_PATH" ] && INSTALL_TX_PATHS+=("$WWW$INSTALL_TX_OLD_B64_PATH")
+  [ -n "$INSTALL_TX_OLD_PANEL_PATH" ] && INSTALL_TX_PATHS+=("$WWW$INSTALL_TX_OLD_PANEL_PATH" "$WWW${INSTALL_TX_OLD_PANEL_PATH%.html}-login.html")
+  snapshot_files "$INSTALL_TX_BACKUP" "${INSTALL_TX_PATHS[@]}" || { rm -rf "$INSTALL_TX_BACKUP"; INSTALL_TX_BACKUP=""; die "无法备份现有安装状态"; }
+  systemctl is-active --quiet sing-box 2>/dev/null && INSTALL_TX_OLD_SINGBOX_ACTIVE=1 || true
+  systemctl is-active --quiet nginx 2>/dev/null && INSTALL_TX_OLD_NGINX_ACTIVE=1 || true
+  systemctl is-active --quiet sing-box-porthop 2>/dev/null && INSTALL_TX_OLD_PORTHOP_ACTIVE=1 || true
+
+  _rollback_install() {
+    [ "$INSTALL_TX_ROLLBACK_STARTED" = 0 ] || return 1
+    INSTALL_TX_ROLLBACK_STARTED=1
+    set +e
+    local rollback_rc=0
+    warn "安装后半段失败，正在恢复此前工作状态..."
+    restore_files "$INSTALL_TX_BACKUP" "${INSTALL_TX_PATHS[@]}" || rollback_rc=1
+    [ -n "${SUB_PATH:-}" ] && [ "$SUB_PATH" != "$INSTALL_TX_OLD_SUB_PATH" ] && rm -f "$WWW$SUB_PATH"
+    [ -n "${SUB_B64_PATH:-}" ] && [ "$SUB_B64_PATH" != "$INSTALL_TX_OLD_B64_PATH" ] && rm -f "$WWW$SUB_B64_PATH"
+    if [ -n "${PANEL_PATH:-}" ] && [ "$PANEL_PATH" != "$INSTALL_TX_OLD_PANEL_PATH" ]; then
+      rm -f "$WWW$PANEL_PATH" "$WWW${PANEL_PATH%.html}-login.html"
+    fi
+    sysctl --system >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$INSTALL_TX_OLD_PORTHOP_ACTIVE" = 1 ]; then
+      systemctl enable --now sing-box-porthop >/dev/null 2>&1 || rollback_rc=1
+    else
+      systemctl disable --now sing-box-porthop >/dev/null 2>&1 || true
+      command -v nft >/dev/null 2>&1 && nft delete table inet sb_hophy2 >/dev/null 2>&1 || true
+    fi
+    if [ "$INSTALL_TX_OLD_SINGBOX_ACTIVE" = 1 ]; then
+      systemctl reset-failed sing-box >/dev/null 2>&1 || true
+      systemctl restart sing-box >/dev/null 2>&1 || rollback_rc=1
+      systemctl is-active --quiet sing-box >/dev/null 2>&1 || rollback_rc=1
+    else
+      systemctl stop sing-box >/dev/null 2>&1 || true
+    fi
+    if [ "$INSTALL_TX_OLD_NGINX_ACTIVE" = 1 ]; then
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || rollback_rc=1
+      else
+        rollback_rc=1
+      fi
+    else
+      systemctl stop nginx >/dev/null 2>&1 || true
+    fi
+    [ -f "$TRAFFIC_PY" ] && "$PY" "$TRAFFIC_PY" >/dev/null 2>&1 || true
+    if [ "$rollback_rc" -eq 0 ]; then
+      rm -rf "$INSTALL_TX_BACKUP"
+      INSTALL_TX_BACKUP=""
+      warn "已恢复安装前状态"
+    else
+      err "自动回滚不完整，备份保留在: $INSTALL_TX_BACKUP"
+    fi
+    return "$rollback_rc"
+  }
+  _install_exit_trap() {
+    local rc=$?
+    trap - EXIT
+    if [ "$rc" -ne 0 ]; then _rollback_install || true; fi
+    exit "$rc"
+  }
+  trap '_install_exit_trap' EXIT
+
   detect_net
   check_reality_sni   # best-effort 探测偷证书目标是否支持 TLS1.3+H2, 填错只提示
   gen_secrets
@@ -2763,30 +3506,33 @@ do_install() {
   config_firewall
   config_porthop
   print_summary
+  trap - EXIT
+  rm -rf "$INSTALL_TX_BACKUP"
+  INSTALL_TX_BACKUP=""; INSTALL_TX_PATHS=(); INSTALL_TX_ROLLBACK_STARTED=0
 }
 
 main() {
   need_root
   case "${1:-install}" in
-    install)   do_install ;;
+    install)   with_maintenance_lock do_install ;;
     info)      do_info ;;
-    panel)     do_panel ;;
-    panel-pass) shift; do_panel_pass "$@" ;;
+    panel)     with_maintenance_lock do_panel ;;
+    panel-pass) shift; with_maintenance_lock do_panel_pass "$@" ;;
     links)     do_links ;;
     status)    do_status ;;
     doctor)    do_doctor ;;
-    set)       shift; do_set "$@" ;;
+    set)       shift; with_maintenance_lock do_set "$@" ;;
     backup)    do_backup ;;
-    restore)   shift; do_restore "$@" ;;
-    harden)    do_harden ;;
-    update)    do_update ;;
-    restart)   do_restart ;;
-    cf)        do_cf ;;
-    warp)      shift; do_warp "$@" ;;
-    admin)     shift; do_admin "$@" ;;
-    komari)    do_komari ;;
+    restore)   shift; with_maintenance_lock do_restore "$@" ;;
+    harden)    with_maintenance_lock do_harden ;;
+    update)    with_maintenance_lock do_update ;;
+    restart)   with_maintenance_lock do_restart ;;
+    cf)        with_maintenance_lock do_cf ;;
+    warp)      shift; with_maintenance_lock do_warp "$@" ;;
+    admin)     shift; with_maintenance_lock do_admin "$@" ;;
+    komari)    with_maintenance_lock do_komari ;;
     menu)      do_menu ;;
-    uninstall) do_uninstall ;;
+    uninstall) with_maintenance_lock do_uninstall ;;
     *) echo "用法: $0 [install|info|panel|panel-pass <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]"; exit 1 ;;
   esac
 }

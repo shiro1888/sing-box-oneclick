@@ -102,18 +102,18 @@ CFCFG="$(ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfuuid CF_WS_PATH=
 if printf '%s' "$CFCFG" | python -c "import json,sys;d=json.load(sys.stdin);assert [i['tag'] for i in d['inbounds']]==['hy2-in','anytls-in','vless-in','ss-in','cf-vless-ws-in'];c=[i for i in d['inbounds'] if i['tag']=='cf-vless-ws-in'][0];assert c['listen']=='127.0.0.1' and c['transport']['type']=='ws'" 2>"$TMP/e"; then
   echo "PASS  含 cf 入站(127.0.0.1 ws)且为第5入站"; else echo "FAIL  cf-config"; cat "$TMP/e"; fail=1; fi
 
-ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfuuid CF_WS_PATH=/cf-abc render render_subscription_yaml > "$TMP/subcf.yaml"
+ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfuuid CF_WS_PATH=/cf-abc CF_NAME=CF-TEST-WS render render_subscription_yaml > "$TMP/subcf.yaml"
 if python - "$TMP/subcf.yaml" <<'PYV' 2>"$TMP/e"
 import yaml,sys
 d=yaml.safe_load(open(sys.argv[1],encoding='utf-8'))
 names=[p['name'] for p in d['proxies']]
-assert names==['Hysteria2','AnyTLS','Vless','SS2022','CF-Vless'], names
-cf=[p for p in d['proxies'] if p['name']=='CF-Vless'][0]
+assert names==['Hysteria2','AnyTLS','Vless','SS2022','CF-TEST-WS'], names
+cf=[p for p in d['proxies'] if p['name']=='CF-TEST-WS'][0]
 assert cf['type']=='vless' and cf['network']=='ws' and cf['server']=='cf.example.com'
 assert cf['ws-opts']['path']=='/cf-abc' and cf['ws-opts']['headers']['Host']=='cf.example.com'
-assert d['proxy-groups'][0]['proxies'][-1]=='CF-Vless'
+assert d['proxy-groups'][0]['proxies'][-1]=='CF-TEST-WS'
 PYV
-then echo "PASS  订阅含 CF-Vless 节点且在代理组末位"; else echo "FAIL  cf-sub"; cat "$TMP/e"; fail=1; fi
+then echo "PASS  订阅含自定义 CF_NAME 且在代理组末位"; else echo "FAIL  cf-sub"; cat "$TMP/e"; fail=1; fi
 
 # 确认不开 CF 时不会冒出 CF 节点
 NOCF="$(ANYTLS_OK=1 render render_subscription_yaml)"
@@ -131,11 +131,58 @@ clink '^ss://2022-blake3-aes-128-gcm:.+@1\.2\.3\.4:4435#' 'ss SIP022 链接(meth
 if printf '%s' "$LINKS" | grep -q 'ss://.*=='; then echo "FAIL  ss 密码未百分号编码"; fail=1; else echo "PASS  ss 密码已百分号编码(无裸 ==)"; fi
 if printf '%s' "$LINKS" | grep -q 'CF-Vless'; then echo "FAIL  未开CF却有CF-Vless链接"; fail=1; else echo "PASS  无CF时无 CF-Vless 链接"; fi
 
-LINKSCF="$(ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfu CF_WS_PATH=/cf-x render render_share_links)"
-if printf '%s' "$LINKSCF" | grep -qE '^vless://cfu@cf\.example\.com:443\?.*type=ws'; then echo "PASS  开CF后有 CF-Vless(ws) 链接"; else echo "FAIL  CF 链接"; fail=1; fi
+LINKSCF="$(ANYTLS_OK=1 CF_HOSTNAME=cf.example.com CF_VLESS_UUID=cfu CF_WS_PATH=/cf-x CF_NAME=CF-TEST-WS render render_share_links)"
+if printf '%s' "$LINKSCF" | grep -qE '^vless://cfu@cf\.example\.com:443\?.*type=ws.*#CF-TEST-WS$'; then echo "PASS  开CF后分享链接使用自定义 CF_NAME"; else echo "FAIL  CF 链接"; fail=1; fi
 
 B64="$(ANYTLS_OK=1 render render_share_links | base64 -w0)"
 if printf '%s' "$B64" | base64 -d 2>/dev/null | grep -q '^hysteria2://'; then echo "PASS  base64 通用订阅可解码且含链接"; else echo "FAIL  base64 往返"; fail=1; fi
+
+echo
+echo "=== 4c2) 订阅地址校验 + 原子发布保护 ==="
+if NODE_ADDR=';' render render_subscription_yaml >/dev/null 2>&1; then
+  echo "FAIL  非法 NODE_ADDR 被写进订阅"; fail=1
+else
+  echo "PASS  非法 NODE_ADDR 在渲染前被拒绝"
+fi
+
+AT="$TMP/sub-atomic"; rm -rf "$AT"; mkdir -p "$AT/www"
+printf 'old-yaml\n' > "$AT/www/sub.yaml"
+printf 'old-b64\n' > "$AT/www/sub.txt"
+printf 'old-panel\n' > "$AT/www/panel.html"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  WWW="'"$AT"'/www"; SUB_PATH=/sub.yaml; SUB_B64_PATH=/sub.txt; PANEL_PATH=/panel.html; PANEL_MAP="'"$AT"'/no-map"
+  render_share_links(){ return 1; }
+  write_subscription' >/dev/null 2>&1; then
+  echo "FAIL  分享链接渲染失败却仍发布订阅"; fail=1
+elif [ "$(cat "$AT/www/sub.yaml")" = old-yaml ] && [ "$(cat "$AT/www/sub.txt")" = old-b64 ] && [ "$(cat "$AT/www/panel.html")" = old-panel ]; then
+  echo "PASS  后续产物失败时既有 YAML/Base64/看板均保持不变"
+else
+  echo "FAIL  渲染失败时已有静态文件被截断或部分覆盖"; fail=1
+fi
+
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  WWW="'"$AT"'/www"; SUB_PATH=/sub.yaml; SUB_B64_PATH=/sub.txt; PANEL_PATH=/panel.html; PANEL_MAP="'"$AT"'/no-map"
+  write_subscription' >/dev/null 2>&1 \
+  && grep -q 'server: 1.2.3.4' "$AT/www/sub.yaml" \
+  && base64 -d "$AT/www/sub.txt" 2>/dev/null | grep -q '@1.2.3.4:' \
+  && grep -q 'class="ncard"' "$AT/www/panel.html"; then
+  echo "PASS  全部产物校验成功后原子发布"
+else
+  echo "FAIL  合法订阅未能通过校验并发布"; fail=1
+fi
+
+# 整组提交中途失败时，前面已替换的目标也必须恢复，不能留下半新半旧静态文件。
+TX="$TMP/publish-tx"; rm -rf "$TX"; mkdir -p "$TX"; printf 'old-a\n' >"$TX/a"; printf 'old-b\n' >"$TX/b"; printf 'new-a\n' >"$TX/new-a"; printf 'new-b\n' >"$TX/new-b"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  TX="'"$TX"'"; real_mv="$(type -P mv)"; n=0
+  mv(){ n=$((n+1)); [ "$n" -eq 2 ] && return 1; "$real_mv" "$@"; }
+  publish_files_transaction "$TX/new-a" "$TX/a" "$TX/new-b" "$TX/b"' >/dev/null 2>&1; then
+  echo "FAIL  文件组中途提交失败却返回成功"; fail=1
+elif [ "$(cat "$TX/a")" = old-a ] && [ "$(cat "$TX/b")" = old-b ]; then
+  echo "PASS  文件组中途提交失败时整组回滚"
+else
+  echo "FAIL  文件组失败后留下半提交状态"; ls -la "$TX"; fail=1
+fi
 
 echo
 echo "=== 4d) set 改参数(env 更新 + 校验) ==="
@@ -170,6 +217,81 @@ else
 fi
 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$SETD"'/env"; SECRETS="'"$SETD"'/secrets"; TRAFFIC_PY="'"$SETD"'/nope.py"; ip(){ return 0; }; do_set INTERFACE=eth1' >/dev/null 2>&1
 grep -q '^INTERFACE=eth1$' "$SETD/env" && echo "PASS  do_set 接受存在的网卡并落盘" || { echo "FAIL  do_set 合法网卡未落盘"; grep INTERFACE "$SETD/env"; fail=1; }
+# set 改 HY2 护栏时要保留已有 CF/WARP 入站，不能因没加载状态而把可选节点删掉。
+SETX="$TMP/set-preserve"; rm -rf "$SETX"; mkdir -p "$SETX/sb" "$SETX/www"
+cat >"$SETX/env" <<'E'
+LIMIT_GB=200
+EXPIRE_AT=""
+INTERFACE=eth0
+COUNT_MODE=tx
+SUB_HOST="1.2.3.4"
+PUBLIC_IP="1.2.3.4"
+DOMAIN=""
+AIRPORT_NAME="US-01"
+NODE_ADDR="1.2.3.4"
+HY2_PORT=4433
+ANYTLS_PORT=4434
+VLESS_PORT=443
+SS_PORT=4435
+SS_METHOD=2022-blake3-aes-128-gcm
+REALITY_SNI=www.bing.com
+TLS_SNI=www.bing.com
+HY2_HOP_RANGE=
+HY2_UP=
+HY2_DOWN=
+HY2_UP_MBPS=
+HY2_DOWN_MBPS=
+ENABLE_BLOCK_BT=1
+ENABLE_BLOCK_ADS=1
+ENABLE_HY2=1
+ENABLE_OBFS=1
+SS_UDP=1
+E
+cat >"$SETX/sb/secrets" <<'E'
+HY2_PASSWORD=pw1
+ANYTLS_PASSWORD=pw2
+VLESS_UUID=11111111-1111-1111-1111-111111111111
+REALITY_PRIVATE_KEY=PRIVKEY
+REALITY_PUBLIC_KEY=PUBKEY
+REALITY_SHORT_ID=abcdef0123456789
+SUB_PATH=/sub.yaml
+SUB_B64_PATH=/sub.txt
+PANEL_PATH=/panel.html
+SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="
+OBFS_PASSWORD=obfs123
+E
+cat >"$SETX/sb/cf.env" <<'E'
+CF_HOSTNAME=cf.example.com
+CF_PORT=28080
+CF_VLESS_UUID=22222222-2222-2222-2222-222222222222
+CF_WS_PATH=/cf-test
+CF_VERIFIED=1
+CF_NAME=CF-TEST-WS
+E
+cat >"$SETX/sb/warp.env" <<'E'
+WARP_PRIVATE_KEY='cHJpdmtleTEyMw=='
+WARP_ADDR_V4='172.16.0.2/32'
+WARP_ADDR_V6='2606:4700:110:8a36::2/128'
+WARP_RESERVED=''
+WARP_SITES='openai'
+E
+printf '{"inbounds":[{"tag":"anytls-in"}]}' >"$SETX/sb/config.json"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="'"$SETX"'/sb"; SECRETS="'"$SETX"'/sb/secrets"; ENVFILE="'"$SETX"'/env"; CF_ENV="'"$SETX"'/sb/cf.env"; WARP_ENV="'"$SETX"'/sb/warp.env"; WWW="'"$SETX"'/www"; PANEL_MAP="'"$SETX"'/no-map"; TRAFFIC_PY="'"$SETX"'/no-traffic"
+  systemctl(){ return 0; }; nginx(){ return 0; }; sing-box(){ return 0; }; do_set HY2_UP_MBPS=80' >/dev/null 2>&1 \
+  && grep -q 'cf-vless-ws-in' "$SETX/sb/config.json" \
+  && grep -q '"tag": "warp"' "$SETX/sb/config.json" \
+  && grep -q 'CF-TEST-WS' "$SETX/www/sub.yaml"; then
+  echo "PASS  do_set 重渲染时保留 CF 与 WARP 状态"
+else
+  echo "FAIL  do_set 重渲染丢失 CF/WARP"
+  PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+    SB_DIR="'"$SETX"'/sb"; SECRETS="'"$SETX"'/sb/secrets"; ENVFILE="'"$SETX"'/env"; CF_ENV="'"$SETX"'/sb/cf.env"; WARP_ENV="'"$SETX"'/sb/warp.env"; WWW="'"$SETX"'/www"; PANEL_MAP="'"$SETX"'/no-map"; TRAFFIC_PY="'"$SETX"'/no-traffic"
+    systemctl(){ return 0; }; nginx(){ return 0; }; sing-box(){ return 0; }; do_set HY2_UP_MBPS=80' 2>&1 || true
+  grep -E 'cf-vless-ws-in|"tag": "warp"' "$SETX/sb/config.json" 2>/dev/null || true
+  grep -F 'CF-TEST-WS' "$SETX/www/sub.yaml" 2>/dev/null || true
+  fail=1
+fi
 # cf_restore_service 首次接入(空备份)应卸载刚装的新隧道, 不留孤儿服务
 MK="$TMP/cf_uninstall_mk"; rm -f "$MK"
 PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; cloudflared(){ [ "${1:-} ${2:-}" = "service uninstall" ] && touch "'"$MK"'"; return 0; }; systemctl(){ return 0; }; cf_restore_service ""' >/dev/null 2>&1
@@ -220,12 +342,12 @@ if printf '%s' "$PANELCF" | grep -qF 'CF-Vless'; then echo "PASS  开CF后看板
 # 安装上下文是 set -euo pipefail, 看板渲染不能中断(qrencode 失败/缺失都该优雅降级)
 if PYTHON="$PYTHON_BIN" bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1 || true; SUB_HOST=1.2.3.4 SUB_PATH=/s.yaml SUB_B64_PATH=/b.txt ANYTLS_OK=1 AIRPORT_NAME=N; render_panel_html >/dev/null'; then echo "PASS  看板渲染在 set -euo pipefail 下不中断"; else echo "FAIL  看板渲染 set -e 中断"; fail=1; fi
 # 看板页登录(panel-pass): 自定义登录页 + nginx 用 cookie==密码 服务端校验(非网页 JS 假门)
-grep -qF 'if ($sb_ok = 0)' install.sh && grep -qF 'include $PANEL_MAP' install.sh \
-  && echo "PASS  config_nginx 注入未登录跳登录页 + cookie 校验(看板真鉴权)" || { echo "FAIL  缺 nginx cookie 鉴权注入"; fail=1; }
+grep -qF 'if ($sb_ok = 0)' install.sh && grep -qF 'include $PANEL_MAP' install.sh && grep -qF 'absolute_redirect off;' install.sh \
+  && echo "PASS  config_nginx 注入看板真鉴权 + 相对跳转(不泄漏内部端口)" || { echo "FAIL  缺 nginx cookie 鉴权或相对跳转保护"; fail=1; }
 # 登录页渲染: 合法 HTML, 写 cookie sbauth, 跳看板路径; 不含密码
 LG="$(PANEL_PATH=/panel-x.html AIRPORT_NAME=MyNode render render_panel_login_html)"
-if printf '%s' "$LG" | python -c "import sys,html.parser;html.parser.HTMLParser().feed(sys.stdin.read())" 2>/dev/null && printf '%s' "$LG" | grep -qF "sbauth=" && printf '%s' "$LG" | grep -qF '"/panel-x.html"'; then
-  echo "PASS  登录页合法 HTML(写 cookie sbauth + 跳看板)"; else echo "FAIL  登录页渲染"; fail=1; fi
+if printf '%s' "$LG" | python -c "import sys,html.parser;html.parser.HTMLParser().feed(sys.stdin.read())" 2>/dev/null && printf '%s' "$LG" | grep -qF "sbauth=" && printf '%s' "$LG" | grep -qF "location.protocol==='https:'?'; secure':''" && printf '%s' "$LG" | grep -qF '"/panel-x.html"'; then
+  echo "PASS  登录页合法 HTML(HTTPS cookie 加 Secure + 跳看板)"; else echo "FAIL  登录页渲染"; fail=1; fi
 # panel-pass <密码>: 写 nginx map(含密码)+ 渲染登录页
 PP="$TMP/pptest"; rm -rf "$PP"; mkdir -p "$PP/www"; printf 'PANEL_PATH=/panel-x.html\n' > "$PP/secrets"
 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
@@ -234,6 +356,18 @@ PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 
   do_panel_pass abcdef123' >/dev/null 2>&1
 if grep -qF 'map $cookie_sbauth $sb_ok' "$PP/map.conf" 2>/dev/null && grep -qF '"abcdef123" 1;' "$PP/map.conf" 2>/dev/null && [ -f "$PP/www/panel-x-login.html" ]; then
   echo "PASS  panel-pass 写 nginx map(cookie==密码)+ 渲染登录页"; else echo "FAIL  panel-pass 生成"; cat "$PP/map.conf" 2>/dev/null; ls "$PP/www" 2>/dev/null; fail=1; fi
+# 新认证文件已生成但 Nginx 配置失败时，map、登录页、看板必须整组恢复。
+cp "$PP/map.conf" "$PP/map.before"; cp "$PP/www/panel-x-login.html" "$PP/login.before"; cp "$PP/www/panel-x.html" "$PP/panel.before"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map.conf"; WWW="'"$PP"'/www"
+  config_nginx(){ return 1; }; nginx(){ return 0; }; systemctl(){ return 0; }
+  do_panel_pass newpass123' >/dev/null 2>&1; then
+  echo "FAIL  Nginx 失败时 panel-pass 应返回失败"; fail=1
+elif cmp -s "$PP/map.before" "$PP/map.conf" && cmp -s "$PP/login.before" "$PP/www/panel-x-login.html" && cmp -s "$PP/panel.before" "$PP/www/panel-x.html"; then
+  echo "PASS  panel-pass/Nginx 失败时认证文件组恢复旧状态"
+else
+  echo "FAIL  panel-pass 失败留下半更新认证文件"; fail=1
+fi
 # 非法字符密码应被拒
 if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
   SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map2.conf"; WWW="'"$PP"'/www"
@@ -244,6 +378,15 @@ if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/nu
   SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map3.conf"; WWW="'"$PP"'/www"
   config_nginx(){ return 0; }; nginx(){ return 0; }
   do_panel_pass ABCdef123' >/dev/null 2>&1; then echo "FAIL  panel-pass 应拒绝大写密码"; fail=1; else echo "PASS  panel-pass 拒绝大写密码(nginx 大小写不敏感)"; fi
+# 以 ~ 开头会被 nginx map 当正则；保留字会改变 map 语义，两者都必须拒绝。
+for badpw in '~abcdef' default hostnames volatile include; do
+  if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+    SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/reserved.conf"; WWW="'"$PP"'/www"
+    config_nginx(){ return 0; }; nginx(){ return 0; }; do_panel_pass "'"$badpw"'"' >/dev/null 2>&1; then
+    echo "FAIL  panel-pass 应拒绝 nginx map 特殊密码: $badpw"; fail=1
+  fi
+done
+echo "PASS  panel-pass 拒绝 ~ 正则前缀与 map 保留字"
 # panel-pass off: 删 map + 登录页
 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
   SECRETS="'"$PP"'/secrets"; ENVFILE="'"$PP"'/nope"; PANEL_MAP="'"$PP"'/map.conf"; WWW="'"$PP"'/www"
@@ -255,8 +398,8 @@ echo x > "$PP/map_on"
 PL_ON="$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
   PANEL_MAP="'"$PP"'/map_on"; PANEL_PATH=/panel-x.html; SB_DIR="'"$TMP"'/sbtest"; SUB_HOST=1.2.3.4; SUB_PATH=/s.yaml; SUB_B64_PATH=/b.txt; ANYTLS_OK=1
   render_panel_html')"
-printf '%s' "$PL_ON" | grep -qF 'onclick="lo()"' && printf '%s' "$PL_ON" | grep -qF 'function lo()' \
-  && echo "PASS  开登录时看板有退出按钮(清 cookie 回登录页)" || { echo "FAIL  看板缺退出按钮"; fail=1; }
+printf '%s' "$PL_ON" | grep -qF 'onclick="lo()"' && printf '%s' "$PL_ON" | grep -qF 'function lo()' && printf '%s' "$PL_ON" | grep -qF "location.protocol==='https:'?'; secure':''" \
+  && echo "PASS  开登录时看板有退出按钮(按协议清 Secure cookie 后回登录页)" || { echo "FAIL  看板缺退出按钮或 Secure cookie 处理"; fail=1; }
 printf '%s' "$PANEL" | grep -qF 'onclick="lo()"' && { echo "FAIL  未开登录却有退出按钮"; fail=1; } || echo "PASS  未开登录时看板无退出按钮"
 
 echo
@@ -278,6 +421,57 @@ if command -v tar >/dev/null 2>&1; then
     echo "FAIL  restore 应拒绝白名单外成员(evil.txt)"; fail=1
   else
     echo "PASS  restore 拒绝白名单外成员(解包前 die)"; fi
+
+  # 合法迁移包中的 cf.env 只能转为 pending；没有新 Connector token 时不能直接进入新机订阅。
+  RSP="$TMP/restore-pending"; rm -rf "$RSP"; mkdir -p "$RSP/src/etc/sing-box" "$RSP/root/etc/sing-box"
+  cat >"$RSP/src/etc/sing-box/node-secrets.env" <<'E'
+HY2_PASSWORD=pw1
+ANYTLS_PASSWORD=pw2
+VLESS_UUID=11111111-1111-1111-1111-111111111111
+REALITY_PRIVATE_KEY=PRIVKEY
+REALITY_PUBLIC_KEY=PUBKEY
+REALITY_SHORT_ID=abcdef0123456789
+SUB_PATH=/sub.yaml
+SUB_B64_PATH=/sub.txt
+PANEL_PATH=/panel.html
+SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="
+OBFS_PASSWORD=obfs123
+E
+  cat >"$RSP/src/etc/sing-box/cf.env" <<'E'
+CF_HOSTNAME=cf.example.com
+CF_PORT=28080
+CF_VLESS_UUID=22222222-2222-2222-2222-222222222222
+CF_WS_PATH=/cf-test
+CF_VERIFIED=1
+CF_NAME=CF-TEST-WS
+E
+  ( cd "$RSP/src" && tar czf "$RSP/good.tar.gz" etc/sing-box/node-secrets.env etc/sing-box/cf.env ) 2>/dev/null
+  if RSP="$RSP" PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+    RESTORE_ROOT="$RSP/root"; SB_DIR="$RESTORE_ROOT/etc/sing-box"; SECRETS="$SB_DIR/node-secrets.env"; ENVFILE="$RESTORE_ROOT/etc/sing-box-node.env"; CF_ENV="$SB_DIR/cf.env"; CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env"; WARP_ENV="$SB_DIR/warp.env"
+    do_install(){ [ -z "$CF_HOSTNAME" ] && [ -z "$CF_VLESS_UUID" ] && [ "${CF_VERIFIED:-}" = 0 ]; }; do_restore "$RSP/good.tar.gz" >/dev/null 2>&1 \
+    && [ ! -e "$RSP/root/etc/sing-box/cf.env" ] \
+    && grep -q "^CF_HOSTNAME=cf.example.com$" "$RSP/root/etc/sing-box/cf.restore-pending.env" \
+    && load_cf_pending_env'; then
+    echo "PASS  restore 将旧 CF 状态转为待重接，不直接发布死节点"
+  else
+    echo "FAIL  restore 未正确生成 CF pending 状态"; fail=1
+  fi
+
+  # 重建失败时必须恢复迁移前状态，不能把旧机备份覆盖在当前机器后半途退出。
+  printf 'HY2_PASSWORD=before\n' >"$RSP/root/etc/sing-box/node-secrets.env"
+  printf 'CF_HOSTNAME=before.example.com\nCF_PORT=28080\nCF_VLESS_UUID=44444444-4444-4444-4444-444444444444\nCF_WS_PATH=/before\nCF_VERIFIED=1\nCF_NAME=CF-BEFORE-WS\n' >"$RSP/root/etc/sing-box/cf.env"
+  if RSP="$RSP" PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+    RESTORE_ROOT="$RSP/root"; SB_DIR="$RESTORE_ROOT/etc/sing-box"; SECRETS="$SB_DIR/node-secrets.env"; ENVFILE="$RESTORE_ROOT/etc/sing-box-node.env"; CF_ENV="$SB_DIR/cf.env"; CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env"; WARP_ENV="$SB_DIR/warp.env"
+    systemctl(){ return 0; }; nginx(){ return 0; }; do_install(){ return 1; }; do_restore "$RSP/good.tar.gz"' >"$RSP/fail.out" 2>&1; then
+    echo "FAIL  restore 重建失败却返回成功"; fail=1
+  elif grep -q '^HY2_PASSWORD=before$' "$RSP/root/etc/sing-box/node-secrets.env" && grep -q '^CF_HOSTNAME=before.example.com$' "$RSP/root/etc/sing-box/cf.env"; then
+    echo "PASS  restore 重建失败恢复迁移前状态"
+  else
+    echo "FAIL  restore 失败后未恢复旧状态"
+    sed -n '1,80p' "$RSP/fail.out" 2>/dev/null || true
+    grep -E '^(HY2_PASSWORD|CF_HOSTNAME)=' "$RSP/root/etc/sing-box/node-secrets.env" "$RSP/root/etc/sing-box/cf.env" "$RSP/root/etc/sing-box/cf.restore-pending.env" 2>/dev/null || true
+    fail=1
+  fi
 else echo "skip  (未安装 tar, 跳过 restore 校验)"; fi
 
 # apply_singbox_config: 重启失败必须回滚旧配置(systemctl 用桩函数模拟成功/失败)
@@ -293,13 +487,57 @@ if PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; SB
 grep -qF 'render_singbox_config >"$SB_DIR/config.json"' install.sh && { echo "FAIL  write_singbox_config 仍直接覆盖正式 config"; fail=1; } || echo "PASS  主安装路径不再直接覆盖正式 config"
 if grep -qF 'cf_restore_service "$cfbak"' install.sh && [ "$(grep -c cf_restore_service install.sh)" -ge 3 ]; then
   echo "PASS  do_cf 后续失败均回滚旧 cloudflared 隧道(cf_restore_service)"; else echo "FAIL  do_cf 缺 cloudflared 回滚"; fail=1; fi
-grep -qF 'rm -f "$tmpc" "$WARP_ENV"' install.sh && echo "PASS  warp off 成功落地后才删 WARP_ENV" || { echo "FAIL  warp off WARP_ENV 删除时机"; fail=1; }
+grep -qF 'if ! rm -f "$WARP_ENV"' install.sh && grep -qF '_rollback_warp_off' install.sh \
+  && echo "PASS  warp off 成功落地后才删 WARP_ENV，删除失败会回滚" || { echo "FAIL  warp off WARP_ENV 删除/回滚时机"; fail=1; }
+
+# 重复 CF 接入的新隧道若公网 101 失败，旧服务/config/cf.env/订阅必须一起回来。
+CFT="$TMP/cf-tx"; rm -rf "$CFT"; mkdir -p "$CFT/sb" "$CFT/www" "$CFT/systemd"
+cp "$SETX/sb/secrets" "$CFT/sb/secrets"; cp "$SETX/env" "$CFT/env"; cp "$SETX/sb/cf.env" "$CFT/sb/cf.env"
+printf 'old-config\n' >"$CFT/sb/config.json"; printf 'old-service\n' >"$CFT/systemd/cloudflared.service"; printf 'old-yaml\n' >"$CFT/www/sub.yaml"; printf 'old-b64\n' >"$CFT/www/sub.txt"; printf 'old-panel\n' >"$CFT/www/panel.html"
+if CFT="$CFT" CF_TOKEN=dummy CF_HOSTNAME=new.example.com CF_PORT=29090 CF_VLESS_UUID=33333333-3333-3333-3333-333333333333 CF_WS_PATH=/new-ws CF_NAME=CF-NEW-WS PYTHON="$PYTHON_BIN" bash -c '
+  set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="$CFT/sb"; SECRETS="$SB_DIR/secrets"; ENVFILE="$CFT/env"; CF_ENV="$SB_DIR/cf.env"; CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env"; WARP_ENV="$SB_DIR/no-warp"; WWW="$CFT/www"; CF_SERVICE="$CFT/systemd/cloudflared.service"
+  detect_net(){ PUBLIC_IP=1.2.3.4; SUB_HOST=1.2.3.4; NODE_ADDR=1.2.3.4; INTERFACE=eth0; IS_IPV6=0; }; cloudflared(){ if [ "${1:-} ${2:-}" = "service install" ]; then printf "[Service]\nType=notify\nExecStart=/usr/local/bin/cloudflared tunnel run\n" >"$CF_SERVICE"; fi; return 0; }; systemctl(){ return 0; }; render_singbox_config(){ printf "new-config\n"; }; sing-box(){ return 0; }; apply_singbox_config(){ cp "$1" "$SB_DIR/config.json"; }; websocket_101(){ return 1; }
+  do_cf' >/dev/null 2>&1; then
+  echo "FAIL  CF 101 失败却返回成功"; fail=1
+elif grep -q '^old-config$' "$CFT/sb/config.json" && grep -q '^old-service$' "$CFT/systemd/cloudflared.service" && grep -q '^CF_HOSTNAME=cf.example.com$' "$CFT/sb/cf.env" && grep -q '^old-yaml$' "$CFT/www/sub.yaml"; then
+  echo "PASS  重复 CF 接入验证失败恢复旧 Tunnel、配置、状态和订阅"
+else
+  echo "FAIL  CF 失败回滚不完整"; fail=1
+fi
 # write_singbox_config 端到端: 重启失败必须回滚旧配置(桩 sing-box/systemctl)
 WT="$TMP/wsctest"; rm -rf "$WT"; mkdir -p "$WT"; echo '{"sentinel":"old"}' > "$WT/config.json"
 PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e
   SB_DIR="'"$WT"'"; sing-box(){ return 0; }; systemctl(){ case "$1" in restart) return 1;; *) return 0;; esac; }
   write_singbox_config' >/dev/null 2>&1
 if grep -q sentinel "$WT/config.json"; then echo "PASS  write_singbox_config 重启失败端到端回滚旧配置"; else echo "FAIL  write_singbox_config 回滚"; cat "$WT/config.json" 2>/dev/null; fail=1; fi
+
+# 主安装后半段任一步失败，都应恢复密钥/env/config/订阅/Nginx，且清掉本次新生成的随机文件。
+IT="$TMP/install-tx"; rm -rf "$IT"; mkdir -p "$IT/sb" "$IT/www" "$IT/nginx/snippets" "$IT/nginx/conf.d" "$IT/systemd" "$IT/bin"
+cat >"$IT/sb/secrets" <<'E'
+HY2_PASSWORD=oldhy2
+ANYTLS_PASSWORD=oldany
+VLESS_UUID=11111111-1111-1111-1111-111111111111
+REALITY_PRIVATE_KEY=oldprivate
+REALITY_PUBLIC_KEY=oldpublic
+REALITY_SHORT_ID=abcdef0123456789
+SUB_PATH=/old.yaml
+SUB_B64_PATH=/old.txt
+PANEL_PATH=/old.html
+SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="
+OBFS_PASSWORD=oldobfs
+E
+printf 'old-env\n' >"$IT/env"; printf '{"old":1}\n' >"$IT/sb/config.json"; printf 'old-yaml\n' >"$IT/www/old.yaml"; printf 'old-b64\n' >"$IT/www/old.txt"; printf 'old-panel\n' >"$IT/www/old.html"; printf 'old-header\n' >"$IT/nginx/snippets/header"; printf 'old-conf\n' >"$IT/nginx/conf.d/site"; printf 'events{} http{}\n' >"$IT/nginx/nginx.conf"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="'"$IT"'/sb"; SECRETS="$SB_DIR/secrets"; ENVFILE="'"$IT"'/env"; WWW="'"$IT"'/www"; NGINX_SNIPPET="'"$IT"'/nginx/snippets/header"; NGINX_CONF="'"$IT"'/nginx/conf.d/site"; NGINX_MAIN="'"$IT"'/nginx/nginx.conf"; NGINX_DEFAULT_SITE="'"$IT"'/nginx/no-site"; NGINX_DEFAULT_CONF="'"$IT"'/nginx/no-default"; TRAFFIC_PY="'"$IT"'/bin/traffic.py"; CRON="'"$IT"'/cron"; SYSCTL_CONF="'"$IT"'/sysctl"; BBR_MODULE_CONF="'"$IT"'/modules"; PORTHOP_SERVICE="'"$IT"'/systemd/porthop.service"; CF_ENV="$SB_DIR/no-cf"; WARP_ENV="$SB_DIR/no-warp"
+  detect_os(){ PKG=apt; }; install_deps(){ :; }; time_sync(){ :; }; install_singbox(){ ANYTLS_OK=1; }; detect_net(){ PUBLIC_IP=1.2.3.4; SUB_HOST=1.2.3.4; NODE_ADDR=1.2.3.4; INTERFACE=eth0; IS_IPV6=0; }; check_reality_sni(){ :; }; gen_cert(){ :; }; config_sysctl(){ :; }; write_singbox_config(){ printf new-config >"$SB_DIR/config.json"; }; write_subscription(){ printf new-yaml >"$WWW$SUB_PATH"; }; config_nginx(){ printf new-nginx >"$NGINX_CONF"; die forced-install-failure; }; install_traffic(){ :; }; config_firewall(){ :; }; config_porthop(){ :; }; print_summary(){ :; }; nginx(){ return 0; }; systemctl(){ return 0; }; sysctl(){ return 0; }
+  do_install' >/dev/null 2>&1; then
+  echo "FAIL  主安装故障注入应返回失败"; fail=1
+elif grep -q '^old-env$' "$IT/env" && grep -q '"old":1' "$IT/sb/config.json" && grep -q '^old-yaml$' "$IT/www/old.yaml" && grep -q '^old-conf$' "$IT/nginx/conf.d/site"; then
+  echo "PASS  主安装后半段失败恢复旧配置与静态状态"
+else
+  echo "FAIL  主安装事务回滚不完整"; find "$IT" -maxdepth 3 -type f -print; fail=1
+fi
 
 echo
 echo "=== 4h) WARP 解锁分流渲染 ==="
@@ -593,8 +831,8 @@ out=$(ENABLE_OBFS=0 PYTHON="$PYTHON_BIN" bash -c '
   SB_DIR="'"$OBT"'"; SECRETS="'"$OBT"'/secrets.env"
   gen_secrets >/dev/null 2>&1
   echo "OBFS=[$OBFS_PASSWORD]"' 2>/dev/null)
-if [ "$out" = "OBFS=[]" ] && ! grep -q '^OBFS_PASSWORD=' "$OBT/secrets.env"; then
-  echo "PASS  ENABLE_OBFS=0 清空 OBFS_PASSWORD 并从 secrets 删除(混淆真的关掉)"
+if [ "$out" = "OBFS=[]" ] && grep -q '^OBFS_PASSWORD=$' "$OBT/secrets.env"; then
+  echo "PASS  ENABLE_OBFS=0 清空 OBFS_PASSWORD 并原子重写 secrets(混淆真的关掉)"
 else echo "FAIL  ENABLE_OBFS=0 未能关闭混淆: $out"; fail=1; fi
 # 默认(ENABLE_OBFS=1)不能误删已有 obfs 密码
 printf 'SS_PASSWORD="MTIzNDU2Nzg5MGFiY2RlZg=="\nOBFS_PASSWORD="keepme123"\nSUB_B64_PATH=/b.txt\nPANEL_PATH=/p.html\nSUB_PATH=/s.yaml\n' > "$OBT/secrets.env"
@@ -608,12 +846,12 @@ if [ "$out" = "OBFS=[keepme123]" ]; then
 
 echo
 echo "=== 4p) CF-Vless 未验证不进订阅(文档铁律: 验证通过才加入) ==="
-CFV='CF_HOSTNAME=cf.example.com CF_VLESS_UUID=11111111-1111-1111-1111-111111111111 CF_WS_PATH=/w'
+CFV='CF_HOSTNAME=cf.example.com CF_VLESS_UUID=11111111-1111-1111-1111-111111111111 CF_WS_PATH=/w CF_NAME=CF-TEST-WS'
 out=$(env $CFV CF_VERIFIED=1 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_subscription_yaml' 2>/dev/null)
-if printf '%s' "$out" | grep -q 'CF-Vless'; then
-  echo "PASS  CF_VERIFIED=1 时 CF-Vless 进订阅"; else echo "FAIL  已验证却没进订阅"; fail=1; fi
+if printf '%s' "$out" | grep -q 'CF-TEST-WS'; then
+  echo "PASS  CF_VERIFIED=1 时自定义 CF_NAME 进订阅"; else echo "FAIL  已验证却没进订阅"; fail=1; fi
 out=$(env $CFV CF_VERIFIED=0 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_subscription_yaml' 2>/dev/null)
-if ! printf '%s' "$out" | grep -q 'CF-Vless'; then
+if ! printf '%s' "$out" | grep -q 'CF-TEST-WS'; then
   echo "PASS  CF_VERIFIED=0 时订阅不含 CF-Vless(不产生死节点)"; else echo "FAIL  未验证的 CF 节点仍进了订阅"; fail=1; fi
 out=$(env $CFV CF_VERIFIED=0 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; render_share_links' 2>/dev/null)
 if ! printf '%s' "$out" | grep -q 'cf.example.com'; then
@@ -627,6 +865,49 @@ CF_WS_PATH=/w
 out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; CF_ENV="'"$TMP"'/old-cf.env"; load_cf_env; render_subscription_yaml' 2>/dev/null)
 if printf '%s' "$out" | grep -q 'CF-Vless'; then
   echo "PASS  旧 cf.env 无 CF_VERIFIED 时按已验证处理(向后兼容)"; else echo "FAIL  升级会让老用户 CF 节点消失"; fail=1; fi
+
+printf 'CF_HOSTNAME=cf.example.com\nCF_PORT=28080\nCF_VLESS_UUID=11111111-1111-1111-1111-111111111111\nCF_WS_PATH=/w\nCF_VERIFIED=1\nCF_NAME=CF-OCI-ARM-WS\n' > "$TMP/new-cf.env"
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; CF_ENV="'"$TMP"'/new-cf.env"; load_cf_env; render_subscription_yaml' 2>/dev/null)
+if printf '%s' "$out" | grep -q 'CF-OCI-ARM-WS'; then
+  echo "PASS  cf.env 持久化 CF_NAME 并用于订阅"; else echo "FAIL  CF_NAME 未持久生效"; fail=1; fi
+
+# do_cf 载入旧状态后必须让本次显式参数重新赢回来；否则换域名/端口会被旧 cf.env 静默覆盖。
+out=$(CF_HOSTNAME=new.example.com CF_PORT=29090 CF_VLESS_UUID=33333333-3333-3333-3333-333333333333 CF_WS_PATH=/new-ws CF_NAME=CF-NEW-WS PYTHON="$PYTHON_BIN" bash -c '
+  set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  CF_ENV="'"$TMP"'/new-cf.env"; load_cf_env
+  [ -n "$_CLI_CF_HOSTNAME" ] && CF_HOSTNAME="$_CLI_CF_HOSTNAME"; [ -n "$_CLI_CF_PORT" ] && CF_PORT="$_CLI_CF_PORT"; [ -n "$_CLI_CF_VLESS_UUID" ] && CF_VLESS_UUID="$_CLI_CF_VLESS_UUID"; [ -n "$_CLI_CF_WS_PATH" ] && CF_WS_PATH="$_CLI_CF_WS_PATH"; [ -n "$_CLI_CF_NAME" ] && CF_NAME="$_CLI_CF_NAME"
+  printf "%s|%s|%s|%s|%s" "$CF_HOSTNAME" "$CF_PORT" "$CF_VLESS_UUID" "$CF_WS_PATH" "$CF_NAME"' 2>/dev/null)
+if [ "$out" = 'new.example.com|29090|33333333-3333-3333-3333-333333333333|/new-ws|CF-NEW-WS' ]; then
+  echo "PASS  显式 CF 参数覆盖旧 cf.env"
+else
+  echo "FAIL  旧 cf.env 覆盖了本次显式 CF 参数: $out"; fail=1
+fi
+
+# 只接受 HTTP 状态行里的精确 101；1016 等错误码不能误判，握手成功后 curl 因超时非零也应算成功。
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  curl(){ printf "HTTP/1.1 1016 Origin DNS error\r\n\r\n"; return 0; }; websocket_101 http://x && printf BAD || printf REJECTED
+  curl(){ printf "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"; return 28; }; websocket_101 http://x && printf "|ACCEPTED" || printf "|BAD"' 2>/dev/null)
+if [ "$out" = 'REJECTED|ACCEPTED' ]; then
+  echo "PASS  WebSocket 验证严格匹配状态码 101 且容忍握手后超时"
+else
+  echo "FAIL  WebSocket 101 判定错误: $out"; fail=1
+fi
+
+# 旧 Tunnel 回滚若服务仍起不来必须返回失败并保留服务备份，不能误报已恢复后删掉唯一副本。
+CFR="$TMP/cf-restore-fail"; rm -rf "$CFR"; mkdir -p "$CFR"; printf 'old-service\n' >"$CFR/backup.service"
+if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  CF_SERVICE="'"$CFR"'/cloudflared.service"; cloudflared(){ return 0; }; systemctl(){ case "${1:-}" in is-active) return 1;; *) return 0;; esac; }; cf_restore_service "'"$CFR"'/backup.service"' >/dev/null 2>&1; then
+  echo "FAIL  cloudflared 回滚失败却返回成功"; fail=1
+elif [ -f "$CFR/backup.service" ]; then
+  echo "PASS  cloudflared 回滚失败会报错并保留旧服务备份"
+else
+  echo "FAIL  cloudflared 回滚失败时丢失备份"; fail=1
+fi
+
+grep -qF 'modprobe tcp_bbr' install.sh && grep -qF 'BBR_MODULE_CONF=/etc/modules-load.d/singbox-bbr.conf' install.sh \
+  && echo "PASS  BBR 模块即时加载并持久化" || { echo "FAIL  BBR 模块加载持久化缺失"; fail=1; }
+grep -qF 'ws_resp="$(curl' install.sh && grep -qF '|| true)' install.sh \
+  && echo "PASS  doctor 的 WS 101 探测不受 curl 超时/pipefail 误报" || { echo "FAIL  WS 101 探测仍会把成功误报为失败"; fail=1; }
 
 echo
 echo "=== 4q) EXPIRE_AT 不再捏造安装日+365天 ==="
@@ -726,6 +1007,38 @@ else echo "PASS  do_update 正确传播下载失败"; fi
 if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; CF_ENV="'"$UT"'/no-cf"; systemctl(){ return 1; }; do_restart' >/dev/null 2>&1; then
   echo "FAIL  do_restart 吞掉服务失败"; fail=1
 else echo "PASS  do_restart 正确传播服务失败"; fi
+
+# 菜单包装必须让动作内部真正启用 errexit，且返回菜单后恢复调用方原来的 shell 选项。
+MENU_MARK="$TMP/menu-errexit"; rm -f "$MENU_MARK"
+out=$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; set +e
+  action(){ false; touch "'"$MENU_MARK"'"; }; run_menu_action action >/dev/null 2>&1; case $- in *e*) printf ON;; *) printf OFF;; esac' 2>/dev/null)
+if [ "$out" = OFF ] && [ ! -e "$MENU_MARK" ]; then
+  echo "PASS  菜单动作内部 errexit 生效且恢复调用方选项"
+else
+  echo "FAIL  菜单错误传播/选项恢复异常: $out"; fail=1
+fi
+
+# 已持有维护锁时第二个修改动作必须被拒，避免并发快照互相覆盖。
+if command -v flock >/dev/null 2>&1; then
+  LK="$TMP/maint-lock"; rm -rf "$LK"; mkdir -p "$LK"
+  (
+    PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SB_DIR="'"$LK"'"; MAINT_LOCK_WAIT=2; with_maintenance_lock bash -c "sleep 3"' >/dev/null 2>&1
+  ) & lock_pid=$!
+  sleep 0.3
+  if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SB_DIR="'"$LK"'"; MAINT_LOCK_WAIT=1; with_maintenance_lock true' >/dev/null 2>&1; then
+    echo "FAIL  维护锁未阻止并发修改"; fail=1
+  else
+    echo "PASS  维护锁阻止并发修改"
+  fi
+  wait "$lock_pid" 2>/dev/null || true
+  if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; SB_DIR="'"$LK"'"; MAINT_LOCK_WAIT=1; with_maintenance_lock true; with_maintenance_lock true' >/dev/null 2>&1; then
+    echo "PASS  维护动作完成后释放锁，可在同一菜单进程连续运行"
+  else
+    echo "FAIL  维护锁完成后未释放"; fail=1
+  fi
+else
+  echo "skip  (未安装 flock, 跳过维护锁并发测试)"
+fi
 
 echo
 echo "=== 5) 流量头 + 内嵌脚本 ==="

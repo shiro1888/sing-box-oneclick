@@ -29,6 +29,8 @@
 - **HY2 进阶（按需）**：salamander 混淆默认开（抗 QUIC 识别）；`HY2_HOP_RANGE` 端口跳跃抗运营商 UDP 限速；`HY2_UP/HY2_DOWN` brutal 暴力带宽烂线路提速；`HY2_UP_MBPS/HY2_DOWN_MBPS` **服务端带宽护栏**（给套餐峰值留余量，防压测/多人下载打爆 UDP 队列）。见环境变量表。
 - **可选**：ufw（默认关，避免锁死 SSH）。
 - **不破坏现有节点**：二次运行复用已有密钥（含升级时自动补 SS2022 / 保留 CF-Vless）。
+- **事务化维护**：安装后半段、`set`、`panel-pass`、CF 重接以及订阅/看板文件组都先快照再发布；任一步失败会恢复旧配置，自动回滚不完整时保留备份路径并明确报警。
+- **并发保护**：修改型命令使用维护锁，同一时间只允许一个 `install/cf/warp/set/restore/panel-pass` 等动作，避免两个旧快照互相覆盖。
 
 ---
 
@@ -105,6 +107,8 @@ LIMIT_GB=500 COUNT_MODE=tx AIRPORT_NAME=JP-01 bash install.sh
 ```
 
 > 重装保参数：二次运行 `install.sh` 会沿用 `/etc/sing-box-node.env` 里已有的 `LIMIT_GB`/`EXPIRE_AT`/`COUNT_MODE`/HY2 护栏等；本次显式传入的环境变量仍然优先。所以升级重跑不会把你 `set` 过的配置打回默认值。
+>
+> 状态兼容：端口、SNI、节点地址、机场名、协议开关等现已完整持久化。升级老版本时若 env 缺这些键，脚本会从已有订阅/看板回填后再重写，避免单独运行 `set`/`panel` 时用默认值覆盖真实节点参数。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -150,13 +154,13 @@ sudo bash install.sh status      # 状态体检: 服务/配置/端口/时间/证
 sudo bash install.sh doctor      # 一键自检常见坑: sysctl调优/防火墙+安全组/证书到期/外部可达/端口跳跃/内存+swap+IO压力, 带修复提示
 sudo bash install.sh set LIMIT_GB=500 COUNT_MODE=tx   # 可改 LIMIT_GB/EXPIRE_AT/COUNT_MODE/INTERFACE/HY2_UP_MBPS/HY2_DOWN_MBPS; 其余参数(端口/SNI/ENABLE_HY2 等)带环境变量重跑 install.sh 即可, 未传的会自动沿用
 sudo bash install.sh backup      # 打包密钥+配置 -> /root/sing-box-backup-时间.tar.gz
-sudo bash install.sh restore <文件>   # 新 VPS 上恢复(同一套凭证, 客户端不用换密码)
+sudo bash install.sh restore <文件>   # 新 VPS 上恢复；直连凭证不变，CF Tunnel 需拿新 Connector token 重接
 sudo bash install.sh harden      # SSH 加固: 密钥登录+禁密码+fail2ban(必须先有授权公钥)
 sudo bash install.sh warp        # WARP 解锁分流: OpenAI/Claude/Gemini/Netflix/Disney 走 WARP(关闭: warp off)
 sudo bash install.sh admin       # 网页管理面板(仅 127.0.0.1+SSH隧道+token, 改限额/到期/重启/备份; 关闭: admin off)
 sudo bash install.sh update      # 更新 sing-box 到最新版并重启
 sudo bash install.sh restart     # 重启 sing-box / nginx (/ cloudflared)
-sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf    # 接入可选第 5 节点 CF-Vless(见第 3 节)
+sudo CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf    # 接入/重接可选第 5 节点 CF-Vless(见第 3 节)
 sudo KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token bash install.sh komari   # 装 Komari 探针 agent
 sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认；删前自动备份密钥）
 ```
@@ -174,11 +178,11 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认；删前自动�
 
 **给看板页加登录**：嫌「知道链接就能直接打开」不安全，可以加一道登录——一个和看板同款的**自定义登录页**，输密码才放行：
 ```bash
-sudo bash install.sh panel-pass 'your-strong-pass'   # 打开看板会先跳到登录页(密码限 小写字母数字 . _ ~ -, ≥6 位)
+sudo bash install.sh panel-pass 'your-strong-pass'   # 打开看板会先跳到登录页(密码限 小写字母数字 . _ ~ -, ≥6 位；不能以 ~ 开头)
 sudo bash install.sh panel-pass off                  # 关闭登录
 ```
 原理是 **nginx 服务端校验**（真鉴权，不是网页里的 JS 假门）：登录页让你输密码 → JS 把密码写进 cookie 并跳转看板 → **nginx 用 `map` 比对 cookie 是否等于密码**，不对就跳回登录页。密码**只存在 `600 root` 的 `/etc/nginx/.singbox_panel_map.conf`**（由 nginx master 加载，从不下发浏览器），所以 `查看源代码`/`curl` 都拿不到——这点和「网页里弹个 JS 密码框、凭证就在源码里」的**假安全**有本质区别。
-> 边界：明文 HTTP 下 cookie 不加密（同网段可被嗅探），它挡的是「知道链接的人」，要**真加密**仍需 HTTPS（CF Tunnel）；登录无限速，请用**强密码**（`openssl rand -hex 12`）。`map` 片段与登录页 **不随 `backup` 迁移**，换机后重设一次。
+> 边界：明文 HTTP 下 cookie 不加密（同网段可被嗅探），它挡的是「知道链接的人」，要**真加密**仍需 HTTPS（CF Tunnel）；登录无限速，请用**强密码**（`openssl rand -hex 12`）。密码不能以 `~` 开头，也不能使用 nginx `map` 保留字。`map` 片段与登录页 **不随 `backup` 迁移**，换机后重设一次。
 
 ### 网页管理面板（可写，但只在本机）
 如果你想在**网页上**改限额/到期/计费、一键重启、一键备份，而不是敲命令：
@@ -249,9 +253,17 @@ sudo KOMARI_ENDPOINT='https://你的komari面板' KOMARI_TOKEN='节点token' bas
 ```bash
 sudo CF_TOKEN='粘贴你的token' CF_HOSTNAME='cf.example.com' bash install.sh cf
 ```
-脚本会：加一个只监听 `127.0.0.1:28080` 的 VLESS-WS 入站、下载安装 cloudflared 并以 token 起服务、生成 CF 节点密钥、把 `CF-Vless` 并进订阅、再用 `101 Switching Protocols` 验证隧道是否打通。
+脚本会：加一个只监听 `127.0.0.1:28080` 的 VLESS-WS 入站、下载安装 cloudflared 并以 token 起服务、生成 CF 节点密钥，然后先验证本机入站和公网域名都返回**严格 HTTP 状态码 `101`**。两段都通过才写 `cf.env` 并把节点并进订阅；`1016` 等错误码不会被误判成成功。
 
-**第三步**：看到 `101` 后，客户端**重新拉取订阅**，就多出 `CF-Vless` 节点（排在最后，平时不用，直连都挂了再切它）。没通就先别用——脚本会告诉你怎么复测。
+**第三步**：看到 `101` 后，客户端**重新拉取订阅**，就多出 `CF-Vless` 节点（排在最后，平时不用，直连都挂了再切它）。没通时脚本不会发布死节点；如果是在更换 token/域名，会恢复旧 cloudflared 服务、旧 sing-box 配置、CF 状态和订阅。自动回滚本身失败时会保留备份路径并停止继续修改。
+
+换机 `restore` 时，备份里的 `cf.env` 会改名为 `cf.restore-pending.env`：UUID、WS 路径、域名和显示名会保留，但在新机安装 Connector 并通过两段 `101` 前不会进入订阅。迁移后运行：
+
+```bash
+sudo CF_TOKEN='新机 Connector token' bash install.sh cf
+```
+
+本次显式传入的 `CF_HOSTNAME` / `CF_PORT` / `CF_VLESS_UUID` / `CF_WS_PATH` / `CF_NAME` 优先于旧状态，适合在重接时主动换域名或端口。
 
 > 注意：部分 VPS 商家对 Cloudflare/CDN 流量额外计费或不适合走 CF，这种机器就别开。`uninstall` 会一并停掉脚本装的 cloudflared，但 CF 后台那条 Tunnel 要你自己去删。
 
