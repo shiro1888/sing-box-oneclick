@@ -5,3 +5,12 @@
 *.tmp
 *.bak
 *.orig
+
+# 测试可能留下的 Python 产物(正常结束会自动删, 中断时兜底)
+__pycache__/
+*.pyc
+_sbadmin_test.py
+
+# 操作系统杂项
+.DS_Store
+Thumbs.db
