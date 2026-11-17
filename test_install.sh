@@ -676,6 +676,15 @@ out=$(LIMIT_GB=999 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./ins
 if [ "$out" = '999|max' ]; then
   echo "PASS  显式传入 env 优先于文件值(LIMIT_GB=999 覆盖, 其余仍沿用)"
 else echo "FAIL  显式 env 未优先: got '$out'"; fail=1; fi
+# b2) 旧默认 HY2_PORT=4433 在升级时跟到 443; 显式传 4433 则尊重用户选择
+cat >"$MENV" <<'ENVEOF'
+LIMIT_GB=500
+HY2_PORT=4433
+ENVEOF
+out=$(unset HY2_PORT; PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$MENV"'"; merge_env_defaults >/dev/null 2>&1; echo "$HY2_PORT"' 2>/dev/null)
+if [ "$out" = '443' ]; then echo "PASS  旧默认 HY2_PORT=4433 升级迁移到 443"; else echo "FAIL  HY2 端口未迁移: got '$out'"; fail=1; fi
+out=$(HY2_PORT=4433 PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1; ENVFILE="'"$MENV"'"; merge_env_defaults >/dev/null 2>&1; echo "$HY2_PORT"' 2>/dev/null)
+if [ "$out" = '4433' ]; then echo "PASS  显式 HY2_PORT=4433 不被强制迁移"; else echo "FAIL  显式端口被覆盖: got '$out'"; fail=1; fi
 # c) restore 必须保留新机探测到的网络值，不能将备份机器的 IP/订阅 Host/网卡写回。
 cat >"$MENV" <<'ENVEOF'
 LIMIT_GB=500

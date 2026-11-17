@@ -765,6 +765,12 @@ merge_env_defaults() {
     PUBLIC_IP="$current_public"; SUB_HOST="$current_host"; INTERFACE="$current_interface"
     DOMAIN="$current_domain"; NODE_ADDR="${current_node:-$current_public}"
   fi
+  # 一次性迁移: 2026-10 基线把 HY2 入口统一到 UDP 443。旧版默认 4433 的机器在重装时
+  # 自动跟到 443; 显式传 HY2_PORT=4433(或其它端口) 的用户保持自己的选择。
+  if [ -z "${_CLI_HY2_PORT:-}" ] && [ "${HY2_PORT:-}" = 4433 ]; then
+    HY2_PORT=443
+    note "HY2 端口已按 2026-10 基线从 4433 迁移到 UDP 443: 记得在云安全组放行 443/udp(旧 4433 可移除), 并让客户端重新拉订阅。"
+  fi
   for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
             HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS \
             ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
