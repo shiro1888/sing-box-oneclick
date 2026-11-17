@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  sing-box 四协议一键部署脚本
-#  Hysteria2 + AnyTLS + VLESS-Reality-Vision + Shadowsocks-2022  ->  Clash/Mihomo 订阅
+#  sing-box 三协议一键部署脚本
+#  Hysteria2 + AnyTLS + Shadowsocks-2022  ->  Clash/Mihomo 订阅
+#
+#  2026-10 现网口径: 直连 VLESS/Reality 与旧 CF-VLESS 一键路径已退休;
+#  节点只保留 Hysteria2(UDP 443) / AnyTLS(TCP 4434) / SS2022(TCP+UDP 4435)。
 #
 #  用法:
 #    一键(在线):  bash <(curl -fsSL https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/main/install.sh)
-#    本地:        sudo bash install.sh [install|info|panel|panel-pass <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf|warp [off]|admin [off]|komari|menu|uninstall]
+#    本地:        sudo bash install.sh [install|info|panel|panel-pass <密码>|links|status|doctor|set|backup|restore <file>|harden|update|restart|cf off|warp [off]|admin [off]|komari|menu|uninstall]
 #    交互菜单:    sudo bash install.sh menu
 #    可视化看板:  sudo bash install.sh panel        (浏览器看订阅+扫码)
 #    装探针:      KOMARI_ENDPOINT=https://面板 KOMARI_TOKEN=token sudo bash install.sh komari
@@ -17,20 +20,18 @@
 #    DOMAIN=node.example.com 订阅域名(留空=用公网IP,无需域名)
 #    AIRPORT_NAME=US-01     客户端订阅显示名
 #    PUBLIC_IP=1.2.3.4       手动指定公网IP(探测失败时)
-#    HY2_PORT/ANYTLS_PORT/VLESS_PORT/SS_PORT  端口(默认 4433/4434/443/4435)
+#    HY2_PORT/ANYTLS_PORT/SS_PORT  端口(默认 443/4434/4435)
 #    SS_METHOD=2022-blake3-aes-128-gcm  SS2022 加密方法(可改 256-gcm/chacha)
-#    REALITY_SNI/TLS_SNI     伪装域名(默认均为 www.bing.com)
+#    TLS_SNI                 HY2/AnyTLS 自签证书 CN(默认 www.bing.com)
+#    SUB_TLS=auto            订阅 TLS: auto(有域名证书就开 443 HTTPS)|1|0
 #    ENABLE_BBR=1            开启 BBR(默认开,纯 sysctl,安全)
 #    ENABLE_UFW=0            自动配置并启用 ufw(默认关,避免锁死SSH)
 #    ENABLE_OBFS=1           HY2 salamander 混淆(默认开, 抗 QUIC 识别)
 #    ENABLE_BLOCK_BT=1       拦截 BT/PT(默认开, 防被商家封机收滥用投诉)
-#    ENABLE_BLOCK_ADS=1      geosite 拦广告(默认开, 远程 rule_set)
-#    HY2_HOP_RANGE=20000-50000  HY2 端口跳跃 UDP 段(需 nftables + 云安全组放行整段)
-#    HY2_UP=50 HY2_DOWN=200      HY2 brutal 带宽 Mbps(客户端拥塞控制, 要填你真实带宽, 烂线路提速)
-#    HY2_UP_MBPS=80 HY2_DOWN_MBPS=160  HY2 服务端带宽护栏(给套餐峰值留余量, 防压测打爆 UDP 队列)
+#    ENABLE_BLOCK_ADS=1      MRS 广告规则拦截(默认开)
 #
-#  可选第5节点 CF-Vless(大保底, 需先在 CF 后台建 Tunnel 拿 token+域名):
-#    CF_TOKEN=... CF_HOSTNAME=cf.example.com CF_NAME=CF-US-WS bash install.sh cf
+#  HY2 统一使用自动拥塞控制: 不再支持 HY2_HOP_RANGE / HY2_UP / HY2_DOWN /
+#  HY2_UP_MBPS / HY2_DOWN_MBPS; 老机器上的端口跳跃会在重装时自动清理。
 #
 #  适配: Debian/Ubuntu(完整) ; RHEL系 dnf/yum(尽力,nginx 默认站点可能需手动处理)
 # =============================================================================
@@ -55,51 +56,44 @@ PY="${PYTHON:-python3}"
 # 先记录"用户本次是否显式传入"这些运行参数, 再套默认值。
 # 用途: 重装(二次运行 install)时, 已存在的 $ENVFILE 里的值应作为默认被沿用,
 # 但本次命令行显式传的 env 仍要赢 —— 见 do_install 里的 merge_env_defaults。
+# 已下线参数的显式传入必须直接报错: 否则用户以为开了端口跳跃/暴力带宽, 实际配置里没有,
+# 排查方向会被彻底带偏。老 env 文件里的同名键不走这条(load_node_env 会读入后丢弃)。
+for _legacy in HY2_HOP_RANGE HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS; do
+  eval "_legacy_val=\${$_legacy:-}"
+  [ -z "$_legacy_val" ] || die "$_legacy 已下线(2026-10 现网口径: HY2 固定 UDP 443 + 自动拥塞控制), 请去掉该参数后重跑"
+done
+unset _legacy _legacy_val
+
 for _v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
-          HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI \
-          HY2_HOP_RANGE HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS \
+          HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS \
           ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
   eval "_CLI_$_v=\"\${$_v:-}\""
 done
 unset _v
 
-# CF 参数也要在载入 cf.env 前保留本次显式值；否则换 token/域名时会被旧状态静默覆盖。
-_CLI_CF_HOSTNAME="${CF_HOSTNAME:-}"
-_CLI_CF_PORT="${CF_PORT:-}"
-_CLI_CF_VLESS_UUID="${CF_VLESS_UUID:-}"
-_CLI_CF_WS_PATH="${CF_WS_PATH:-}"
-_CLI_CF_NAME="${CF_NAME:-}"
-
 LIMIT_GB="${LIMIT_GB:-200}"
 COUNT_MODE="${COUNT_MODE:-tx}"
 DOMAIN="${DOMAIN:-}"
 AIRPORT_NAME="${AIRPORT_NAME:-US-01}"
-HY2_PORT="${HY2_PORT:-4433}"
+HY2_PORT="${HY2_PORT:-443}"
 ANYTLS_PORT="${ANYTLS_PORT:-4434}"
-VLESS_PORT="${VLESS_PORT:-443}"
 SS_PORT="${SS_PORT:-4435}"
 SS_METHOD="${SS_METHOD:-2022-blake3-aes-128-gcm}"
-CF_PORT="${CF_PORT:-28080}"   # CF-Vless 本地 WS 入站端口(只听 127.0.0.1)
-CF_NAME="${CF_NAME:-CF-Vless}" # 客户端显示名；写入 cf.env，避免重生成订阅时退回默认名
-REALITY_SNI="${REALITY_SNI:-www.bing.com}"
 TLS_SNI="${TLS_SNI:-www.bing.com}"
+# 订阅 TLS: auto=有域名且证书就位才开 443 HTTPS; 1=强制; 0=只用 80 HTTP
+SUB_TLS="${SUB_TLS:-auto}"
 ENABLE_BBR="${ENABLE_BBR:-1}"
 ENABLE_UFW="${ENABLE_UFW:-0}"
 ENABLE_OBFS="${ENABLE_OBFS:-1}"      # HY2 salamander 混淆(默认开, 抗 QUIC 识别; 0 关)
 ENABLE_HY2="${ENABLE_HY2:-1}"        # 是否部署 Hysteria2(默认开)。0=不装 HY2:
                                      #   甲骨文小机 / 已被 DDoS 清洗过的机器按文档「按机型选协议组合」走 TCP 组合时用。
-                                     #   关掉后: 不写 hy2 入站、订阅与分享链接不含 HY2、不放行 UDP 端口、不配端口跳跃。
+                                     #   关掉后: 不写 hy2 入站、订阅与分享链接不含 HY2、不放行 UDP 端口。
 SS_UDP="${SS_UDP:-1}"                # SS2022 是否走 UDP(默认开)。0=TCP-only 稳定版:
                                      #   订阅写 udp: false 且不放行 SS 的 UDP 端口(服务端仍监听, 客户端不走 UDP)。
 ENABLE_BLOCK_BT="${ENABLE_BLOCK_BT:-1}"    # 拦截 BT/PT(默认开, 防被商家封机收滥用投诉; 0 关)
-ENABLE_BLOCK_ADS="${ENABLE_BLOCK_ADS:-1}"  # geosite 拦广告(默认开; 用远程 rule_set; 0 关)
+ENABLE_BLOCK_ADS="${ENABLE_BLOCK_ADS:-1}"  # MRS 广告规则拦截(默认开; 0 关)
 KOMARI_ENDPOINT="${KOMARI_ENDPOINT:-}"  # Komari 探针面板地址(install.sh komari 用)
 KOMARI_TOKEN="${KOMARI_TOKEN:-}"        # Komari 节点 token
-HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"   # HY2 端口跳跃 UDP 段(如 20000-50000, 空=不启用; 需 nftables+云安全组放行整段)
-HY2_UP="${HY2_UP:-}"                 # HY2 brutal 上行 Mbps(客户端拥塞控制; 空=自适应; 设了即开暴力模式, 要填你真实带宽)
-HY2_DOWN="${HY2_DOWN:-}"             # HY2 brutal 下行 Mbps(同上)
-HY2_UP_MBPS="${HY2_UP_MBPS:-}"       # HY2 服务端带宽护栏 up_mbps(空=不限; 按套餐峰值留余量, 防压测/多人下载打爆 UDP 队列)
-HY2_DOWN_MBPS="${HY2_DOWN_MBPS:-}"   # HY2 服务端带宽护栏 down_mbps(同上; 200Mbps 峰值机参考 up=80/down=160)
 
 # 路径
 SB_DIR=/etc/sing-box
@@ -111,7 +105,6 @@ NGINX_CONF=/etc/nginx/conf.d/00-singbox-sub.conf
 NGINX_MAIN="${NGINX_MAIN:-/etc/nginx/nginx.conf}"
 NGINX_DEFAULT_SITE="${NGINX_DEFAULT_SITE:-/etc/nginx/sites-enabled/default}"
 NGINX_DEFAULT_CONF="${NGINX_DEFAULT_CONF:-/etc/nginx/conf.d/default.conf}"
-CF_SERVICE="${CF_SERVICE:-/etc/systemd/system/cloudflared.service}"
 RESTORE_ROOT="${RESTORE_ROOT:-/}"
 PORTHOP_SERVICE="${PORTHOP_SERVICE:-/etc/systemd/system/sing-box-porthop.service}"
 PANEL_MAP=/etc/nginx/.singbox_panel_map.conf   # 看板页登录: nginx map 片段(600 root, 校验 cookie==密码; 存在=已开登录; panel-pass 管理)
@@ -124,8 +117,8 @@ BBR_MODULE_CONF=/etc/modules-load.d/singbox-bbr.conf
 AKEYS="${AKEYS:-/root/.ssh/authorized_keys}"
 SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
 SSHD_DROPIN_DIR="${SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
-CF_ENV="$SB_DIR/cf.env"   # CF-Vless 状态(存在=已接入第5节点; 由 cf 子命令写入)
-CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env" # 跨机恢复后的待重接 CF 参数；不会直接进订阅/接管服务
+CF_ENV="$SB_DIR/cf.env"   # 旧 CF-Vless 状态(仅用于 cf off 清理与重装提示, 不再进订阅)
+CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env" # 旧版恢复流程遗留的待重接 CF 参数, 仅清理
 WARP_ENV="$SB_DIR/warp.env"   # WARP 解锁状态(存在=已接入; 由 warp 子命令写入)
 # 管理面板(admin 子命令; 仅监听 127.0.0.1, 经 SSH 隧道访问, Token 鉴权)
 ADMIN_ENV="$SB_DIR/admin.env"           # ADMIN_TOKEN / ADMIN_PORT
@@ -139,22 +132,21 @@ ADMIN_RAW_URL="https://raw.githubusercontent.com/shiro1888/sing-box-oneclick/mai
 PKG="${PKG:-}"; OS_ID="${OS_ID:-}"; PUBLIC_IP="${PUBLIC_IP:-}"; SUB_HOST="${SUB_HOST:-}"
 INTERFACE="${INTERFACE:-}"; SB_VER="${SB_VER:-}"
 ANYTLS_OK="${ANYTLS_OK:-1}"; EXPIRE_VALUE="${EXPIRE_VALUE:-}"
-# 密钥(gen_secrets 填充或从 SECRETS 复用)
-HY2_PASSWORD="${HY2_PASSWORD:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"; VLESS_UUID="${VLESS_UUID:-}"
-REALITY_PRIVATE_KEY="${REALITY_PRIVATE_KEY:-}"; REALITY_PUBLIC_KEY="${REALITY_PUBLIC_KEY:-}"
-REALITY_SHORT_ID="${REALITY_SHORT_ID:-}"; SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
+# 密钥(gen_secrets 填充或从 SECRETS 复用)。VLESS/Reality 相关变量仅用于兼容旧状态文件,
+# 新装/升级后不再生成也不会写回。
+HY2_PASSWORD="${HY2_PASSWORD:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"
+SUB_PATH="${SUB_PATH:-}"; SS_PASSWORD="${SS_PASSWORD:-}"
 SUB_B64_PATH="${SUB_B64_PATH:-}"   # 通用(base64)订阅路径(供 v2rayN 等; gen_secrets 生成)
 OBFS_PASSWORD="${OBFS_PASSWORD:-}" # HY2 obfs 密码(非空=启用 obfs; gen_secrets 生成)
 PANEL_PATH="${PANEL_PATH:-}"       # 可视化看板页路径(随机; gen_secrets 生成)
-# CF-Vless(可选第5节点; cf.env 提供, 空=未接入)
+# 旧 CF-Vless 状态(只读兼容; cf off 清理)
 CF_HOSTNAME="${CF_HOSTNAME:-}"; CF_VLESS_UUID="${CF_VLESS_UUID:-}"; CF_WS_PATH="${CF_WS_PATH:-}"
-CF_TRANSACTION_PATHS=()
 RESTORE_TX_TARGETS=(); RESTORE_TX_STAGE=""; RESTORE_TX_BACKUP=""; RESTORE_TX_OLD_SINGBOX_ACTIVE=0; RESTORE_TX_OLD_NGINX_ACTIVE=0; RESTORE_TX_ROLLBACK_STARTED=0
 INSTALL_TX_PATHS=(); INSTALL_TX_BACKUP=""; INSTALL_TX_OLD_SUB_PATH=""; INSTALL_TX_OLD_B64_PATH=""; INSTALL_TX_OLD_PANEL_PATH=""; INSTALL_TX_OLD_SINGBOX_ACTIVE=0; INSTALL_TX_OLD_NGINX_ACTIVE=0; INSTALL_TX_OLD_PORTHOP_ACTIVE=0; INSTALL_TX_ROLLBACK_STARTED=0
-# 1=公网隧道已验证 101, 才允许把 CF-Vless 写进订阅。
-# 旧版 cf.env 没有这个字段, 默认按 1 处理以保持向后兼容。
-CF_VERIFIED="${CF_VERIFIED:-1}"
 IS_IPV6="${IS_IPV6:-0}"; NODE_ADDR="${NODE_ADDR:-}"   # detect_net 里按探测结果赋值
+# 证书路径: server.crt/key 是 HY2/AnyTLS 自签证书; sub.crt/key 可选, 存在时订阅走 443 HTTPS。
+# 订阅证书允许用 SUB_CERT/SUB_KEY 覆盖; 默认值在函数里按 SB_DIR 现算(restore/测试会改 SB_DIR)。
+SUB_CERT="${SUB_CERT:-}"; SUB_KEY="${SUB_KEY:-}"
 # WARP 解锁分流(warp.env 提供; WARP_PRIVATE_KEY 非空=启用)
 WARP_DEFAULT_SITES="openai,anthropic,google-gemini,netflix,disney"
 WARP_PRIVATE_KEY="${WARP_PRIVATE_KEY:-}"; WARP_ADDR_V4="${WARP_ADDR_V4:-}"; WARP_ADDR_V6="${WARP_ADDR_V6:-}"; WARP_RESERVED="${WARP_RESERVED:-}"
@@ -303,7 +295,7 @@ hydrate_legacy_runtime_state() {
     state_has_key "$key" && continue
     [ -n "$cli" ] && continue
     case "$key" in
-      AIRPORT_NAME|NODE_ADDR|HY2_PORT|ANYTLS_PORT|VLESS_PORT|SS_PORT|SS_METHOD|REALITY_SNI|TLS_SNI)
+      AIRPORT_NAME|NODE_ADDR|HY2_PORT|ANYTLS_PORT|SS_PORT|SS_METHOD|TLS_SNI)
         [ -n "$value" ] && printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -320,15 +312,13 @@ if yaml_path.exists():
     for m in re.finditer(r'^  - name:\s*["\']?([^"\'\n]+)["\']?\s*\n(.*?)(?=^  - name:|^proxy-groups:)', text, re.M | re.S):
         fields = dict(re.findall(r'^\s{4}([A-Za-z0-9_-]+):\s*["\']?([^"\'\n]+)', m.group(2), re.M))
         blocks[m.group(1).strip()] = fields
-    direct = next((blocks.get(n, {}).get("server", "") for n in ("Hysteria2", "AnyTLS", "Vless", "SS2022") if blocks.get(n, {}).get("server")), "")
+    direct = next((blocks.get(n, {}).get("server", "") for n in ("Hysteria2", "AnyTLS", "SS2022") if blocks.get(n, {}).get("server")), "")
     values = {
         "NODE_ADDR": direct,
         "HY2_PORT": blocks.get("Hysteria2", {}).get("port", ""),
         "ANYTLS_PORT": blocks.get("AnyTLS", {}).get("port", ""),
-        "VLESS_PORT": blocks.get("Vless", {}).get("port", ""),
         "SS_PORT": blocks.get("SS2022", {}).get("port", ""),
         "SS_METHOD": blocks.get("SS2022", {}).get("cipher", ""),
-        "REALITY_SNI": blocks.get("Vless", {}).get("servername", ""),
         "TLS_SNI": blocks.get("Hysteria2", {}).get("sni", "") or blocks.get("AnyTLS", {}).get("sni", ""),
     }
     for key, value in values.items():
@@ -353,30 +343,21 @@ ver_ge() { # ver_ge A B  -> A >= B ?
 # 装前输入校验(端口/SNI/域名/到期时间), 不合法立即报错, 避免装到一半才崩
 validate_inputs() {
   local p
-  for p in "$HY2_PORT" "$ANYTLS_PORT" "$VLESS_PORT" "$SS_PORT"; do
+  for p in "$HY2_PORT" "$ANYTLS_PORT" "$SS_PORT"; do
     case "$p" in ''|*[!0-9]*) die "端口必须是数字: '$p'";; esac
     { [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; } || die "端口超出范围 1-65535: '$p'"
   done
-  case "$REALITY_SNI" in *[!A-Za-z0-9.-]*) die "REALITY_SNI 含非法字符: '$REALITY_SNI'";; esac
-  case "$TLS_SNI"     in *[!A-Za-z0-9.-]*) die "TLS_SNI 含非法字符: '$TLS_SNI'";; esac
+  # 三个入站端口保持互不相同: HY2 虽然走 UDP, 与 TCP 端口理论可共存, 但同号会让
+  # 客户端/防火墙/排障全部变得难以区分, 直接拒绝更省事。
+  [ "$HY2_PORT" != "$ANYTLS_PORT" ] && [ "$HY2_PORT" != "$SS_PORT" ] && [ "$ANYTLS_PORT" != "$SS_PORT" ] \
+    || die "HY2_PORT/ANYTLS_PORT/SS_PORT 必须互不相同(当前: $HY2_PORT/$ANYTLS_PORT/$SS_PORT)"
+  case "$TLS_SNI" in ''|*[!A-Za-z0-9.-]*) die "TLS_SNI 含非法字符: '$TLS_SNI'";; esac
   [ -z "$DOMAIN" ] || case "$DOMAIN" in *[!A-Za-z0-9.-]*) die "DOMAIN 含非法字符: '$DOMAIN'";; esac
+  case "$SUB_TLS" in auto|0|1) ;; *) die "SUB_TLS 只能是 auto / 1 / 0: '$SUB_TLS'";; esac
   if [ -n "${EXPIRE_AT:-}" ]; then
     [[ "$EXPIRE_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] \
       || die "EXPIRE_AT 格式必须是 'YYYY-MM-DD HH:MM:SS +0800'(含四位时区偏移, 不能是 +08:00 或省略), 当前: '$EXPIRE_AT'"
   fi
-  if [ -n "$HY2_HOP_RANGE" ]; then
-    [[ "$HY2_HOP_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "HY2_HOP_RANGE 须为 起-止(如 20000-50000): '$HY2_HOP_RANGE'"
-    local hs="${HY2_HOP_RANGE%-*}" he="${HY2_HOP_RANGE#*-}"
-    { [ "$hs" -ge 1 ] && [ "$he" -le 65535 ] && [ "$hs" -lt "$he" ]; } || die "HY2_HOP_RANGE 端口段非法(1-65535 且 起<止): '$HY2_HOP_RANGE'"
-    local op   # 端口段不能盖住正在监听的 UDP 端口(HY2/SS), 否则会把它也重定向到 HY2
-    for op in "$HY2_PORT" "$SS_PORT"; do
-      { [ "$op" -ge "$hs" ] && [ "$op" -le "$he" ]; } && die "HY2_HOP_RANGE($HY2_HOP_RANGE) 覆盖了 UDP 端口 $op, 会把它也重定向到 HY2; 请让端口段避开 HY2_PORT/SS_PORT"
-    done
-  fi
-  local v
-  for v in "$HY2_UP" "$HY2_DOWN" "$HY2_UP_MBPS" "$HY2_DOWN_MBPS"; do
-    [ -z "$v" ] || case "$v" in *[!0-9]*) die "HY2_UP/HY2_DOWN/HY2_UP_MBPS/HY2_DOWN_MBPS 要是数字(Mbps): '$v'";; esac
-  done
   [ -z "$OBFS_PASSWORD" ] || case "$OBFS_PASSWORD" in *[!A-Za-z0-9]*) die "OBFS_PASSWORD 只能含字母数字: '$OBFS_PASSWORD'";; esac
   # SS_METHOD 会裸插进 Clash YAML 的 cipher: 与 ss:// 链接; 含引号或 ": " 会让整份订阅 YAML 解析失败
   # (四个节点全拉不到, 不只是 SS 那条)。用字符白名单而非枚举, 以免误杀传统 cipher。
@@ -425,9 +406,9 @@ install_deps() {
 }
 
 time_sync() {
-  timedatectl set-ntp true >/dev/null 2>&1 || warn "无法自动开启 NTP, 请确认系统时间准确(Reality 对时钟敏感)"
+  timedatectl set-ntp true >/dev/null 2>&1 || warn "无法自动开启 NTP, 请确认系统时间准确(TLS 握手对时钟敏感)"
   if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = no ]; then
-    note "系统时间尚未同步(NTPSynchronized=no): Reality 可能握手失败(连得上但代理不通)。稍等几分钟或手动核对 timedatectl。"
+    note "系统时间尚未同步(NTPSynchronized=no): TLS 握手可能失败(连得上但代理不通)。稍等几分钟或手动核对 timedatectl。"
   fi
 }
 
@@ -443,7 +424,7 @@ install_singbox() {
     ANYTLS_OK=1
   else
     ANYTLS_OK=0
-    note "sing-box 版本 ${SB_VER:-未知} < 1.12.0, 不支持 AnyTLS: 已自动跳过 AnyTLS, 部署 Hysteria2 + Vless + SS2022。升级 sing-box 后重跑本脚本即可补上 AnyTLS。"
+    note "sing-box 版本 ${SB_VER:-未知} < 1.12.0, 不支持 AnyTLS: 已自动跳过 AnyTLS, 部署 Hysteria2 + SS2022。升级 sing-box 后重跑本脚本即可补上 AnyTLS。"
     warn "sing-box ${SB_VER:-未知} 过旧, 跳过 AnyTLS"
   fi
   ok "sing-box 版本: ${SB_VER:-unknown} (AnyTLS: $([ "$ANYTLS_OK" = 1 ] && echo 启用 || echo 跳过))"
@@ -477,7 +458,7 @@ detect_net() {
   # 因为不少客户端对 IPv6 字面量支持不好, 用域名更稳。
   NODE_ADDR="${NODE_ADDR:-$PUBLIC_IP}"
   if [ "$IS_IPV6" = 1 ] && [ "$NODE_ADDR" = "$PUBLIC_IP" ]; then
-    note "检测到纯 IPv6 出口($PUBLIC_IP): 订阅已开 ipv6。IPv4-only 的客户端连不到本机, 建议 (1) 配好 AAAA 后用 NODE_ADDR=你的域名 重跑, 并 (2) 用 install.sh cf 加 CF-Vless 作为 IPv4 客户端的入口。"
+    note "检测到纯 IPv6 出口($PUBLIC_IP): 订阅已开 ipv6。IPv4-only 的客户端连不到本机, 建议配好 AAAA 后用 NODE_ADDR=你的域名 重跑; 需要 IPv4 入口请另建 Cloudflare WebSocket 节点(现网口径不再提供一键 CF-VLESS)。"
   fi
   ok "公网 IP: $PUBLIC_IP   网卡: $INTERFACE"
   [ -n "$DOMAIN" ] && note "订阅域名 $DOMAIN: 请确认已把它的 DNS A 记录解析到 $PUBLIC_IP(本脚本无法替你改 DNS)。"
@@ -519,9 +500,21 @@ require_node_address() {
   valid_node_address "$value" || { err "节点连接地址非法，拒绝生成订阅: '${value:-空}'"; return 1; }
 }
 
+sub_cert_file() { printf '%s' "${SUB_CERT:-$SB_DIR/sub.crt}"; }
+sub_key_file()  { printf '%s' "${SUB_KEY:-$SB_DIR/sub.key}"; }
+
+# 订阅是否走 443 HTTPS: 必须有域名 + 证书。auto=两者齐备才开; 1=强制(缺证书时
+# config_nginx 会直接报错, 不会留下一个打不开的 https:// 链接); 0=永远 HTTP。
+subscription_tls_enabled() {
+  [ "$SUB_TLS" != 0 ] || return 1
+  [ -n "$DOMAIN" ] || return 1
+  [ -f "$(sub_cert_file)" ] && [ -f "$(sub_key_file)" ]
+}
+
 subscription_url() {
-  local path="${1:-$SUB_PATH}"
-  printf 'http://%s%s' "$(url_host "$SUB_HOST")" "$path"
+  local path="${1:-$SUB_PATH}" scheme=http
+  subscription_tls_enabled && scheme=https
+  printf '%s://%s%s' "$scheme" "$(url_host "$SUB_HOST")" "$path"
 }
 
 # SS2022 密钥: base64, 长度按方法自适应(128-gcm=16字节, 256/chacha=32字节)
@@ -585,8 +578,13 @@ valid_state_value() {
     HY2_HOP_RANGE)
       [[ -z "$value" || "$value" =~ ^[0-9]+-[0-9]+$ ]]
       ;;
+    # 旧版 env 可能仍带 VLESS_PORT/HY2_HOP_RANGE/HY2_* 带宽键: 读取时接受(否则升级会
+    # 直接报"未识别键"), 但 write_env 不再写回, 值也不会进入渲染 —— 等于自动迁移。
     HY2_PORT|ANYTLS_PORT|VLESS_PORT|SS_PORT|HY2_UP|HY2_DOWN|HY2_UP_MBPS|HY2_DOWN_MBPS|CF_PORT|ADMIN_PORT)
       [[ -z "$value" || "$value" =~ ^[0-9]+$ ]]
+      ;;
+    SUB_TLS)
+      case "$value" in auto|0|1) return 0 ;; esac; return 1
       ;;
     ENABLE_BLOCK_BT|ENABLE_BLOCK_ADS|ENABLE_HY2|ENABLE_OBFS|SS_UDP|CF_VERIFIED)
       [[ "$value" = 0 || "$value" = 1 ]]
@@ -653,14 +651,18 @@ load_state_file() {
 }
 
 load_secrets() {
+  # 旧版 secrets 里的 VLESS_UUID/REALITY_* 仍接受(否则升级直接报错), 但读完即丢弃。
   load_state_file "$SECRETS" HY2_PASSWORD ANYTLS_PASSWORD VLESS_UUID REALITY_PRIVATE_KEY \
     REALITY_PUBLIC_KEY REALITY_SHORT_ID SUB_PATH SUB_B64_PATH PANEL_PATH SS_PASSWORD OBFS_PASSWORD
+  VLESS_UUID=""; REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""
 }
 
 load_node_env() {
   load_state_file "$ENVFILE" LIMIT_GB EXPIRE_AT INTERFACE COUNT_MODE SUB_HOST PUBLIC_IP DOMAIN AIRPORT_NAME NODE_ADDR \
-    HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI HY2_HOP_RANGE \
+    HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI SUB_TLS HY2_HOP_RANGE \
     HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP
+  # 迁移: 旧值只用于兼容读取, 不参与渲染/写回。
+  VLESS_PORT=""; REALITY_SNI=""; HY2_HOP_RANGE=""; HY2_UP=""; HY2_DOWN=""; HY2_UP_MBPS=""; HY2_DOWN_MBPS=""
 }
 
 load_cf_env() {
@@ -719,11 +721,6 @@ gen_secrets() {
   log "生成密钥与随机参数..."
   HY2_PASSWORD="$(openssl rand -hex 16)"
   ANYTLS_PASSWORD="$(openssl rand -hex 16)"
-  VLESS_UUID="$(sing-box generate uuid)"
-  local kp; kp="$(sing-box generate reality-keypair)"
-  REALITY_PRIVATE_KEY="$(printf '%s\n' "$kp" | awk '/PrivateKey/{print $NF}')"
-  REALITY_PUBLIC_KEY="$(printf '%s\n' "$kp" | awk '/PublicKey/{print $NF}')"
-  REALITY_SHORT_ID="$(openssl rand -hex 8)"
   SUB_PATH="/sub-$(openssl rand -hex 8).yaml"
   SUB_B64_PATH="/sub-b64-$(openssl rand -hex 8).txt"
   PANEL_PATH="/panel-$(openssl rand -hex 8).html"
@@ -737,10 +734,6 @@ write_secrets() {
   atomic_write_file "$SECRETS" 600 <<EOF
 HY2_PASSWORD=$HY2_PASSWORD
 ANYTLS_PASSWORD=$ANYTLS_PASSWORD
-VLESS_UUID=$VLESS_UUID
-REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
-REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
-REALITY_SHORT_ID=$REALITY_SHORT_ID
 SUB_PATH=$SUB_PATH
 SUB_B64_PATH=$SUB_B64_PATH
 PANEL_PATH=$PANEL_PATH
@@ -759,31 +752,9 @@ gen_cert() {
   chmod 600 "$SB_DIR/server.key"; chmod 644 "$SB_DIR/server.crt"
 }
 
-# 校验 Reality 偷证书目标(REALITY_SNI): 需支持 TLS1.3(硬性), 建议 H2。best-effort, 失败只提示不中断。
-check_reality_sni() {
-  command -v openssl >/dev/null 2>&1 || return 0
-  local host="$REALITY_SNI" out
-  log "校验 Reality 偷证书目标 $host (需 TLS1.3, 建议 H2)..."
-  out="$( { echo | timeout 8 openssl s_client -connect "$host:443" -servername "$host" -alpn h2; } 2>/dev/null )" || true
-  if ! printf '%s' "$out" | grep -q 'BEGIN CERTIFICATE'; then
-    note "Reality 偷证书目标 $host:443 连不上(网络/被墙?), 没能校验。确认它在 VPS 上能直连且支持 TLS1.3(默认 www.bing.com 一般没问题)。"
-    return 0
-  fi
-  if printf '%s' "$out" | grep -q 'TLSv1.3'; then
-    if printf '%s' "$out" | grep -qE 'ALPN protocol: *h2$'; then
-      ok "Reality SNI $host: TLS1.3 + H2 ✓"
-    else
-      note "Reality SNI $host 支持 TLS1.3 但未协商出 H2: 能用, 但建议换个支持 HTTP/2 的目标更隐蔽(如 www.bing.com)。"
-    fi
-  else
-    note "Reality SNI $host 不支持 TLS1.3 ✗(偷证书目标的硬性要求, 握手会有问题): 换成确定支持 TLS1.3 的大站, 如 www.bing.com / www.cloudflare.com / www.apple.com。"
-  fi
-}
-
 # 重装保参数: 已有 $ENVFILE 时, 把文件里的运行参数当默认值沿用;
 # 本次显式传入的 env(_CLI_* 非空)优先级更高, 仍然覆盖文件值。
-# 不这样做的话, 二次运行 install 会把 LIMIT_GB 打回 200、EXPIRE_AT 顺延成"安装日+365天"、
-# HY2 带宽护栏(up/down_mbps)被清空 —— 静默丢掉用户 set 过的配置。
+# 不这样做的话, 二次运行 install 会把 LIMIT_GB 打回 200、EXPIRE_AT 顺延成"安装日+365天"。
 merge_env_defaults() {
   [ -f "$ENVFILE" ] || return 0
   local restoring="${1:-0}" v cli current_public="$PUBLIC_IP" current_host="$SUB_HOST" current_interface="$INTERFACE" current_node="$NODE_ADDR" current_domain="$DOMAIN"
@@ -795,8 +766,7 @@ merge_env_defaults() {
     DOMAIN="$current_domain"; NODE_ADDR="${current_node:-$current_public}"
   fi
   for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
-            HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI \
-            HY2_HOP_RANGE HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS \
+            HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS \
             ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
     eval "cli=\"\${_CLI_$v:-}\""
     [ -n "$cli" ] && printf -v "$v" '%s' "$cli"  # 本次显式传的赢回来
@@ -824,16 +794,10 @@ AIRPORT_NAME="$AIRPORT_NAME"
 NODE_ADDR="$NODE_ADDR"
 HY2_PORT=$HY2_PORT
 ANYTLS_PORT=$ANYTLS_PORT
-VLESS_PORT=$VLESS_PORT
 SS_PORT=$SS_PORT
 SS_METHOD=$SS_METHOD
-REALITY_SNI=$REALITY_SNI
 TLS_SNI=$TLS_SNI
-HY2_HOP_RANGE=$HY2_HOP_RANGE
-HY2_UP=$HY2_UP
-HY2_DOWN=$HY2_DOWN
-HY2_UP_MBPS=$HY2_UP_MBPS
-HY2_DOWN_MBPS=$HY2_DOWN_MBPS
+SUB_TLS=$SUB_TLS
 ENABLE_BLOCK_BT=$ENABLE_BLOCK_BT
 ENABLE_BLOCK_ADS=$ENABLE_BLOCK_ADS
 ENABLE_HY2=$ENABLE_HY2
@@ -858,27 +822,9 @@ render_singbox_config() {
 JSON
 )"
   fi
-  local cf_block=""
-  if [ -n "$CF_HOSTNAME" ] && [ -n "$CF_VLESS_UUID" ]; then
-    cf_block="$(cat <<JSON
-,
-    {
-      "type": "vless",
-      "tag": "cf-vless-ws-in",
-      "listen": "127.0.0.1",
-      "listen_port": $CF_PORT,
-      "users": [ { "uuid": "$CF_VLESS_UUID" } ],
-      "transport": { "type": "ws", "path": "$CF_WS_PATH" }
-    }
-JSON
-)"
-  fi
   local obfs_line=""
   [ -n "$OBFS_PASSWORD" ] && obfs_line=$'\n      "obfs": { "type": "salamander", "password": "'"$OBFS_PASSWORD"'" },'
-  # HY2 服务端带宽护栏(up_mbps/down_mbps): 给套餐峰值留余量, 防压测/多人下载把 UDP 队列与 I/O wait 打爆
-  local hy2_bw_line=""
-  [ -n "$HY2_UP_MBPS" ]   && hy2_bw_line="$hy2_bw_line"$'\n      "up_mbps": '"$HY2_UP_MBPS"','
-  [ -n "$HY2_DOWN_MBPS" ] && hy2_bw_line="$hy2_bw_line"$'\n      "down_mbps": '"$HY2_DOWN_MBPS"','
+  # HY2 不再写 up_mbps/down_mbps: 统一使用自动拥塞控制(2026-10 现网口径)。
   local route_json="" warp_ep=""
   if [ "$ENABLE_BLOCK_BT" = 1 ] || [ "$ENABLE_BLOCK_ADS" = 1 ] || [ -n "$WARP_PRIVATE_KEY" ]; then
     local rules="" rsets=""
@@ -946,7 +892,7 @@ JSON
       "tag": "hy2-in",
       "listen": "::",
       "listen_port": $HY2_PORT,
-      "users": [ { "password": "$HY2_PASSWORD" } ],$obfs_line$hy2_bw_line
+      "users": [ { "password": "$HY2_PASSWORD" } ],$obfs_line
       "tls": { "enabled": true, "certificate_path": "$SB_DIR/server.crt", "key_path": "$SB_DIR/server.key" }
     },
 JSON
@@ -959,30 +905,13 @@ JSON
 $hy2_block
 $anytls_block
     {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": $VLESS_PORT,
-      "users": [ { "uuid": "$VLESS_UUID", "flow": "xtls-rprx-vision" } ],
-      "tls": {
-        "enabled": true,
-        "server_name": "$REALITY_SNI",
-        "reality": {
-          "enabled": true,
-          "handshake": { "server": "$REALITY_SNI", "server_port": 443 },
-          "private_key": "$REALITY_PRIVATE_KEY",
-          "short_id": ["$REALITY_SHORT_ID"]
-        }
-      }
-    },
-    {
       "type": "shadowsocks",
       "tag": "ss-in",
       "listen": "::",
       "listen_port": $SS_PORT,$ss_net_line
       "method": "$SS_METHOD",
       "password": "$SS_PASSWORD"
-    }$cf_block
+    }
   ],$route_json
   "outbounds": [ { "type": "direct", "tag": "direct" } ]$warp_ep
 }
@@ -992,21 +921,17 @@ JSON
 render_subscription_yaml() {
   require_node_address || return 1
   ANYTLS_OK="$ANYTLS_OK" PUBLIC_IP="$PUBLIC_IP" DOMAIN="$DOMAIN" \
-  HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" VLESS_PORT="$VLESS_PORT" \
-  HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" VLESS_UUID="$VLESS_UUID" \
-  REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
-  REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
+  HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" \
+  HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" \
+  TLS_SNI="$TLS_SNI" \
   SS_PORT="$SS_PORT" SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
-  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" CF_NAME="$CF_NAME" \
-  CF_VERIFIED="$CF_VERIFIED" \
-  OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
+  OBFS_PASSWORD="$OBFS_PASSWORD" \
   ENABLE_HY2="$ENABLE_HY2" SS_UDP="$SS_UDP" \
   IS_IPV6="$IS_IPV6" NODE_ADDR="$NODE_ADDR" \
   "$PY" - <<'PY'
 import os
 ip  = os.environ.get("NODE_ADDR") or os.environ["PUBLIC_IP"]   # 节点连接地址(纯 IPv6 机可传域名)
 v6  = os.environ.get("IS_IPV6", "0") == "1"
-dom = os.environ.get("DOMAIN", "")
 anytls = os.environ["ANYTLS_OK"] == "1"
 hy2_on = os.environ.get("ENABLE_HY2", "1") == "1"
 ss_udp = "true" if os.environ.get("SS_UDP", "1") == "1" else "false"
@@ -1021,15 +946,9 @@ hy2 = [
     f'    sni: {os.environ["TLS_SNI"]}',
     '    skip-cert-verify: true',
 ]
-if os.environ.get("HY2_HOP_RANGE", ""):
-    hy2.append(f'    ports: "{os.environ["HY2_HOP_RANGE"]}"')
 if os.environ.get("OBFS_PASSWORD", ""):
     hy2.append('    obfs: salamander')
     hy2.append(f'    obfs-password: {os.environ["OBFS_PASSWORD"]}')
-if os.environ.get("HY2_UP", ""):
-    hy2.append(f'    up: "{os.environ["HY2_UP"]} Mbps"')
-if os.environ.get("HY2_DOWN", ""):
-    hy2.append(f'    down: "{os.environ["HY2_DOWN"]} Mbps"')
 hy2 += ['    alpn:', '      - h3']
 if hy2_on:
     proxies.append("\n".join(hy2))
@@ -1043,20 +962,6 @@ if anytls:
     skip-cert-verify: true
     udp: true
     client-fingerprint: chrome''')
-proxies.append(f'''  - name: "Vless"
-    type: vless
-    server: {ip}
-    port: {os.environ["VLESS_PORT"]}
-    uuid: {os.environ["VLESS_UUID"]}
-    network: tcp
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: {os.environ["REALITY_SNI"]}
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: {os.environ["REALITY_PUBLIC_KEY"]}
-      short-id: {os.environ["REALITY_SHORT_ID"]}''')
 proxies.append(f'''  - name: "SS2022"
     type: ss
     server: {ip}
@@ -1065,82 +970,98 @@ proxies.append(f'''  - name: "SS2022"
     password: "{os.environ["SS_PASSWORD"]}"
     udp: {ss_udp}''')
 
-cf_host = os.environ.get("CF_HOSTNAME", "")
-cf_uuid = os.environ.get("CF_VLESS_UUID", "")
-cf_name = os.environ.get("CF_NAME") or "CF-Vless"
-cf_on = bool(cf_host and cf_uuid) and (os.environ.get("CF_VERIFIED") or "1") == "1"
-if cf_on:
-    proxies.append(f'''  - name: "{cf_name}"
-    type: vless
-    server: {cf_host}
-    port: 443
-    uuid: {cf_uuid}
-    network: ws
-    udp: true
-    tls: true
-    servername: {cf_host}
-    client-fingerprint: chrome
-    ws-opts:
-      path: {os.environ["CF_WS_PATH"]}
-      headers:
-        Host: {cf_host}''')
-
-names = (["Hysteria2"] if hy2_on else []) + (["AnyTLS"] if anytls else []) + ["Vless", "SS2022"] + ([cf_name] if cf_on else [])
+names = (["Hysteria2"] if hy2_on else []) + (["AnyTLS"] if anytls else []) + ["SS2022"]
 grp = "\n".join(f'      - "{n}"' for n in names)
 
-rules = []
-if dom:
-    rules.append(f"  - DOMAIN,{dom},DIRECT")
-# 本机地址直连: IPv6 要用 IP-CIDR6//128, 写成 /32 不生效。
-# ip 可能是域名(NODE_ADDR), 那种情况没有可写的 CIDR, 靠上面的 DOMAIN 规则兜。
-_pub = os.environ.get("PUBLIC_IP", "")
-if v6:
-    if ":" in _pub:
-        rules.append(f"  - IP-CIDR6,{_pub}/128,DIRECT,no-resolve")
-elif _pub:
-    rules.append(f"  - IP-CIDR,{_pub}/32,DIRECT,no-resolve")
-rules += [
-    "  - DOMAIN-SUFFIX,local,DIRECT",
-    "  - DOMAIN-SUFFIX,localhost,DIRECT",
-    "  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-    "  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
-    "  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
-    "  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
-    "  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-    "  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-    "  - IP-CIDR,198.18.0.0/16,DIRECT,no-resolve",
-    "  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
+# 分流基线(2026-10 现网口径): 只引用 MetaCubeX/meta-rules-dat 的 meta 分支,
+# 不再维护手写域名/IP 规则。6 个 provider + 固定 7 条规则:
+# 私有 -> 广告 REJECT -> Google(含 Play/GMS)走代理 -> 中国直连 -> MATCH。
+# meta-google 必须早于 meta-cn-domain, 否则 googleapis.cn 会先命中 cn 导致 Play 卡 99%。
+providers = '''rule-providers:
+  meta-private-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    proxy: "🚀 节点选择"
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.mrs
+    path: ./ruleset/meta-private-domain.mrs
+  meta-private-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    interval: 86400
+    proxy: "🚀 节点选择"
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/private.mrs
+    path: ./ruleset/meta-private-ip.mrs
+  meta-ads:
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    proxy: "🚀 节点选择"
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ads-all.mrs
+    path: ./ruleset/meta-ads.mrs
+  meta-google:
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    proxy: "🚀 节点选择"
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/google.mrs
+    path: ./ruleset/meta-google.mrs
+  meta-cn-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    interval: 86400
+    proxy: "🚀 节点选择"
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs
+    path: ./ruleset/meta-cn-domain.mrs
+  meta-cn-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    interval: 86400
+    proxy: "🚀 节点选择"
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs
+    path: ./ruleset/meta-cn-ip.mrs'''
+
+rules = [
+    "  - RULE-SET,meta-private-domain,DIRECT",
+    "  - RULE-SET,meta-private-ip,DIRECT,no-resolve",
+    "  - RULE-SET,meta-ads,REJECT",
+    "  - RULE-SET,meta-google,🚀 节点选择",
+    "  - RULE-SET,meta-cn-domain,DIRECT",
+    "  - RULE-SET,meta-cn-ip,DIRECT,no-resolve",
+    "  - MATCH,🚀 节点选择",
 ]
-# 开了 ipv6 之后必须补本地 IPv6 直连: 上面那组全是 IPv4 网段,
-# 否则回环/链路本地/ULA/组播这些本地 IPv6 流量会因为没规则匹配而误走代理。
-if v6:
-    rules += [
-        "  - IP-CIDR6,::1/128,DIRECT,no-resolve",
-        "  - IP-CIDR6,fc00::/7,DIRECT,no-resolve",
-        "  - IP-CIDR6,fe80::/10,DIRECT,no-resolve",
-        "  - IP-CIDR6,ff00::/8,DIRECT,no-resolve",
-    ]
-# Google Play / GMS 下载链路必须放在国内直连规则前面, 避免下载 CDN 被误判 DIRECT 后卡 99%。
-rules += [
-    "  - GEOSITE,google,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,google.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,googleapis.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,gstatic.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,googleusercontent.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,ggpht.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,gvt1.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,gvt2.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,gvt3.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,android.com,🚀 节点选择",
-    "  - DOMAIN-SUFFIX,google-analytics.com,🚀 节点选择",
-]
-for d in ["qq.com","weixin.com","wechat.com","gtimg.com","qpic.cn","bilibili.com","b23.tv",
-          "hdslb.com","taobao.com","tmall.com","jd.com","360buyimg.com","alicdn.com","aliyun.com",
-          "alipay.com","douyin.com","iesdouyin.com","byteimg.com","bytedance.com","amap.com",
-          "autonavi.com","baidu.com","bdstatic.com","163.com","126.net","127.net","mi.com",
-          "xiaomi.com","miui.com","huawei.com","vmall.com"]:
-    rules.append(f"  - DOMAIN-SUFFIX,{d},DIRECT")
-rules += ["  - GEOSITE,cn,DIRECT", "  - GEOIP,CN,DIRECT", "  - MATCH,🚀 节点选择"]
+
+# 订阅 DNS: 节点域名用国内 DoH 专用解析(proxy-server-nameserver), 不依赖境外 fallback;
+# fallback 必须为空数组 —— 境外 DoH 不可达时会稳定复现 5 秒解析超时(2026-10-16 实测)。
+dns = f'''dns:
+  enable: true
+  ipv6: {"true" if v6 else "false"}
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  proxy-server-nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  fallback: []
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+  nameserver-policy:
+    "geosite:cn,private,apple":
+      - https://doh.pub/dns-query
+      - https://dns.alidns.com/dns-query
+    "geosite:category-ads-all": rcode://success'''
 
 doc = f'''mixed-port: 7897
 allow-lan: false
@@ -1148,6 +1069,8 @@ mode: rule
 log-level: info
 ipv6: {"true" if v6 else "false"}
 tcp-concurrent: true
+
+{dns}
 
 proxies:
 {chr(10).join(proxies)}
@@ -1158,6 +1081,8 @@ proxy-groups:
     proxies:
 {grp}
 
+{providers}
+
 rules:
 {chr(10).join(rules)}
 '''
@@ -1166,18 +1091,15 @@ sys.stdout.write(doc)
 PY
 }
 
-# 各节点的分享链接(vless:// hysteria2:// anytls:// ss://), 一行一条; 通用订阅就是它的 base64
+# 各节点的分享链接(hysteria2:// anytls:// ss://), 一行一条; 通用订阅就是它的 base64
 render_share_links() {
   require_node_address || return 1
   ANYTLS_OK="$ANYTLS_OK" PUBLIC_IP="$PUBLIC_IP" \
-  HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" VLESS_PORT="$VLESS_PORT" SS_PORT="$SS_PORT" \
-  HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" VLESS_UUID="$VLESS_UUID" \
+  HY2_PORT="$HY2_PORT" ANYTLS_PORT="$ANYTLS_PORT" SS_PORT="$SS_PORT" \
+  HY2_PASSWORD="$HY2_PASSWORD" ANYTLS_PASSWORD="$ANYTLS_PASSWORD" \
   SS_METHOD="$SS_METHOD" SS_PASSWORD="$SS_PASSWORD" \
-  REALITY_PUBLIC_KEY="$REALITY_PUBLIC_KEY" REALITY_SHORT_ID="$REALITY_SHORT_ID" \
-  REALITY_SNI="$REALITY_SNI" TLS_SNI="$TLS_SNI" \
-  CF_HOSTNAME="$CF_HOSTNAME" CF_VLESS_UUID="$CF_VLESS_UUID" CF_WS_PATH="$CF_WS_PATH" CF_NAME="$CF_NAME" \
-  CF_VERIFIED="$CF_VERIFIED" \
-  OBFS_PASSWORD="$OBFS_PASSWORD" HY2_HOP_RANGE="$HY2_HOP_RANGE" HY2_UP="$HY2_UP" HY2_DOWN="$HY2_DOWN" \
+  TLS_SNI="$TLS_SNI" \
+  OBFS_PASSWORD="$OBFS_PASSWORD" \
   ENABLE_HY2="$ENABLE_HY2" \
   IS_IPV6="$IS_IPV6" NODE_ADDR="$NODE_ADDR" \
   "$PY" - <<'PY'
@@ -1192,29 +1114,12 @@ out = []
 hy2q = f"insecure=1&sni={q(tls)}"
 if os.environ.get("OBFS_PASSWORD", ""):
     hy2q += f"&obfs=salamander&obfs-password={q(os.environ['OBFS_PASSWORD'])}"
-hop = os.environ.get("HY2_HOP_RANGE", "")
-# 端口跳跃: 端口段写进 authority(官方 URI 规范, mihomo/标准解析认), 再附 mport 兼容 NekoBox 系
-hy2_port = hop if hop else os.environ["HY2_PORT"]
-if hop:
-    hy2q += f"&mport={hop}"
 if os.environ.get("ENABLE_HY2", "1") == "1":
-    out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{hy2_port}/?{hy2q}#{q('Hysteria2')}")
+    out.append(f"hysteria2://{q(os.environ['HY2_PASSWORD'])}@{ip}:{os.environ['HY2_PORT']}/?{hy2q}#{q('Hysteria2')}")
 if os.environ["ANYTLS_OK"] == "1":
     out.append(f"anytls://{q(os.environ['ANYTLS_PASSWORD'])}@{ip}:{os.environ['ANYTLS_PORT']}/?insecure=1&sni={q(tls)}#{q('AnyTLS')}")
-vq = u.urlencode({'encryption':'none','flow':'xtls-rprx-vision','security':'reality',
-                  'sni':os.environ['REALITY_SNI'],'fp':'chrome',
-                  'pbk':os.environ['REALITY_PUBLIC_KEY'],'sid':os.environ['REALITY_SHORT_ID'],'type':'tcp'})
-out.append(f"vless://{os.environ['VLESS_UUID']}@{ip}:{os.environ['VLESS_PORT']}?{vq}#{q('Vless')}")
 # SS2022(SIP022): method:password(密码百分号编码), 不做 base64
 out.append(f"ss://{os.environ['SS_METHOD']}:{q(os.environ['SS_PASSWORD'])}@{ip}:{os.environ['SS_PORT']}#{q('SS2022')}")
-cfh = os.environ.get("CF_HOSTNAME",""); cfu = os.environ.get("CF_VLESS_UUID","")
-# 与订阅口径一致: 隧道未验证通过就不给分享链接, 否则通用订阅里同样会多一条死节点
-if (os.environ.get("CF_VERIFIED") or "1") != "1":
-    cfh = cfu = ""
-if cfh and cfu:
-    cq = u.urlencode({'encryption':'none','security':'tls','sni':cfh,'fp':'chrome',
-                      'type':'ws','host':cfh,'path':os.environ['CF_WS_PATH']})
-    out.append(f"vless://{cfu}@{cfh}:443?{cq}#{q(os.environ.get('CF_NAME') or 'CF-Vless')}")
 import sys
 sys.stdout.write("\n".join(out) + "\n")
 PY
@@ -1692,24 +1597,19 @@ write_subscription() {
   fi
 
   SUB_YAML="$tmp_yaml" SUB_B64="$tmp_b64" PANEL_HTML="$tmp_panel" NODE_IP="${NODE_ADDR:-$PUBLIC_IP}" \
-    EXPECTED_CF_NAME="$CF_NAME" EXPECTED_CF="$([ -n "$CF_HOSTNAME" ] && [ -n "$CF_VLESS_UUID" ] && [ "${CF_VERIFIED:-1}" = 1 ] && printf 1 || printf 0)" \
     EXPECTED_HY2="$ENABLE_HY2" EXPECTED_ANYTLS="$ANYTLS_OK" "$PY" - <<'PY' || { _cleanup_subscription_tmp; return 1; }
 import base64
 import os
 import re
 
 node_ip = os.environ["NODE_IP"]
-expected_cf = os.environ["EXPECTED_CF"] == "1"
-expected_cf_name = os.environ.get("EXPECTED_CF_NAME") or "CF-Vless"
-expected_direct = 2 + (os.environ["EXPECTED_HY2"] == "1") + (os.environ["EXPECTED_ANYTLS"] == "1")
-expected_total = expected_direct + expected_cf
+expected_direct = 1 + (os.environ["EXPECTED_HY2"] == "1") + (os.environ["EXPECTED_ANYTLS"] == "1")
+expected_total = expected_direct
 
 yaml_text = open(os.environ["SUB_YAML"], encoding="utf-8").read()
 servers = re.findall(r"^\s+server:\s*(\S+)\s*$", yaml_text, re.M)
 if len(servers) != expected_total or servers[:expected_direct] != [node_ip] * expected_direct:
     raise SystemExit("invalid direct server fields in rendered subscription")
-if expected_cf and (servers[-1] in {"", ";"} or expected_cf_name not in yaml_text):
-    raise SystemExit("invalid CF node in rendered subscription")
 
 b64_path = os.environ.get("SUB_B64", "")
 if b64_path:
@@ -1749,12 +1649,11 @@ PY
 
 validate_panel_file() {
   local panel="$1"
-  EXPECTED_CF="$([ -n "$CF_HOSTNAME" ] && [ -n "$CF_VLESS_UUID" ] && [ "${CF_VERIFIED:-1}" = 1 ] && printf 1 || printf 0)" \
-    EXPECTED_HY2="$ENABLE_HY2" EXPECTED_ANYTLS="$ANYTLS_OK" "$PY" - "$panel" <<'PY'
+  EXPECTED_HY2="$ENABLE_HY2" EXPECTED_ANYTLS="$ANYTLS_OK" "$PY" - "$panel" <<'PY'
 import os
 import sys
 
-expected = 2 + (os.environ["EXPECTED_HY2"] == "1") + (os.environ["EXPECTED_ANYTLS"] == "1") + (os.environ["EXPECTED_CF"] == "1")
+expected = 1 + (os.environ["EXPECTED_HY2"] == "1") + (os.environ["EXPECTED_ANYTLS"] == "1")
 text = open(sys.argv[1], encoding="utf-8").read()
 if "@;:" in text or text.count('class="ncard"') != expected:
     raise SystemExit(1)
@@ -1811,6 +1710,18 @@ config_nginx() {
   tmp_header="$(mktemp "$(dirname "$NGINX_SNIPPET")/.sub-headers.XXXXXX")" || { _rollback_nginx; return 1; }
   if ! render_header "$EXPIRE_VALUE" >"$tmp_header" || ! chmod 644 "$tmp_header"; then rm -f "$tmp_header"; _rollback_nginx; return 1; fi
 
+  # 订阅 TLS(可选): TCP 443 在 VLESS 下线后已经空出。有域名证书时让订阅 server 直接监听 443,
+  # 并补一个 443 默认 server —— 未知 SNI 会命中自签证书后 444 关闭, 不暴露任何内容(黑洞)。
+  local tls_listen="" tls_default=""
+  if subscription_tls_enabled; then
+    tls_listen=$'\n    listen 443 ssl;\n    ssl_certificate '"$(sub_cert_file)"$';\n    ssl_certificate_key '"$(sub_key_file)"$';'
+    tls_default=$'server {\n    listen 443 ssl default_server;\n    ssl_certificate '"$SB_DIR/server.crt"$';\n    ssl_certificate_key '"$SB_DIR/server.key"$';\n    server_name _;\n    return 444;\n}\n\n'
+  elif [ "$SUB_TLS" = 1 ]; then
+    rm -f "$tmp_header"; _rollback_nginx
+    err "SUB_TLS=1 需要 DOMAIN=$( [ -n "$DOMAIN" ] && printf '%s' "$DOMAIN" || printf '<域名>' ) 且证书就位: $(sub_cert_file) / $(sub_key_file)"
+    return 1
+  fi
+
   # 双 server: 默认 Host/IP 一律 404; 只有订阅域名/IP 的精确随机路径返回内容。
   local v6_default="" v6_named=""
   if ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
@@ -1830,14 +1741,14 @@ config_nginx() {
   fi
   tmp_conf="$(mktemp "$(dirname "$NGINX_CONF")/.singbox-sub.XXXXXX")" || { rm -f "$tmp_header"; _rollback_nginx; return 1; }
   cat >"$tmp_conf" <<EOF
-${panel_inc}server {
+${panel_inc}${tls_default}server {
     listen 80 default_server;$v6_default
     server_name _;
     return 404;
 }
 
 server {
-    listen 80;$v6_named
+    listen 80;$v6_named$tls_listen
     root $WWW;
     server_name $sub_server_name;
     # 若该 vhost 后续放到内部 TLS 端口后面，保持相对 Location，避免把内部端口泄漏给浏览器。
@@ -2077,7 +1988,7 @@ EOF
     # Oracle 等内核可能把 BBR 编译成模块；先加载再应用 sysctl，否则会继续停在 cubic。
     modprobe tcp_bbr >/dev/null 2>&1 || true
     cat >>"$SYSCTL_CONF" <<'EOF'
-# BBR 拥塞控制 + fq 队列(只作用于 TCP: AnyTLS/Vless; HY2 走 UDP 不受影响)
+# BBR 拥塞控制 + fq 队列(只作用于 TCP: AnyTLS; HY2 走 UDP 不受影响)
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
@@ -2091,10 +2002,8 @@ EOF
   fi
 }
 
-# HY2 端口跳跃: nftables 把一段 UDP 端口重定向到真实 HY2 端口, 抗运营商按端口对 UDP 限速
-# 关闭端口跳跃时的清理: 只删本脚本自己建的表和服务, 不碰用户其它 nft 规则。
-# 没有它的话, 把 HY2_HOP_RANGE 置空(或 ENABLE_HY2=0)重跑 install 只是"不再配置",
-# 旧的整段 UDP -> HY2 重定向和开机自启服务仍然留着, 等于关不掉。
+# HY2 端口跳跃已于 2026-10 下线(现网固定 UDP 443 + 自动拥塞控制)。
+# 老机器可能仍留着 nft 表/自启服务: 重装时只清理本脚本自己建的对象, 不碰用户其它 nft 规则。
 porthop_cleanup() {
   local svc="$PORTHOP_SERVICE"
   local had=0
@@ -2103,83 +2012,39 @@ porthop_cleanup() {
     nft list table inet sb_hophy2 >/dev/null 2>&1 && had=1
   fi
   [ "$had" = 1 ] || return 0          # 本来就没配过端口跳跃, 什么都不做
-  log "清理旧的 HY2 端口跳跃配置..."
+  log "清理旧版 HY2 端口跳跃配置..."
   systemctl disable --now sing-box-porthop >/dev/null 2>&1 || true
   rm -f "$svc" "$SB_DIR/porthop.nft"
   systemctl daemon-reload >/dev/null 2>&1 || true
   if command -v nft >/dev/null 2>&1; then nft delete table inet sb_hophy2 >/dev/null 2>&1 || true; fi
-  ok "已关闭 HY2 端口跳跃(删除 nft 表与自启服务)"
+  ok "已移除旧版 HY2 端口跳跃(nft 表与自启服务)"
+  note "旧版 HY2 端口跳跃已清理: 云安全组里之前为跳跃放行的 UDP 端口段可以一并删掉。"
   return 0
 }
 
-config_porthop() {
-  # HY2 关掉时端口跳跃无意义: 顺带清掉上一次可能留下的表和服务, 否则整段 UDP 重定向会继续生效
-  if [ "$ENABLE_HY2" != 1 ]; then porthop_cleanup; return 0; fi
-  if [ -z "$HY2_HOP_RANGE" ]; then porthop_cleanup; return 0; fi
-  log "配置 HY2 端口跳跃(UDP $HY2_HOP_RANGE -> $HY2_PORT)..."
-  if ! command -v nft >/dev/null 2>&1; then
-    case "$PKG" in apt) apt-get install -y nftables >/dev/null 2>&1 || true ;; dnf|yum) "$PKG" install -y nftables >/dev/null 2>&1 || true ;; esac
-  fi
-  local nftbin; nftbin="$(command -v nft 2>/dev/null || true)"
-  [ -n "$nftbin" ] || { warn "nftables 未装上, 跳过端口跳跃"; note "端口跳跃: 装不上 nftables, 未启用; 手动装后重跑 install。"; return 0; }
-  local hs="${HY2_HOP_RANGE%-*}" he="${HY2_HOP_RANGE#*-}"
-  local rules="$SB_DIR/porthop.nft"
-  cat >"$rules" <<EOF
-#!/usr/sbin/nft -f
-table inet sb_hophy2
-delete table inet sb_hophy2
-table inet sb_hophy2 {
-  chain prerouting {
-    type nat hook prerouting priority dstnat; policy accept;
-    iifname "${INTERFACE:-eth0}" udp dport ${hs}-${he} redirect to :${HY2_PORT}
-  }
-}
-EOF
-  if ! "$nftbin" -f "$rules" 2>/dev/null; then
-    warn "nft 应用失败, 端口跳跃未生效"; note "端口跳跃: 'nft -f $rules' 报错, 请手动排查。"; return 0
-  fi
-  cat >"$PORTHOP_SERVICE" <<EOF
-[Unit]
-Description=sing-box HY2 port hopping (nftables redirect)
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStart=$nftbin -f $rules
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now sing-box-porthop >/dev/null 2>&1 || true
-  ok "HY2 端口跳跃已开(UDP $HY2_HOP_RANGE 重定向到 $HY2_PORT)"
-  note "端口跳跃: 云安全组必须放行 UDP 整段 $HY2_HOP_RANGE(不只是 $HY2_PORT), 否则跳跃端口连不上。"
-}
-
 config_firewall() {
-  # 提示要跟着 ENABLE_HY2 / SS_UDP 走: 关掉的协议不该再让用户去云安全组放行对应 UDP
-  local _ss_p="$SS_PORT/tcp" _hy2_p="" _udp_hint=""
-  [ "$SS_UDP" = 1 ] && { _ss_p="$SS_PORT/tcp+udp"; _udp_hint="$SS_PORT"; }
+  # 提示要跟着 ENABLE_HY2 / SS_UDP / 订阅 TLS 走: 关掉的协议不该再让用户去云安全组放行对应端口
+  local tcp_ports="22 80 $ANYTLS_PORT $SS_PORT" udp_ports="" udp_hint="" tls_note=""
+  if subscription_tls_enabled; then tcp_ports="22 80 443 $ANYTLS_PORT $SS_PORT"; tls_note=" 443/tcp(订阅 HTTPS)"; fi
+  [ "$SS_UDP" = 1 ] && udp_ports="$SS_PORT" && udp_hint="$SS_PORT"
   if [ "$ENABLE_HY2" = 1 ]; then
-    _hy2_p=" $HY2_PORT/udp"
-    _udp_hint="$HY2_PORT${_udp_hint:+、$_udp_hint}"
+    udp_ports="$HY2_PORT${udp_ports:+ $udp_ports}"
+    udp_hint="$HY2_PORT${udp_hint:+、$udp_hint}"
   fi
-  if [ -n "$_udp_hint" ]; then
-    note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $_ss_p$_hy2_p —— 尤其 UDP($_udp_hint)。本脚本改不了云端安全组, 这是'HY2/SS 连不上、Vless 却正常'的头号原因。"
+  if [ -n "$udp_hint" ]; then
+    note "云安全组(服务商控制台)必须放行: $tcp_ports/tcp$tls_note 与 UDP($udp_hint)—— 尤其 UDP。本脚本改不了云端安全组, 这是'HY2/SS 连不上、AnyTLS 却正常'的头号原因。"
   else
-    note "云安全组(服务商控制台)必须放行: 22/tcp 80/tcp $VLESS_PORT/tcp $ANYTLS_PORT/tcp $_ss_p(本机按 TCP-only 组合部署, 无需放行 UDP)。本脚本改不了云端安全组。"
+    note "云安全组(服务商控制台)必须放行: $tcp_ports/tcp$tls_note(本机按 TCP-only 组合部署, 无需放行 UDP)。本脚本改不了云端安全组。"
   fi
   if ! command -v ufw >/dev/null 2>&1; then return 0; fi
+  _ufw_allow_ports() {
+    local p
+    for p in $tcp_ports; do ufw allow "$p"/tcp >/dev/null 2>&1 || true; done
+    for p in $udp_ports; do ufw allow "$p"/udp >/dev/null 2>&1 || true; done
+  }
   if [ "$ENABLE_UFW" = 1 ]; then
     log "配置并启用 ufw..."
-    ufw allow 22/tcp >/dev/null 2>&1 || true
-    ufw allow 80/tcp >/dev/null 2>&1 || true
-    ufw allow "$VLESS_PORT"/tcp  >/dev/null 2>&1 || true
-    ufw allow "$ANYTLS_PORT"/tcp >/dev/null 2>&1 || true
-    if [ "$ENABLE_HY2" = 1 ]; then ufw allow "$HY2_PORT"/udp >/dev/null 2>&1 || true; fi
-    ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
-    if [ "$SS_UDP" = 1 ]; then ufw allow "$SS_PORT"/udp >/dev/null 2>&1 || true; fi
-    [ -n "$HY2_HOP_RANGE" ] && ufw allow "${HY2_HOP_RANGE%-*}":"${HY2_HOP_RANGE#*-}"/udp >/dev/null 2>&1 || true
+    _ufw_allow_ports
     # 启用前确认 22 已放行, 否则不启用以免把自己 SSH 关在门外
     if ufw status 2>/dev/null | grep -q '22/tcp'; then
       yes | ufw enable >/dev/null 2>&1 || true
@@ -2190,17 +2055,10 @@ config_firewall() {
     fi
   elif ufw status 2>/dev/null | grep -q "Status: active"; then
     log "ufw 已是激活状态, 补放行端口..."
-    ufw allow 22/tcp >/dev/null 2>&1 || true
-    ufw allow 80/tcp >/dev/null 2>&1 || true
-    ufw allow "$VLESS_PORT"/tcp  >/dev/null 2>&1 || true
-    ufw allow "$ANYTLS_PORT"/tcp >/dev/null 2>&1 || true
-    if [ "$ENABLE_HY2" = 1 ]; then ufw allow "$HY2_PORT"/udp >/dev/null 2>&1 || true; fi
-    ufw allow "$SS_PORT"/tcp     >/dev/null 2>&1 || true
-    if [ "$SS_UDP" = 1 ]; then ufw allow "$SS_PORT"/udp >/dev/null 2>&1 || true; fi
-    [ -n "$HY2_HOP_RANGE" ] && ufw allow "${HY2_HOP_RANGE%-*}":"${HY2_HOP_RANGE#*-}"/udp >/dev/null 2>&1 || true
+    _ufw_allow_ports
     ok "已在现有 ufw 中放行端口"
   else
-    note "主机防火墙 ufw 未启用, 本脚本未自动开启(避免锁死 SSH)。如需启用: 用 ENABLE_UFW=1 重跑, 或手动 'ufw allow 22,80,$VLESS_PORT,$ANYTLS_PORT,$SS_PORT/tcp; ufw allow $HY2_PORT/udp; ufw allow $SS_PORT/udp; ufw enable'。"
+    note "主机防火墙 ufw 未启用, 本脚本未自动开启(避免锁死 SSH)。如需启用: 用 ENABLE_UFW=1 重跑, 或手动放行 TCP($tcp_ports)${udp_ports:+ 与 UDP($udp_ports)} 后 'ufw enable'。"
   fi
 }
 
@@ -2219,10 +2077,8 @@ print_summary() {
   printf '  节点(客户端里显示名):\n'
   [ "$ENABLE_HY2" = 1 ] && printf '    - Hysteria2  (UDP %s)\n' "$HY2_PORT"
   [ "$ANYTLS_OK" = 1 ] && printf '    - AnyTLS     (TCP %s)\n' "$ANYTLS_PORT"
-  printf '    - Vless      (TCP %s, Reality)\n' "$VLESS_PORT"
   if [ "$SS_UDP" = 1 ]; then printf '    - SS2022     (TCP+UDP %s)\n' "$SS_PORT"
   else printf '    - SS2022     (TCP %s, TCP-only)\n' "$SS_PORT"; fi
-  [ -n "$CF_HOSTNAME" ] && printf '    - %-14s (WS via %s, Argo 大保底)\n' "$CF_NAME" "$CF_HOSTNAME"
   [ -n "$WARP_PRIVATE_KEY" ] && printf '    * WARP 解锁分流已开 (%s 走 WARP)\n' "${WARP_SITES:-$WARP_DEFAULT_SITES}"
   echo
   printf '  管理命令:\n'
@@ -2234,7 +2090,7 @@ print_summary() {
   printf '    SSH 加固:    bash install.sh harden   (密钥登录+禁密码+fail2ban)\n'
   printf '    WARP 解锁:   bash install.sh warp      (关闭: warp off)\n'
   printf '    网页管理:    bash install.sh admin     (仅本机, SSH隧道访问)\n'
-  printf '    加CF大保底:  CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf\n'
+  printf '    旧CF清理:    bash install.sh cf off    (CF-VLESS 一键路径已下线)\n'
   printf '    装探针:      KOMARI_ENDPOINT=.. KOMARI_TOKEN=.. bash install.sh komari\n'
   printf '    卸载:        bash install.sh uninstall\n'
 
@@ -2247,16 +2103,15 @@ print_summary() {
     for n in "${NOTES[@]}"; do printf '  %d) %s\n' "$i" "$n"; i=$((i+1)); done
   fi
   echo
-  warn "可选增强(默认未做): 1) SSH 改密钥登录+禁用密码(防爆破, 最值得做)  2) CF-Vless 大保底(需 Cloudflare 域名+Tunnel, 见 README)  3) 订阅改 HTTPS(需域名/CF, 见 README)"
+  warn "可选增强(默认未做): 1) SSH 改密钥登录+禁用密码(防爆破, 最值得做)  2) 订阅 443 HTTPS(把域名证书放到 $(sub_cert_file) 与 $(sub_key_file) 后重跑 install)  3) WARP 解锁分流(见 README)"
   echo
-  log "自检: 把订阅 URL 导入 Clash/Mihomo, 先试 Hysteria2, 不通切 Vless。服务器端可跑: systemctl is-active sing-box nginx ; curl -I $sub_url"
+  log "自检: 把订阅 URL 导入 Clash/Mihomo, 先试 Hysteria2, 不通切 AnyTLS / SS2022。服务器端可跑: systemctl is-active sing-box nginx ; curl -I $sub_url"
 }
 
 do_info() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   # 优先用安装时存下的 SUB_HOST(纯读, 不崩); 老版本无此字段才回退探测且探测失败不致命
   [ -n "${SUB_HOST:-}" ] || SOFT_DETECT=1 detect_net
   command -v sing-box >/dev/null 2>&1 && SB_VER="$(sing-box version 2>/dev/null | awk '/version/{print $3; exit}')"
@@ -2268,7 +2123,6 @@ do_links() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
@@ -2303,7 +2157,6 @@ do_panel() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
   hydrate_legacy_runtime_state
@@ -2330,7 +2183,6 @@ do_panel_pass() {
   # 同 write_env: 不捏造到期日, 留空即 expire=0("无到期"), 也避免 panel-pass 顺手把假日期写进流量头
   EXPIRE_VALUE="${EXPIRE_AT:-}"
   SUB_HOST="${SUB_HOST:-${PUBLIC_IP:-127.0.0.1}}"
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   hydrate_legacy_runtime_state
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   local login_file="$WWW${PANEL_PATH%.html}-login.html"
@@ -2462,14 +2314,14 @@ EOF
 do_backup() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   local bf="${BACKUP_DIR:-/root}/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz" f files=""
-  for f in "$SECRETS" "$ENVFILE" "$CF_ENV" "$CF_PENDING_ENV" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key"; do
+  for f in "$SECRETS" "$ENVFILE" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$(sub_cert_file)" "$(sub_key_file)"; do
     [ -f "$f" ] && files="$files $f"
   done
   # shellcheck disable=SC2086
   ( umask 077; tar czf "$bf" $files 2>/dev/null ) || die "打包失败"
   chmod 600 "$bf"
   ok "备份已生成: $bf"
-  echo "  含: 密钥 / 运行参数 / CF状态 / 自签证书 —— 足以在新机重建同一套节点(凭证不变)。"
+  echo "  含: 密钥 / 运行参数 / WARP状态 / 自签证书 / 可选订阅证书 —— 足以在新机重建同一套节点(凭证不变)。"
   echo "  迁移到新 VPS:  1) scp 过去   2) 新机上 bash install.sh restore $bf"
   warn "此文件含全部凭证, 妥善保管、别外传。"
 }
@@ -2514,7 +2366,7 @@ do_restore() {
 
   mkdir -p "$SB_DIR" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "无法创建 sing-box 状态目录"; }
   RESTORE_TX_BACKUP="$(mktemp -d "$SB_DIR/.restore-backup.XXXXXX")" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "无法创建 restore 回滚目录"; }
-  RESTORE_TX_TARGETS=("$SECRETS" "$ENVFILE" "$CF_ENV" "$CF_PENDING_ENV" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key")
+  RESTORE_TX_TARGETS=("$SECRETS" "$ENVFILE" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$(sub_cert_file)" "$(sub_key_file)")
   snapshot_files "$RESTORE_TX_BACKUP" "${RESTORE_TX_TARGETS[@]}" || { rm -rf "$RESTORE_TX_STAGE" "$RESTORE_TX_BACKUP"; RESTORE_TX_STAGE=""; RESTORE_TX_BACKUP=""; die "无法备份恢复前状态"; }
   RESTORE_TX_OLD_SINGBOX_ACTIVE=0; RESTORE_TX_OLD_NGINX_ACTIVE=0; RESTORE_TX_ROLLBACK_STARTED=0
   systemctl is-active --quiet sing-box 2>/dev/null && RESTORE_TX_OLD_SINGBOX_ACTIVE=1 || true
@@ -2572,26 +2424,13 @@ do_restore() {
   rm -rf "$RESTORE_TX_STAGE"
   RESTORE_TX_STAGE=""
 
-  # 载入用户偏好(限额/到期/计费/HY2 进阶); 机器相关(IP/网卡/订阅host)清空让新机重新探测。
+  # 载入用户偏好(限额/到期/计费); 机器相关(IP/网卡/订阅host)清空让新机重新探测。
   # 状态文件只能按字面量解析，备份内的 KEY=VALUE 绝不能作为 root shell 执行。
   if [ -f "$ENVFILE" ]; then load_node_env || die "备份中的运行参数文件格式非法: $ENVFILE"; fi
   INTERFACE=""; PUBLIC_IP=""; SUB_HOST=""
-  # CF-Vless 隧道是跟机器走的(cloudflared+token), 备份只带了节点参数, 新机要重接
-  if [ -f "$CF_ENV" ]; then
-    load_cf_env || die "备份中的 CF 状态文件格式非法: $CF_ENV"
-    atomic_write_file "$CF_PENDING_ENV" 600 <<EOF || die "无法写入待重接 CF 状态"
-CF_HOSTNAME=$CF_HOSTNAME
-CF_PORT=$CF_PORT
-CF_VLESS_UUID=$CF_VLESS_UUID
-CF_WS_PATH=$CF_WS_PATH
-CF_NAME=$CF_NAME
-EOF
-    rm -f "$CF_ENV" || die "无法移除恢复出的正式 CF 状态"
-    note "CF-Vless 第5节点已保存为待重接状态，不会进入新机订阅。请运行 'CF_TOKEN=.. bash install.sh cf' 重新安装 Connector；原域名/UUID/路径会沿用。"
-  fi
-  # pending 只保存下次重接参数，不代表本机已有 Connector。重建阶段必须显式关闭 CF 入站/订阅。
-  if [ -f "$CF_PENDING_ENV" ]; then
-    CF_HOSTNAME=""; CF_VLESS_UUID=""; CF_WS_PATH=""; CF_VERIFIED=0
+  # 旧备份里的 cf.env 不会恢复: CF-VLESS 一键路径已下线, 换机后不再重建 cloudflared。
+  if [ -f "$CF_ENV" ] || [ -f "$CF_PENDING_ENV" ]; then
+    note "检测到旧 CF-VLESS 状态: 该路径已下线, 不会进入订阅; 如确认不再使用可运行 'install.sh cf off' 清理。"
   fi
   ok "凭证已就位, 按新机重建(IP/网卡自动适配; 用域名的话加 DOMAIN= 重跑或重指 DNS)..."
   local install_rc had_errexit=0
@@ -2660,22 +2499,21 @@ do_status() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
-  local cf_svc=""; [ -f "$CF_ENV" ] && cf_svc="cloudflared"
   echo "===== 服务 ====="
   local s
-  for s in sing-box nginx vnstat cron $cf_svc; do
+  for s in sing-box nginx vnstat cron; do
     printf '  %-12s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo inactive)"
   done
   echo "===== 配置校验 ====="
   sing-box check -c "$SB_DIR/config.json" >/dev/null 2>&1 && echo "  sing-box: OK" || echo "  sing-box: FAIL (跑 sing-box check -c $SB_DIR/config.json 看详情)"
   nginx -t >/dev/null 2>&1 && echo "  nginx:    OK" || echo "  nginx:    FAIL (跑 nginx -t 看详情)"
   echo "===== 本地端口监听(不代表外部可达, 云安全组另算) ====="
-  ss -lntup 2>/dev/null | grep -E ":($HY2_PORT|$ANYTLS_PORT|$VLESS_PORT|$SS_PORT|80)\b" || echo "  (无匹配)"
+  ss -lntup 2>/dev/null | grep -E ":($HY2_PORT|$ANYTLS_PORT|$SS_PORT|80|443)\b" || echo "  (无匹配)"
   echo "===== 其它 ====="
   printf '  时间同步 NTPSynchronized = %s\n' "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
   [ -f "$SB_DIR/server.crt" ] && printf '  自签证书 %s\n' "$(openssl x509 -enddate -noout -in "$SB_DIR/server.crt" 2>/dev/null)"
+  printf '  订阅传输: %s\n' "$(subscription_tls_enabled && echo '443 HTTPS' || echo '80 HTTP')"
   printf '  限额 %s GB | 计费 %s | 到期 %s\n' "${LIMIT_GB:-?}" "${COUNT_MODE:-?}" "${EXPIRE_AT:-?}"
   [ -n "$WARP_PRIVATE_KEY" ] && printf '  WARP 解锁分流: 已开 (OpenAI/Netflix/Disney 走 WARP; 关闭: install.sh warp off)\n'
   if [ -f /etc/systemd/system/singbox-admin.service ]; then
@@ -2684,7 +2522,9 @@ do_status() {
     printf '  网页管理面板: %s (127.0.0.1:%s; 取访问方式: install.sh admin)\n' "$(systemctl is-active singbox-admin 2>/dev/null || echo inactive)" "$ap"
   fi
   # 同 doctor: 不带 Host 会命中默认 server 得到 404, 让健康机看起来像订阅坏了
-  curl -s -o /dev/null -H "Host: $(url_host "$SUB_HOST")" -w '  订阅本地可达: http %{http_code}\n' "http://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
+  local probe_scheme=http; local -a probe_extra=()
+  if subscription_tls_enabled; then probe_scheme=https; probe_extra=(-k); fi
+  curl -s -o /dev/null "${probe_extra[@]}" -H "Host: $(url_host "$SUB_HOST")" -w "  订阅本地可达: $probe_scheme %{http_code}\n" "$probe_scheme://127.0.0.1${SUB_PATH}" 2>/dev/null || echo "  订阅本地探测失败"
   echo "  本月流量明细见: install.sh info  /  journalctl -t traffic_limit -n 20"
 }
 
@@ -2692,7 +2532,6 @@ do_doctor() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
   SUB_HOST="${SUB_HOST:-$PUBLIC_IP}"
@@ -2733,52 +2572,50 @@ do_doctor() {
   [ "$cc" = bbr ] && P "拥塞控制 = bbr" || W "拥塞控制 = ${cc:-未知}(非 bbr): 重跑 install 开 BBR"
   # 4) 端口本地监听
   # ENABLE_HY2=0 时 4433 本就不该监听, 不能当成故障报出来
-  local p miss=0 want="$VLESS_PORT $SS_PORT 80"
+  local p miss=0 want="$SS_PORT 80"
   [ "$ENABLE_HY2" = 1 ] && want="$HY2_PORT $want"
+  [ "$ANYTLS_OK" = 1 ] && want="$ANYTLS_PORT $want"
+  subscription_tls_enabled && want="$want 443"
   for p in $want; do
     ss -lntuH 2>/dev/null | grep -qE "[:.]$p\b" || { W "端口 $p 本地未监听"; miss=1; }
   done
   [ "$miss" = 0 ] && P "节点端口本地监听正常 ($(printf '%s' "$want" | tr ' ' '/'))"
   # 5) 防火墙 / 安全组(头号坑)
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
-    W "ufw 已启用: 确认放行 $HY2_PORT/udp、$VLESS_PORT/tcp、$SS_PORT、80/tcp"
+    W "ufw 已启用: 确认放行 $ANYTLS_PORT/tcp、$SS_PORT/tcp(+udp)、80/tcp$([ "$ENABLE_HY2" = 1 ] && printf '、%s/udp' "$HY2_PORT")$(subscription_tls_enabled && printf '、443/tcp')"
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     W "firewalld 已启用: 确认放行对应端口(含 UDP)"
   else
     P "未检测到本机防火墙(ufw/firewalld)启用"
   fi
   W "云厂商安全组要在控制台单独放行——HY2 是 UDP, 最容易漏放 UDP 端口!"
-  # 6) 时间同步(Reality/TLS 敏感)
+  # 6) 时间同步(TLS 敏感)
   [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && P "系统时间已同步" || W "系统时间未同步: timedatectl set-ntp true"
   # 7) 证书到期
   if [ -f "$SB_DIR/server.crt" ]; then
     openssl x509 -checkend $((30*86400)) -noout -in "$SB_DIR/server.crt" >/dev/null 2>&1 && P "自签证书 30 天内不过期" || W "自签证书 30 天内将过期: 重跑 install 重新生成"
   fi
+  if [ -f "$(sub_cert_file)" ] && [ -f "$(sub_key_file)" ]; then
+    openssl x509 -checkend $((30*86400)) -noout -in "$(sub_cert_file)" >/dev/null 2>&1 && P "订阅证书 30 天内不过期" || W "订阅证书 30 天内将过期: 续期后重跑 install"
+    subscription_tls_enabled || W "订阅证书已就位但 DOMAIN 为空: 443 HTTPS 未启用"
+  elif [ "$SUB_TLS" = 1 ]; then
+    W "SUB_TLS=1 但订阅证书缺失: $(sub_cert_file) / $(sub_key_file)"
+  fi
   # 8) 订阅可达
   # 必须带 Host: 订阅 server 绑的是 server_name $SUB_HOST, 不带 Host 会命中默认 server(return 404),
   # 于是每台完全正常的机器都会被报成"订阅本机不可达", 真故障反而被这条噪声淹没。
-  curl -fsS -o /dev/null -m 5 -H "Host: $(url_host "$SUB_HOST")" "http://127.0.0.1$SUB_PATH" 2>/dev/null \
-    && P "订阅本机可达" \
+  local probe_scheme=http; local -a probe_extra=(-fsS)
+  if subscription_tls_enabled; then probe_scheme=https; probe_extra+=(-k); fi
+  curl "${probe_extra[@]}" -o /dev/null -m 5 -H "Host: $(url_host "$SUB_HOST")" "$probe_scheme://127.0.0.1$SUB_PATH" 2>/dev/null \
+    && P "订阅本机可达($probe_scheme)" \
     || F "订阅本机不可达: 看 nginx -t / $WWW 权限(若手改过 server_name, Host 不匹配也会 404)"
   if [ -n "${PUBLIC_IP:-}" ]; then
-    curl -fsS -o /dev/null -m 6 "http://$(url_host "$PUBLIC_IP")$SUB_PATH" 2>/dev/null && P "订阅经公网 IP 可达" \
-      || W "订阅经公网 IP 不可达(可能是 hairpin 不支持, 不一定是真问题): 用手机流量/外部网络测 $(subscription_url "$SUB_PATH")"
+    curl -fsS -o /dev/null -m 6 "$(subscription_url "$SUB_PATH")" 2>/dev/null && P "订阅经公网可达" \
+      || W "订阅经公网不可达(可能是 hairpin 不支持, 不一定是真问题): 用手机流量/外部网络测 $(subscription_url "$SUB_PATH")"
   fi
   # 9) 可选组件
-  [ -f "$CF_ENV" ] && { [ "$(systemctl is-active cloudflared 2>/dev/null)" = active ] && P "cloudflared(CF-Vless) 运行中" || W "cloudflared 未运行: systemctl status cloudflared"; }
-  if [ -f "$CF_ENV" ] && [ -n "${CF_WS_PATH:-}" ]; then   # 本机 WS 入站 101: 区分"sing-box 入站坏"还是"cloudflared/隧道坏"
-    local ws_hdr=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13') ws_resp
-    # 101 后 WebSocket 会保持连接，curl 到超时返回 28；先捕获响应再匹配，避免 pipefail 把成功误报成失败。
-    ws_resp="$(curl -isS -m 2 --http1.1 -H "Host: ${CF_HOSTNAME:-localhost}" "${ws_hdr[@]}" "http://127.0.0.1:${CF_PORT:-28080}$CF_WS_PATH" 2>/dev/null || true)"
-    if printf '%s' "$ws_resp" | grep -qi '101'; then
-      P "CF-Vless 本机 WS 入站 101(sing-box 侧 OK; 公网不通则查 cloudflared/DNS/Tunnel)"
-    else
-      W "CF-Vless 本机 WS 入站未拿到 101: 查 sing-box 的 cf-vless-ws-in / CF_WS_PATH / CF_VLESS_UUID"
-    fi
-  fi
-  if [ -f "$PORTHOP_SERVICE" ]; then
-    { command -v nft >/dev/null 2>&1 && nft list table inet sb_hophy2 >/dev/null 2>&1 && P "端口跳跃 nftables 表在位"; } || W "端口跳跃服务装了但 nft 表缺失: systemctl restart sing-box-porthop"
-  fi
+  if [ -f "$CF_ENV" ]; then W "检测到旧版 CF-VLESS 状态($CF_ENV): 该路径已下线, 可运行 'install.sh cf off' 清理"; fi
+  if [ -f "$PORTHOP_SERVICE" ]; then W "检测到旧版 HY2 端口跳跃服务: 重跑 install 会自动清理"; fi
   [ -n "${WARP_PRIVATE_KEY:-}" ] && P "WARP 解锁分流已配置(站点: ${WARP_SITES:-$WARP_DEFAULT_SITES})"
   if [ -f /etc/systemd/system/singbox-admin.service ]; then
     { [ "$(systemctl is-active singbox-admin 2>/dev/null)" = active ] && P "网页管理面板运行中(仅 127.0.0.1)"; } || W "网页管理面板服务未运行: journalctl -u singbox-admin"
@@ -2802,10 +2639,9 @@ do_doctor() {
 
 do_set() {
   [ -f "$ENVFILE" ] || die "未检测到安装(缺 $ENVFILE)"
-  [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / HY2_UP_MBPS / HY2_DOWN_MBPS)"
+  [ "$#" -ge 1 ] || die "用法: install.sh set KEY=VAL ...  (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / SUB_TLS)"
   if [ -f "$SECRETS" ]; then load_secrets || die "密钥文件格式非法: $SECRETS"; fi
   load_node_env || die "运行参数文件格式非法: $ENVFILE"
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi
   if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
   # 兼容旧 env(可能无 PUBLIC_IP/SUB_HOST): 回填后再让 write_env 重写, 否则会被清空
   [ -n "${PUBLIC_IP:-}" ] || SOFT_DETECT=1 detect_net
@@ -2813,31 +2649,29 @@ do_set() {
   hydrate_legacy_runtime_state
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   local tx_bak=""
-  local a key val iface_changed=0 sb_render=0
+  local a key val iface_changed=0 nginx_render=0
   for a in "$@"; do
     key="${a%%=*}"; val="${a#*=}"
     [ "$key" != "$a" ] || die "参数要写成 KEY=VAL: $a"
     case "$key" in
       LIMIT_GB)   case "$val" in ''|.|*.*.*|*[!0-9.]*) die "LIMIT_GB 要是数字(如 200 或 0.5): $val";; esac; LIMIT_GB="$val" ;;
       COUNT_MODE) case "$val" in rx+tx|tx|max) COUNT_MODE="$val" ;; *) die "COUNT_MODE 只能 rx+tx/tx/max";; esac ;;
-      # HY2 服务端带宽护栏: 清洗敏感机最需要它长期生效。放进 set 是为了不用手改 config.json ——
-      # 手改会被下一次 install/cf/warp 的全量重渲染抹掉, 而 env 里的值有 merge_env_defaults 保底。
-      HY2_UP_MBPS|HY2_DOWN_MBPS)
-                  case "$val" in ''|*[!0-9]*) die "$key 要是数字(Mbps, 如 80): $val";; esac
-                  eval "$key=\"\$val\""; sb_render=1 ;;
+      SUB_TLS)    case "$val" in auto|0|1) SUB_TLS="$val"; nginx_render=1 ;; *) die "SUB_TLS 只能 auto / 1 / 0";; esac ;;
       INTERFACE)  [ -n "$val" ] || die "INTERFACE 不能空"
                   # 校验网卡真实存在: 打错名字会让 vnstat 取不到数据, traffic_limit.py 提前退出,
                   # 流量头不更新且配额自动停机静默失效。有 ip 命令时落盘前就拦掉(测试机无 ip 则跳过)。
                   if command -v ip >/dev/null 2>&1; then ip -br link show "$val" >/dev/null 2>&1 || die "网卡不存在: $val(用 ip -br link 查真实名)"; fi
                   INTERFACE="$val"; iface_changed=1 ;;
       EXPIRE_AT)  [[ "$val" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] || die "EXPIRE_AT 格式须为 'YYYY-MM-DD HH:MM:SS +0800'"; EXPIRE_AT="$val" ;;
-      *) die "不支持的键: $key (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / HY2_UP_MBPS / HY2_DOWN_MBPS)" ;;
+      HY2_UP_MBPS|HY2_DOWN_MBPS|HY2_UP|HY2_DOWN|HY2_HOP_RANGE)
+                  die "$key 已下线(HY2 固定 UDP 443 + 自动拥塞控制), 不能再通过 set 修改" ;;
+      *) die "不支持的键: $key (可改 LIMIT_GB / EXPIRE_AT / COUNT_MODE / INTERFACE / SUB_TLS)" ;;
     esac
     ok "set $key=$val"
   done
   mkdir -p "$(dirname "$ENVFILE")" || die "无法创建运行参数目录"
   tx_bak="$(mktemp -d "$(dirname "$ENVFILE")/.set-backup.XXXXXX")" || die "无法创建 set 回滚目录"
-  local -a set_paths=("$ENVFILE" "$SB_DIR/config.json" "$NGINX_SNIPPET")
+  local -a set_paths=("$ENVFILE" "$SB_DIR/config.json" "$NGINX_SNIPPET" "$NGINX_CONF" "$NGINX_MAIN")
   if [ -n "${SUB_PATH:-}" ]; then
     set_paths+=("$WWW$SUB_PATH")
     [ -n "${SUB_B64_PATH:-}" ] && set_paths+=("$WWW$SUB_B64_PATH")
@@ -2865,21 +2699,16 @@ do_set() {
     return "$rollback_rc"
   }
   write_env   # 用更新后的全局重写 env(SUB_HOST/PUBLIC_IP 已从 env 读到, 一并保留)
-  # 改了写进 config.json 的键(如 HY2 带宽护栏)要重渲染才生效;
-  # 走 write_singbox_config 的 check + 失败回滚流程, 不裸改正式配置。
-  if [ "$sb_render" = 1 ]; then
-    if [ -f "$SB_DIR/config.json" ]; then write_singbox_config || { _rollback_set; die "应用新 sing-box 参数失败，已恢复旧状态"; }
-    else warn "尚未生成 config.json, 值已存入 env, 下次 install 生效"; fi
-  fi
   if [ -n "${SUB_PATH:-}" ]; then
     write_subscription || { _rollback_set; die "刷新订阅/看板失败，已恢复旧状态"; }
   fi
+  # SUB_TLS 会改变订阅 URL 的 scheme 与 nginx 监听, 必须重新落 nginx 配置。
+  if [ "$nginx_render" = 1 ]; then
+    config_nginx || { _rollback_set; die "应用订阅 TLS 配置失败，已恢复旧状态"; }
+  fi
   [ -f "$TRAFFIC_PY" ] && { "$PY" "$TRAFFIC_PY" >/dev/null 2>&1 && ok "已刷新订阅流量头(限额/到期即时生效)" || warn "流量头刷新失败, 5 分钟后 cron 会自动重试"; }
   rm -rf "$tx_bak"
-  # 改了网卡: HY2 端口跳跃的 nft 规则把旧网卡名烤进了 porthop.nft(do_set 不重建以免用错 HY2_PORT),
-  # 提示用户重跑 install 刷新, 否则跳跃段仍绑旧网卡、客户端经跳跃端口连不上 HY2(直连 HY2_PORT 不受影响)。
-  [ "$iface_changed" = 1 ] && [ -f "$PORTHOP_SERVICE" ] && \
-    warn "网卡已改, 但 HY2 端口跳跃 nft 规则仍绑旧网卡; 重跑 'bash install.sh' 刷新端口跳跃(否则跳跃段连不上 HY2)。"
+  [ "$iface_changed" = 1 ] && warn "网卡已改: 若还有旧版 HY2 端口跳跃残留, 重跑 'bash install.sh' 会一并清理。"
   return 0
 }
 
@@ -2900,9 +2729,6 @@ do_restart() {
   local failed=0
   if systemctl restart sing-box 2>/dev/null; then ok "sing-box 已重启"; else err "sing-box 重启失败"; failed=1; fi
   if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then ok "nginx 已重载"; else err "nginx 重载失败"; failed=1; fi
-  if [ -f "$CF_ENV" ]; then
-    if systemctl restart cloudflared 2>/dev/null; then ok "cloudflared 已重启"; else err "cloudflared 重启失败"; failed=1; fi
-  fi
   return "$failed"
 }
 
@@ -2913,7 +2739,7 @@ do_menu() {
     echo "  1) 安装 / 重装           2) 查看信息(订阅 URL)"
     echo "  3) 分享链接 / 二维码     4) 状态体检"
     echo "  5) 改参数(限额/到期)     6) 更新 sing-box"
-    echo "  7) 加 CF 大保底(第5节点) 8) 重启服务"
+    echo "  7) 重启服务              8) 备份"
     echo "  9) 卸载                  0) 退出"
     echo "  p) 看板页地址            s) 看板加/改登录密码"
     echo "  k) 装 Komari 探针"
@@ -2932,9 +2758,8 @@ do_menu() {
       5) printf '  输入 KEY=VAL(如 LIMIT_GB=500): '; read -r kv || true
          [ -n "${kv:-}" ] && run_menu_action with_maintenance_lock do_set "$kv" ;;
       6) run_menu_action with_maintenance_lock do_update ;;
-      7) printf '  CF_TOKEN: '; read -r t || true; printf '  CF_HOSTNAME: '; read -r h || true
-         if [ -n "${t:-}" ] && [ -n "${h:-}" ]; then run_menu_action env MAINT_LOCK_HELD=0 CF_TOKEN="$t" CF_HOSTNAME="$h" bash "$0" cf; else echo "  已取消(token/域名为空)"; fi ;;
-      8) run_menu_action with_maintenance_lock do_restart ;;
+      7) run_menu_action with_maintenance_lock do_restart ;;
+      8) run_menu_action do_backup ;;
       9) run_menu_action with_maintenance_lock do_uninstall ;;
       p|P) run_menu_action with_maintenance_lock do_panel ;;
       # 看板页含全套节点凭证, 随机路径不是登录保护 —— 菜单里必须能直接加密码,
@@ -2973,7 +2798,7 @@ do_uninstall() {
   fi
   systemctl disable --now sing-box >/dev/null 2>&1 || true
   if [ -f "$SECRETS" ] && ! load_secrets; then warn "密钥文件格式非法, 将按通配路径清理订阅/看板文件"; fi
-  rm -f "$SB_DIR/config.json" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$SECRETS" 2>/dev/null || true
+  rm -f "$SB_DIR/config.json" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$(sub_cert_file)" "$(sub_key_file)" "$SECRETS" 2>/dev/null || true
   rm -f "$ENVFILE" "$TRAFFIC_PY" "$CRON" "$NGINX_SNIPPET" "$NGINX_CONF" 2>/dev/null || true
   [ -n "${SUB_PATH:-}" ] && rm -f "$WWW$SUB_PATH" 2>/dev/null || true
   [ -n "${SUB_B64_PATH:-}" ] && rm -f "$WWW$SUB_B64_PATH" 2>/dev/null || true
@@ -2989,8 +2814,8 @@ do_uninstall() {
   fi
   if [ -f "$CF_ENV" ]; then
     cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
-    rm -f "$CF_ENV" 2>/dev/null || true
-    warn "已停止本脚本 cf 子命令装的 cloudflared(CF 后台那条 Tunnel 需你自行删除)"
+    rm -f "$CF_ENV" "$CF_PENDING_ENV" 2>/dev/null || true
+    warn "已停止旧版 cf 子命令装的 cloudflared(CF 后台那条 Tunnel 需你自行删除)"
   else
     warn "未触碰 cloudflared(若你手动搭过 CF, 请自行处理 /etc/cloudflared, 凭证别误删)"
   fi
@@ -3041,214 +2866,40 @@ apply_singbox_config() {
   return 1
 }
 
-# do_cf 后续步骤失败时回滚 cloudflared(参数: 旧 cloudflared.service 备份文件, 空=首次接入无旧隧道)。
-# 换 token = 卸旧装新; 若 sing-box 那边随后回滚/没动, cloudflared 也必须跟着回滚, 否则状态不一致:
-#   - 有旧隧道备份: 切回旧隧道, 否则旧 CF 节点会断;
-#   - 首次接入(无备份): 卸掉刚装的新隧道, 否则留下一个连上 CF 却指向无监听端口的孤儿服务(502/530)。
-cf_restore_service() {
-  local b="${1:-}" rc=0
-  cloudflared service uninstall >/dev/null 2>&1 || true   # 先清掉当前(可能是新装或装一半的)服务
-  if [ -n "$b" ] && [ -f "$b" ]; then
-    warn "恢复旧 cloudflared 隧道服务(回滚 token 切换)..."
-    install -m644 "$b" "$CF_SERVICE" || rc=1
-    systemctl daemon-reload >/dev/null 2>&1 || rc=1
-    systemctl enable --now cloudflared >/dev/null 2>&1 || rc=1
-    systemctl is-active --quiet cloudflared >/dev/null 2>&1 || rc=1
-    [ "$rc" -eq 0 ] || err "旧 cloudflared 服务未能完整恢复，服务备份保留在: $b"
-  else
-    warn "首次接入 CF 失败, 已卸载刚装的 cloudflared 隧道(无旧隧道可恢复, 不留孤儿服务)。"
-    systemctl daemon-reload >/dev/null 2>&1 || rc=1
-  fi
-  return "$rc"
-}
-
-websocket_101() {
-  local url="$1" host="${2:-}" resp status
-  local -a args=(-isS -m 8 --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket'
-    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Version: 13')
-  [ -n "$host" ] && args+=(-H "Host: $host")
-  resp="$(curl "${args[@]}" "$url" 2>/dev/null || true)"
-  status="$(printf '%s\n' "$resp" | tr -d '\r' | awk 'toupper($1) ~ /^HTTP\// {print $2; exit}')"
-  [ "$status" = 101 ]
-}
-
-restore_cf_transaction() {
-  local state_bak="$1" cfbak="$2" rc=0
-  restore_files "$state_bak" "${CF_TRANSACTION_PATHS[@]}" || rc=1
-  cf_restore_service "$cfbak" || rc=1
-  systemctl reset-failed sing-box >/dev/null 2>&1 || true
-  systemctl restart sing-box >/dev/null 2>&1 || rc=1
-  systemctl is-active --quiet sing-box >/dev/null 2>&1 || rc=1
-  if [ "$rc" -eq 0 ]; then
-    rm -rf "$state_bak"
-  else
-    err "CF 回滚不完整，状态备份保留在: $state_bak"
-    [ -n "$cfbak" ] && [ -f "$cfbak" ] && err "cloudflared 服务备份保留在: $cfbak"
-  fi
-  return "$rc"
-}
-
-cf_rollback_or_die() {
-  local state_bak="$1" cfbak="$2" message="$3"
-  if restore_cf_transaction "$state_bak" "$cfbak"; then
-    [ -n "$cfbak" ] && rm -f "$cfbak"
-    die "$message"
-  fi
-  die "$message；自动回滚不完整，已保留上述备份，请先人工恢复后再重试"
-}
-
-# 可选第5节点: CF-Vless 大保底(Argo 命名隧道)。VPS 侧自动, CF 后台需你先建 Tunnel。
+# CF-VLESS 一键路径已于 2026-10 下线(现网只保留经验证的自有 CF WebSocket 节点, 由现网事务工具维护)。
+# 这里只保留清理入口, 避免老机器留下无人管理的 cloudflared 服务与状态文件。
 do_cf() {
-  umask 077
-  [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再加 CF-Vless"
+  if [ "${1:-}" != "off" ]; then
+    cat <<EOF
+CF-VLESS 一键安装路径已下线(2026-10 现网口径):
+  直连 VLESS/Reality 与旧 CF-VLESS 已退休; 节点只保留 Hysteria2 / AnyTLS / SS2022。
+  现网如仍需 CF WebSocket 节点, 由各自 Tunnel 与自有域名单独维护, 不再走本脚本。
+
+清理老机器上由旧版 cf 子命令安装的 cloudflared 与状态:
+  bash install.sh cf off
+EOF
+    return 0
+  fi
+  [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"
-  elif [ -f "$CF_PENDING_ENV" ]; then load_cf_pending_env || die "待重接 CF 状态文件格式非法: $CF_PENDING_ENV"; fi
-  if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi
-  [ -n "$_CLI_CF_HOSTNAME" ] && CF_HOSTNAME="$_CLI_CF_HOSTNAME"
-  [ -n "$_CLI_CF_PORT" ] && CF_PORT="$_CLI_CF_PORT"
-  [ -n "$_CLI_CF_VLESS_UUID" ] && CF_VLESS_UUID="$_CLI_CF_VLESS_UUID"
-  [ -n "$_CLI_CF_WS_PATH" ] && CF_WS_PATH="$_CLI_CF_WS_PATH"
-  [ -n "$_CLI_CF_NAME" ] && CF_NAME="$_CLI_CF_NAME"
-  CF_PORT="${CF_PORT:-28080}"
-
-  if [ -z "${CF_TOKEN:-}" ] || [ -z "${CF_HOSTNAME:-}" ]; then
-    cat <<EOF
-CF-Vless 大保底(第5节点)需要先在 Cloudflare 后台建一条 Tunnel:
-  Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared
-  · Public hostname: 你的域名(如 cf.example.com)
-    Service: http://127.0.0.1:${CF_PORT}
-  · 复制 Connector token
-然后回本机运行:
-  CF_TOKEN='粘贴token' CF_HOSTNAME='cf.example.com' bash install.sh cf
-EOF
-    die "缺少 CF_TOKEN 或 CF_HOSTNAME"
-  fi
-  case "$CF_HOSTNAME" in *[!A-Za-z0-9.-]*) die "CF_HOSTNAME 含非法字符: $CF_HOSTNAME";; esac
-  case "$CF_NAME" in ''|*[!A-Za-z0-9._-]*) die "CF_NAME 含非法字符(只允许字母数字 . _ -): $CF_NAME";; esac
-  case "$CF_PORT" in ''|*[!0-9]*) die "CF_PORT 必须是数字: $CF_PORT";; esac
-  { [ "$CF_PORT" -ge 1 ] && [ "$CF_PORT" -le 65535 ]; } || die "CF_PORT 超出范围 1-65535: $CF_PORT"
-
-  CF_VLESS_UUID="${CF_VLESS_UUID:-$(sing-box generate uuid)}"
-  CF_WS_PATH="${CF_WS_PATH:-/cf-$(openssl rand -hex 8)}"
-  case "$CF_WS_PATH" in /*) ;; *) CF_WS_PATH="/$CF_WS_PATH";; esac
-  # 字符白名单: WS 路径会原样进订阅 YAML(裸标量)。含 ': ' 等字符虽过 sing-box check(JSON 合法),
-  # 却会让整份 Clash 订阅 YAML 解析失败、所有客户端拉不到订阅。这里和 CF_HOSTNAME 一样早挡掉。
-  case "$CF_WS_PATH" in *[!A-Za-z0-9/_.-]*) die "CF_WS_PATH 含非法字符(只允许 字母数字 / _ . -): $CF_WS_PATH";; esac
-  # CF_ENV 状态文件改到"配置校验+落地成功"后再写(见下), 避免坏参数留下"已接入"状态毒害后续 install/重启
-  # 网卡/IP 探测与 anytls 入站判定放到"换 cloudflared token"之前: 这俩若失败应在动 cloudflared 之前就退出,
-  # 免得换完 token 才在这里 die、把已有隧道留在新 token 上回不去。
-  { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
-  detect_net
-
-  # 装 cloudflared(直接下二进制, 跨发行版)
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    log "下载 cloudflared..."
-    local cfarch
-    case "$(uname -m)" in
-      x86_64|amd64)   cfarch=amd64 ;;
-      aarch64|arm64)  cfarch=arm64 ;;
-      armv7l|armv7|armhf) cfarch=arm ;;   # 官方有 cloudflared-linux-arm; wgcf 分支也支持 armv7, 这里对齐
-      i386|i686)      cfarch=386 ;;
-      *) die "cloudflared 不支持架构 $(uname -m)(官方仅提供 amd64/arm64/arm/386)" ;;
-    esac
-    # --retry: 单次 curl 遇到网络抖动就整条 cf 流程失败, 重试几次成本极低
-    curl -fsSL --retry 3 --retry-delay 2 -o /usr/local/bin/cloudflared \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cfarch" \
-      || die "cloudflared 下载失败"
-    chmod 755 /usr/local/bin/cloudflared
-  fi
-  log "安装 cloudflared 服务(token)..."
-  local cfsvc="$CF_SERVICE" cfbak="" state_bak old_cf_managed=0
-  [ -f "$CF_ENV" ] && old_cf_managed=1
-  if [ -f "$cfsvc" ] && [ "$old_cf_managed" != 1 ]; then
-    die "检测到非本脚本管理的 cloudflared.service；为避免覆盖其它 Tunnel，拒绝接管。请先手动迁移/停用该服务。"
-  fi
-  state_bak="$(mktemp -d "$SB_DIR/.cf-backup.XXXXXX")" || die "无法创建 CF 回滚目录"
-  CF_TRANSACTION_PATHS=("$SB_DIR/config.json" "$CF_ENV" "$CF_PENDING_ENV")
-  [ -n "${SUB_PATH:-}" ] && CF_TRANSACTION_PATHS+=("$WWW$SUB_PATH")
-  [ -n "${SUB_B64_PATH:-}" ] && CF_TRANSACTION_PATHS+=("$WWW$SUB_B64_PATH")
-  [ -n "${PANEL_PATH:-}" ] && CF_TRANSACTION_PATHS+=("$WWW$PANEL_PATH" "$WWW${PANEL_PATH%.html}-login.html")
-  snapshot_files "$state_bak" "${CF_TRANSACTION_PATHS[@]}" \
-    || { rm -rf "$state_bak"; die "无法备份 CF 相关状态"; }
-  # 先备份旧隧道服务: 新 token 装失败时能回滚, 不至于把已有隧道(本机其它隧道/旧 CF-Vless)弄丢
-  if [ -f "$cfsvc" ]; then
-    cfbak="$(mktemp)" || { rm -rf "$state_bak"; die "无法创建 cloudflared 服务备份"; }
-    cp -a "$cfsvc" "$cfbak" || { rm -f "$cfbak"; rm -rf "$state_bak"; die "无法备份现有 cloudflared 服务，未执行切换"; }
-  fi
-  cloudflared service uninstall >/dev/null 2>&1 || true   # 幂等: 重复跑 cf(换token)时先卸旧服务
-  if ! cloudflared service install "$CF_TOKEN"; then
-    cf_rollback_or_die "$state_bak" "$cfbak" "cloudflared service install 失败(token 错误/过期?)。换对 token 后重跑: CF_TOKEN=.. CF_HOSTNAME=.. bash install.sh cf"
-  fi
-  # cfbak 先保留: 后续 sing-box check / apply_singbox_config 任一失败, 都要把 cloudflared 切回旧隧道(见下)
-  systemctl enable --now cloudflared >/dev/null 2>&1 || cf_rollback_or_die "$state_bak" "$cfbak" "新 cloudflared 服务未能启动，已恢复旧状态"
-  # 保持 protocol=auto：官方会优先 QUIC，UDP 不通时自动回退 HTTP/2；不要为“稳定”牺牲正常线路性能。
-  if [ -f "$cfsvc" ]; then
-    cp -a "$cfsvc" "${cfsvc}.singbox-bak.$(date +%s)" 2>/dev/null || true
-    sed -i -E 's/[[:space:]]+--protocol[[:space:]]+(http2|quic|auto)//g' "$cfsvc" \
-      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 服务失败，已恢复旧状态"
-    grep -q -- '--loglevel' "$cfsvc" || sed -i 's#\(ExecStart=.*tunnel run\)#\1 --loglevel warn#' "$cfsvc" \
-      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 日志参数失败，已恢复旧状态"
-    grep -q '^TimeoutStartSec=' "$cfsvc" || sed -i '/^\[Service\]/a TimeoutStartSec=60' "$cfsvc" \
-      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 超时参数失败，已恢复旧状态"
-    { grep -q '^Type=' "$cfsvc" && sed -i 's/^Type=.*/Type=simple/' "$cfsvc"; } || sed -i '/^\[Service\]/a Type=simple' "$cfsvc" \
-      || cf_rollback_or_die "$state_bak" "$cfbak" "修改 cloudflared 服务类型失败，已恢复旧状态"
-    systemctl daemon-reload >/dev/null 2>&1 \
-      && systemctl restart cloudflared >/dev/null 2>&1 \
-      && systemctl is-active --quiet cloudflared \
-      || cf_rollback_or_die "$state_bak" "$cfbak" "cloudflared 重启失败，已恢复旧状态"
-    ok "cloudflared 已优化: protocol=auto(QUIC 优先/HTTP2 回退) + --loglevel warn + TimeoutStartSec=60(备份 ${cfsvc}.singbox-bak.*)"
-  fi
-
-  # 重建 config(含 cf-vless-ws-in 入站)与订阅(含 CF-Vless 节点)。
-  # 安全护栏: 先渲染到临时文件并 sing-box check 通过, 再覆盖正式 config; 失败保留原配置。
-  # 这之后任一步失败, 除回滚 sing-box 配置外, 还要 cf_restore_service 把 cloudflared 切回旧隧道(token 已换)。
-  local tmpc=""
-  # mktemp/render 也纳入回滚保护: errexit 下它们若失败(如磁盘满)会直接退出, 不补这层就会跳过 cloudflared 回滚。
-  tmpc="$(mktemp)" || cf_rollback_or_die "$state_bak" "$cfbak" "创建临时文件失败, 已恢复旧状态"
-  render_singbox_config >"$tmpc" || { rm -f "$tmpc"; cf_rollback_or_die "$state_bak" "$cfbak" "渲染配置失败, 已恢复旧状态"; }
-  sing-box check -c "$tmpc" >/dev/null 2>&1 || { rm -f "$tmpc"; cf_rollback_or_die "$state_bak" "$cfbak" "加入 CF 入站后 sing-box 配置校验失败, 已恢复旧状态; 检查 CF_PORT/CF_WS_PATH/CF_VLESS_UUID"; }
-  apply_singbox_config "$tmpc" || { rm -f "$tmpc"; cf_rollback_or_die "$state_bak" "$cfbak" "加入 CF 入站后 sing-box 重启失败, 已恢复旧状态; 看 systemctl status sing-box"; }
-  rm -f "$tmpc"
-  # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)
-  # ② 先验本机 28080 入站, 再验公网隧道: 一眼分清是 sing-box 坏还是 cloudflared/Tunnel 坏。
-  # 验证必须排在 write_subscription 之前: 隧道没通就把 CF-Vless 写进订阅 = 客户端多一条死节点,
-  # 万一客户端手动选中它, 表现是"所有流量都断", 正是最难自查的场景。
-  log "验证(先本机 $CF_PORT, 再公网隧道; 101 = 通; 刚装可能要等几秒 cloudflared 连上)..."
-  local local_ok=0 public_ok=0
-  if websocket_101 "http://127.0.0.1:$CF_PORT$CF_WS_PATH" "$CF_HOSTNAME"; then
-    local_ok=1
-    ok "本机 WS 入站 127.0.0.1:$CF_PORT 正常(101) —— sing-box 侧 OK"
+  local had=0
+  if [ -f "$CF_ENV" ] || [ -f "$CF_PENDING_ENV" ]; then had=1; fi
+  if ! command -v cloudflared >/dev/null 2>&1 && [ "$had" = 0 ]; then ok "没有检测到旧 CF-VLESS 状态, 无需清理"; return 0; fi
+  if ! load_cf_env 2>/dev/null; then CF_HOSTNAME=""; fi
+  # 只卸由本脚本 cf.env 记录在案的 cloudflared; 没有 cf.env 时不碰别人的 Tunnel。
+  if [ "$had" = 1 ]; then
+    log "停止并移除旧版 CF-VLESS 的 cloudflared 服务..."
+    cloudflared service uninstall >/dev/null 2>&1 || systemctl disable --now cloudflared >/dev/null 2>&1 || true
+    rm -f "$CF_ENV" "$CF_PENDING_ENV" || die "删除旧 CF 状态失败, 请手动检查 $SB_DIR"
   else
-    warn "本机 WS 入站未拿到严格 HTTP 101"
+    warn "检测到 cloudflared 二进制但没有 cf.env(可能不是本脚本安装), 未改动其服务"
   fi
-  if [ "$local_ok" = 1 ] && websocket_101 "https://$CF_HOSTNAME$CF_WS_PATH"; then
-    public_ok=1
-  fi
-  if [ "$local_ok" != 1 ] || [ "$public_ok" != 1 ]; then
-    cf_rollback_or_die "$state_bak" "$cfbak" "新 CF Tunnel 未同时通过本机和公网 HTTP/1.1 101，已恢复此前工作状态；稍后确认 DNS/Tunnel 后重试"
-  fi
-  local cf_verified=1
-
-  # 配置已校验通过并落地, 现在才持久化 CF 状态(避免坏参数留下"已接入"状态毒害后续重装)。
-  # CF_VERIFIED 决定该节点是否进订阅: 未验证通过时后续 install/warp 也不会把死节点加回来。
-  atomic_write_file "$CF_ENV" 600 <<EOF || cf_rollback_or_die "$state_bak" "$cfbak" "写入 CF 状态失败，已恢复旧状态"
-CF_HOSTNAME=$CF_HOSTNAME
-CF_PORT=$CF_PORT
-CF_VLESS_UUID=$CF_VLESS_UUID
-CF_WS_PATH=$CF_WS_PATH
-CF_VERIFIED=$cf_verified
-CF_NAME=$CF_NAME
-EOF
-  CF_VERIFIED="$cf_verified"
-  write_subscription || cf_rollback_or_die "$state_bak" "$cfbak" "发布 CF 订阅失败，已恢复旧状态"
-  rm -f "$CF_PENDING_ENV" || cf_rollback_or_die "$state_bak" "$cfbak" "清理旧 CF 待重接状态失败，已恢复旧状态"
-  rm -rf "$state_bak"
-  [ -n "$cfbak" ] && rm -f "$cfbak"
-
-  ok "公网隧道连通(严格 HTTP/1.1 101)。$CF_NAME 已加入订阅, 客户端重新拉订阅即可看到。"
-  ok "$CF_NAME 已接入(本地入站 127.0.0.1:$CF_PORT, 隧道 $CF_HOSTNAME, 路径 $CF_WS_PATH)"
+  # 订阅里已不含 CF 节点; 重生成一次确保面板/订阅与 sing-box 配置一致。
+  [ -n "${SUB_PATH:-}" ] && write_subscription || true
+  ok "旧 CF-VLESS 状态已清理(Cloudflare 后台的 Tunnel 需你自行删除)"
+  [ -n "${SUB_PATH:-}" ] && echo "  订阅已重建: $(subscription_url "$SUB_PATH")"
+  return 0
 }
 
 install_wgcf() {
@@ -3284,8 +2935,6 @@ do_warp() {
   [ -f "$SECRETS" ] || die "请先运行安装(bash install.sh)再开 WARP 分流"
   load_secrets || die "密钥文件格式非法: $SECRETS"
   if [ -f "$ENVFILE" ]; then load_node_env || die "运行参数文件格式非法: $ENVFILE"; fi
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi   # 保留已接入的 CF-Vless 节点
-  CF_PORT="${CF_PORT:-28080}"
   { [ -e "$SB_DIR/config.json" ] && grep -q anytls-in "$SB_DIR/config.json"; } && ANYTLS_OK=1 || ANYTLS_OK=0
   detect_net
 
@@ -3491,20 +3140,21 @@ do_install() {
   trap '_install_exit_trap' EXIT
 
   detect_net
-  check_reality_sni   # best-effort 探测偷证书目标是否支持 TLS1.3+H2, 填错只提示
   gen_secrets
-  if [ -f "$CF_ENV" ]; then load_cf_env || die "CF 状态文件格式非法: $CF_ENV"; fi   # 已接入过 CF-Vless 则重装时保留
   if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi   # 已接入过 WARP 则重装/更新时保留分流
   gen_cert
   config_sysctl   # 在 sing-box 启动前应用, 这样 HY2/QUIC 一启动就拿到大 UDP 缓冲
-  merge_env_defaults "${RESTORING:-0}"   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT/HY2 护栏等, 显式传入的仍优先
+  merge_env_defaults "${RESTORING:-0}"   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT 等, 显式传入的仍优先
   write_env
   write_singbox_config
   write_subscription
   config_nginx
   install_traffic
   config_firewall
-  config_porthop
+  porthop_cleanup   # 只清旧版残留, 不再新建端口跳跃
+  if [ -f "$CF_ENV" ] || [ -f "$CF_PENDING_ENV" ]; then
+    note "检测到旧 CF-VLESS 状态: 该路径已下线, 不再进入订阅; 如确认不再使用可运行 'install.sh cf off' 清理 cloudflared。"
+  fi
   print_summary
   trap - EXIT
   rm -rf "$INSTALL_TX_BACKUP"
