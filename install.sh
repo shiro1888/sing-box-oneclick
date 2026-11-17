@@ -669,10 +669,6 @@ load_cf_env() {
   load_state_file "$CF_ENV" CF_HOSTNAME CF_PORT CF_VLESS_UUID CF_WS_PATH CF_VERIFIED CF_NAME
 }
 
-load_cf_pending_env() {
-  load_state_file "$CF_PENDING_ENV" CF_HOSTNAME CF_PORT CF_VLESS_UUID CF_WS_PATH CF_NAME
-}
-
 load_warp_env() {
   load_state_file "$WARP_ENV" WARP_PRIVATE_KEY WARP_ADDR_V4 WARP_ADDR_V6 WARP_RESERVED WARP_SITES
 }
