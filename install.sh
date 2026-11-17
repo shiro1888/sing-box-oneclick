@@ -2024,17 +2024,19 @@ porthop_cleanup() {
 
 config_firewall() {
   # 提示要跟着 ENABLE_HY2 / SS_UDP / 订阅 TLS 走: 关掉的协议不该再让用户去云安全组放行对应端口
-  local tcp_ports="22 80 $ANYTLS_PORT $SS_PORT" udp_ports="" udp_hint="" tls_note=""
-  if subscription_tls_enabled; then tcp_ports="22 80 443 $ANYTLS_PORT $SS_PORT"; tls_note=" 443/tcp(订阅 HTTPS)"; fi
+  local tcp_ports="22 80 $ANYTLS_PORT $SS_PORT" udp_ports="" udp_hint="" tcp_hint="" p
+  if subscription_tls_enabled; then tcp_ports="22 80 443 $ANYTLS_PORT $SS_PORT"; fi
+  for p in $tcp_ports; do tcp_hint="${tcp_hint:+$tcp_hint、}$p/tcp"; done
+  subscription_tls_enabled && tcp_hint="$tcp_hint(443 为订阅 HTTPS)"
   [ "$SS_UDP" = 1 ] && udp_ports="$SS_PORT" && udp_hint="$SS_PORT"
   if [ "$ENABLE_HY2" = 1 ]; then
     udp_ports="$HY2_PORT${udp_ports:+ $udp_ports}"
     udp_hint="$HY2_PORT${udp_hint:+、$udp_hint}"
   fi
   if [ -n "$udp_hint" ]; then
-    note "云安全组(服务商控制台)必须放行: $tcp_ports/tcp$tls_note 与 UDP($udp_hint)—— 尤其 UDP。本脚本改不了云端安全组, 这是'HY2/SS 连不上、AnyTLS 却正常'的头号原因。"
+    note "云安全组(服务商控制台)必须放行: $tcp_hint 与 UDP($udp_hint)—— 尤其 UDP。本脚本改不了云端安全组, 这是'HY2/SS 连不上、AnyTLS 却正常'的头号原因。"
   else
-    note "云安全组(服务商控制台)必须放行: $tcp_ports/tcp$tls_note(本机按 TCP-only 组合部署, 无需放行 UDP)。本脚本改不了云端安全组。"
+    note "云安全组(服务商控制台)必须放行: $tcp_hint(本机按 TCP-only 组合部署, 无需放行 UDP)。本脚本改不了云端安全组。"
   fi
   if ! command -v ufw >/dev/null 2>&1; then return 0; fi
   _ufw_allow_ports() {
