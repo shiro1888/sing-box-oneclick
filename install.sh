@@ -65,7 +65,7 @@ done
 unset _legacy _legacy_val
 
 for _v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
-          HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS \
+          HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS SUB_CERT SUB_KEY \
           ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
   eval "_CLI_$_v=\"\${$_v:-}\""
 done
@@ -354,13 +354,42 @@ validate_inputs() {
   case "$TLS_SNI" in ''|*[!A-Za-z0-9.-]*) die "TLS_SNI 含非法字符: '$TLS_SNI'";; esac
   [ -z "$DOMAIN" ] || case "$DOMAIN" in *[!A-Za-z0-9.-]*) die "DOMAIN 含非法字符: '$DOMAIN'";; esac
   case "$SUB_TLS" in auto|0|1) ;; *) die "SUB_TLS 只能是 auto / 1 / 0: '$SUB_TLS'";; esac
+  # SUB_TLS=1 是"强制 HTTPS": 缺域名或证书就直接在开头报错, 不要等 nginx 配到一半才失败。
+  if [ "$SUB_TLS" = 1 ]; then
+    [ -n "$DOMAIN" ] || die "SUB_TLS=1 需要 DOMAIN=你的订阅域名(证书必须与域名匹配)"
+    { [ -f "$(sub_cert_file)" ] && [ -f "$(sub_key_file)" ]; } \
+      || die "SUB_TLS=1 但证书缺失: $(sub_cert_file) / $(sub_key_file)(先放 fullchain 与私钥)"
+  fi
+  # 订阅 HTTPS 会独占 443/tcp; AnyTLS/SS 也是 TCP 入站, 同端口会让 nginx -t 或 sing-box 启动失败。
+  if subscription_tls_enabled || { [ "$SUB_TLS" = 1 ] && [ -n "$DOMAIN" ]; }; then
+    [ "$ANYTLS_PORT" != 443 ] || die "启用订阅 HTTPS 时 443/tcp 归 nginx, ANYTLS_PORT 不能是 443"
+    [ "$SS_PORT" != 443 ]    || die "启用订阅 HTTPS 时 443/tcp 归 nginx, SS_PORT 不能是 443"
+  fi
+  # 这些值会原样写进 /etc/sing-box-node.env; 不校验会让下一次 load_node_env 直接拒绝自己的文件,
+  # 或者让 traffic_limit.py 每次 cron 都崩。
+  [[ "$LIMIT_GB" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || die "LIMIT_GB 要是数字(如 200 或 0.5): '$LIMIT_GB'"
+  case "$COUNT_MODE" in rx+tx|tx|max) ;; *) die "COUNT_MODE 只能 rx+tx / tx / max: '$COUNT_MODE'";; esac
+  case "$AIRPORT_NAME" in
+    ''|*$'\n'*|*$'\r'*|*'"'*|*"'"*|*\\*)
+      die "AIRPORT_NAME 不能为空, 且不能含换行/引号/反斜杠: '$AIRPORT_NAME'" ;;
+  esac
   if [ -n "${EXPIRE_AT:-}" ]; then
     [[ "$EXPIRE_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [+-][0-9]{4}$ ]] \
       || die "EXPIRE_AT 格式必须是 'YYYY-MM-DD HH:MM:SS +0800'(含四位时区偏移, 不能是 +08:00 或省略), 当前: '$EXPIRE_AT'"
   fi
   [ -z "$OBFS_PASSWORD" ] || case "$OBFS_PASSWORD" in *[!A-Za-z0-9]*) die "OBFS_PASSWORD 只能含字母数字: '$OBFS_PASSWORD'";; esac
+  # 自定义订阅证书路径: 固定在 /etc/sing-box/ 下, 保证 backup/restore 的 tar 白名单
+  # 能覆盖到(否则自定义路径的证书既不会被备份, restore 时还可能误删目标文件)。
+  local _cert
+  for _cert in "$SUB_CERT" "$SUB_KEY"; do
+    [ -z "$_cert" ] && continue
+    case "$_cert" in
+      /etc/sing-box/*) [[ "$_cert" != *..* && "$_cert" =~ ^/etc/sing-box/[A-Za-z0-9._/-]+$ ]] || die "证书路径非法(只允许 /etc/sing-box/ 下的常见文件名字符, 不能含 ..): '$_cert'" ;;
+      *) die "证书路径必须位于 /etc/sing-box/ 下: '$_cert'" ;;
+    esac
+  done
   # SS_METHOD 会裸插进 Clash YAML 的 cipher: 与 ss:// 链接; 含引号或 ": " 会让整份订阅 YAML 解析失败
-  # (四个节点全拉不到, 不只是 SS 那条)。用字符白名单而非枚举, 以免误杀传统 cipher。
+  # (三条节点全拉不到, 不只是 SS 那条)。用字符白名单而非枚举, 以免误杀传统 cipher。
   case "$SS_METHOD" in ''|*[!A-Za-z0-9-]*) die "SS_METHOD 只能含 字母/数字/连字符: '$SS_METHOD'";; esac
 }
 
@@ -477,7 +506,7 @@ url_host() {
 }
 
 # 节点连接地址只能是 IPv4、IPv6 字面量或普通 DNS 名。渲染前统一校验，避免维护命令
-# 误把 shell 分隔符/占位符写进全部订阅，导致服务端正常但客户端导入后四条直连节点全坏。
+# 误把 shell 分隔符/占位符写进全部订阅，导致服务端正常但客户端导入后三条直连节点全坏。
 valid_node_address() {
   local value="${1:-}"
   [ -n "$value" ] || return 1
@@ -586,6 +615,13 @@ valid_state_value() {
     SUB_TLS)
       case "$value" in auto|0|1) return 0 ;; esac; return 1
       ;;
+    SUB_CERT|SUB_KEY)
+      case "$value" in
+        '') return 0 ;;
+        /etc/sing-box/*) [[ "$value" != *..* && "$value" =~ ^/etc/sing-box/[A-Za-z0-9._/-]+$ ]] && return 0; return 1 ;;
+        *) return 1 ;;
+      esac
+      ;;
     ENABLE_BLOCK_BT|ENABLE_BLOCK_ADS|ENABLE_HY2|ENABLE_OBFS|SS_UDP|CF_VERIFIED)
       [[ "$value" = 0 || "$value" = 1 ]]
       ;;
@@ -659,7 +695,7 @@ load_secrets() {
 
 load_node_env() {
   load_state_file "$ENVFILE" LIMIT_GB EXPIRE_AT INTERFACE COUNT_MODE SUB_HOST PUBLIC_IP DOMAIN AIRPORT_NAME NODE_ADDR \
-    HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI SUB_TLS HY2_HOP_RANGE \
+    HY2_PORT ANYTLS_PORT VLESS_PORT SS_PORT SS_METHOD REALITY_SNI TLS_SNI SUB_TLS SUB_CERT SUB_KEY HY2_HOP_RANGE \
     HY2_UP HY2_DOWN HY2_UP_MBPS HY2_DOWN_MBPS ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP
   # 迁移: 旧值只用于兼容读取, 不参与渲染/写回。
   VLESS_PORT=""; REALITY_SNI=""; HY2_HOP_RANGE=""; HY2_UP=""; HY2_DOWN=""; HY2_UP_MBPS=""; HY2_DOWN_MBPS=""
@@ -768,7 +804,7 @@ merge_env_defaults() {
     note "HY2 端口已按 2026-10 基线从 4433 迁移到 UDP 443: 记得在云安全组放行 443/udp(旧 4433 可移除), 并让客户端重新拉订阅。"
   fi
   for v in LIMIT_GB COUNT_MODE EXPIRE_AT INTERFACE DOMAIN AIRPORT_NAME NODE_ADDR \
-            HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS \
+            HY2_PORT ANYTLS_PORT SS_PORT SS_METHOD TLS_SNI SUB_TLS SUB_CERT SUB_KEY \
             ENABLE_BLOCK_BT ENABLE_BLOCK_ADS ENABLE_HY2 ENABLE_OBFS SS_UDP; do
     eval "cli=\"\${_CLI_$v:-}\""
     [ -n "$cli" ] && printf -v "$v" '%s' "$cli"  # 本次显式传的赢回来
@@ -783,6 +819,9 @@ write_env() {
   # 留空 -> 流量头 expire=0, 客户端普遍视为"无到期", 比一个编出来的日期诚实。
   EXPIRE_VALUE="${EXPIRE_AT:-}"   # 单一来源, config_nginx 复用, 不再二次 grep
   [ -n "$EXPIRE_VALUE" ] || note "未设置 EXPIRE_AT: 订阅不显示到期(expire=0)。要显示续费日请用: bash install.sh set EXPIRE_AT='2026-12-31 23:59:59 +0800'"
+  # 空网卡名会让写出的 env 反过来过不了 valid_state_value(INTERFACE 不允许空),
+  # 下次 load_node_env 直接报“格式非法”。统一回退 eth0, 与 traffic_limit.py 的默认一致。
+  INTERFACE="${INTERFACE:-eth0}"
   atomic_write_file "$ENVFILE" 600 <<EOF || die "写入运行参数失败，已保留旧文件: $ENVFILE"
 # 由 install.sh 生成 —— 运行参数单一来源
 LIMIT_GB=$LIMIT_GB
@@ -800,6 +839,8 @@ SS_PORT=$SS_PORT
 SS_METHOD=$SS_METHOD
 TLS_SNI=$TLS_SNI
 SUB_TLS=$SUB_TLS
+SUB_CERT=$SUB_CERT
+SUB_KEY=$SUB_KEY
 ENABLE_BLOCK_BT=$ENABLE_BLOCK_BT
 ENABLE_BLOCK_ADS=$ENABLE_BLOCK_ADS
 ENABLE_HY2=$ENABLE_HY2
@@ -1160,6 +1201,8 @@ name_raw = os.environ.get("AIRPORT_NAME", "Node")
 name = e(name_raw)
 clash_raw = os.environ["CLASH_URL"]; b64_raw = os.environ["B64_URL"]
 clash = e(clash_raw); b64 = e(b64_raw)
+# 看板自身也走订阅同一个 server: 有 443 证书时同页就是 HTTPS, 提示不要写死“明文 HTTP”。
+scheme_note = "已启用 HTTPS。" if clash_raw.startswith("https://") else "当前走明文 HTTP。仅自己用、别外传链接；不可信网络请启用 443 HTTPS（见 README）。"
 # 一键导入深链: Clash 系吃 clash://install-config; Shadowrocket 吃 shadowrocket://add/sub://<base64(订阅URL)>
 clash_deep = e("clash://install-config?url=" + urllib.parse.quote(clash_raw, safe="") + "&name=" + urllib.parse.quote(name_raw, safe=""))
 sr_deep = e("shadowrocket://add/sub://" + base64.b64encode(b64_raw.encode()).decode())
@@ -1269,7 +1312,7 @@ body.light .warn{{background:#fff5f5;border-color:#ffd0d0;color:#b42318}}
 <div class="row2" style="margin-top:13px"><button class="lat" onclick="lat()">延迟自测</button><span id="lat" class="muted">到本机 HTTP 往返(参考)</span></div></div>
 <div class="sec">单节点（逐条导入 / 扫码）</div>
 {nodes_html}
-<div class="warn">{I_WARN}<span>此页含全部节点凭证、走明文 HTTP。仅自己用、别外传链接；不可信网络请走 HTTPS（见仓库 README）。</span></div>
+<div class="warn">{I_WARN}<span>此页含全部节点凭证。{scheme_note}</span></div>
 <p class="foot">管理（改限额 / 更新 / 加节点）请用 SSH：<span class="kbd">bash install.sh menu</span></p>
 </div><script>
 {logout_js}
@@ -1296,10 +1339,13 @@ PY
 
 # 看板页登录页(自定义好看页面, 无敏感信息): 输密码 -> JS 写 cookie sbauth -> 跳看板; nginx 校验 cookie==密码。
 render_panel_login_html() {
-  AIRPORT_NAME="$AIRPORT_NAME" PANEL_PATH="$PANEL_PATH" "$PY" - <<'PY'
+  AIRPORT_NAME="$AIRPORT_NAME" PANEL_PATH="$PANEL_PATH" \
+  PANEL_HTTPS="$(subscription_tls_enabled && printf 1 || printf 0)" \
+  "$PY" - <<'PY'
 import os, html, json, sys
 name = html.escape(os.environ.get("AIRPORT_NAME", "订阅"))
 panel = json.dumps(os.environ.get("PANEL_PATH", "/"))   # 安全的 JS 字符串字面量
+tip = "HTTPS 已启用，密码与 cookie 加密传输。" if os.environ.get("PANEL_HTTPS") == "1" else "明文 HTTP 下密码不加密传输; 不可信网络请走 HTTPS。"
 out = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{name} · 登录</title><style>
@@ -1328,7 +1374,7 @@ button:hover{{transform:translateY(-1px);filter:brightness(1.06)}}button:active{
 <input id="pw" type="password" placeholder="密码" autocomplete="current-password" autofocus>
 <button id="go">登录</button>
 <p class="err" id="err">密码不对,再试一次</p>
-<p class="tip">明文 HTTP 下密码不加密传输; 不可信网络请走 HTTPS。</p>
+<p class="tip">{tip}</p>
 </div>
 <script>
 var P={panel};
@@ -2317,6 +2363,8 @@ EOF
 
 do_backup() {
   [ -f "$SECRETS" ] || die "未检测到安装(缺 $SECRETS)"
+  # 自定义订阅证书名存在 env 里; best-effort 读出来, 否则备份会漏掉非默认名的证书。
+  if [ -f "$ENVFILE" ]; then load_node_env 2>/dev/null || warn "运行参数文件无法解析, 自定义订阅证书可能未打包"; fi
   local bf="${BACKUP_DIR:-/root}/sing-box-backup-$(date +%Y%m%d-%H%M%S).tar.gz" f files=""
   for f in "$SECRETS" "$ENVFILE" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$(sub_cert_file)" "$(sub_key_file)"; do
     [ -f "$f" ] && files="$files $f"
@@ -2370,6 +2418,16 @@ do_restore() {
 
   mkdir -p "$SB_DIR" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "无法创建 sing-box 状态目录"; }
   RESTORE_TX_BACKUP="$(mktemp -d "$SB_DIR/.restore-backup.XXXXXX")" || { rm -rf "$RESTORE_TX_STAGE"; RESTORE_TX_STAGE=""; die "无法创建 restore 回滚目录"; }
+  # 备份里的 env 可能指向 /etc/sing-box/ 下的自定义证书名。恢复目标必须在发布前按备份内容
+  # 重定向, 否则 restore 只恢复默认 sub.crt/key, 自定义证书会被漏掉(甚至被 publish "-" 删掉)。
+  local staged_env="$RESTORE_TX_STAGE/etc/sing-box-node.env" _sc="" _sk=""
+  if [ -f "$staged_env" ]; then
+    _sc="$(sed -n 's/^SUB_CERT=//p' "$staged_env" | head -n1 | tr -d '\r')"
+    _sk="$(sed -n 's/^SUB_KEY=//p'  "$staged_env" | head -n1 | tr -d '\r')"
+    _sc="${_sc#\"}"; _sc="${_sc%\"}"; _sk="${_sk#\"}"; _sk="${_sk%\"}"
+    if [ -n "$_sc" ] && valid_state_value SUB_CERT "$_sc"; then SUB_CERT="$SB_DIR/${_sc#/etc/sing-box/}"; fi
+    if [ -n "$_sk" ] && valid_state_value SUB_KEY  "$_sk"; then SUB_KEY="$SB_DIR/${_sk#/etc/sing-box/}"; fi
+  fi
   RESTORE_TX_TARGETS=("$SECRETS" "$ENVFILE" "$WARP_ENV" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$(sub_cert_file)" "$(sub_key_file)")
   snapshot_files "$RESTORE_TX_BACKUP" "${RESTORE_TX_TARGETS[@]}" || { rm -rf "$RESTORE_TX_STAGE" "$RESTORE_TX_BACKUP"; RESTORE_TX_STAGE=""; RESTORE_TX_BACKUP=""; die "无法备份恢复前状态"; }
   RESTORE_TX_OLD_SINGBOX_ACTIVE=0; RESTORE_TX_OLD_NGINX_ACTIVE=0; RESTORE_TX_ROLLBACK_STARTED=0
@@ -2575,7 +2633,7 @@ do_doctor() {
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo)"
   [ "$cc" = bbr ] && P "拥塞控制 = bbr" || W "拥塞控制 = ${cc:-未知}(非 bbr): 重跑 install 开 BBR"
   # 4) 端口本地监听
-  # ENABLE_HY2=0 时 4433 本就不该监听, 不能当成故障报出来
+  # ENABLE_HY2=0 时 HY2_PORT 本就不该监听, 不能当成故障报出来
   local p miss=0 want="$SS_PORT 80"
   [ "$ENABLE_HY2" = 1 ] && want="$HY2_PORT $want"
   [ "$ANYTLS_OK" = 1 ] && want="$ANYTLS_PORT $want"
@@ -2673,6 +2731,9 @@ do_set() {
     esac
     ok "set $key=$val"
   done
+  # set 的键虽少, 但 SUB_TLS=1 依赖 DOMAIN 与证书、还会与 TCP 443 端口互斥; 改完立即校验,
+  # 不合法就别写 env/刷新 nginx(否则会留下一个下次启动才报错的状态)。
+  validate_inputs
   mkdir -p "$(dirname "$ENVFILE")" || die "无法创建运行参数目录"
   tx_bak="$(mktemp -d "$(dirname "$ENVFILE")/.set-backup.XXXXXX")" || die "无法创建 set 回滚目录"
   local -a set_paths=("$ENVFILE" "$SB_DIR/config.json" "$NGINX_SNIPPET" "$NGINX_CONF" "$NGINX_MAIN")
@@ -2800,6 +2861,8 @@ do_uninstall() {
       [ -f "$ENVFILE" ] && cp -a "$ENVFILE" "$bdir/" 2>/dev/null ) || true
     ok "已备份密钥/参数到 $bdir"
   fi
+  # 自定义订阅证书名记在 env 里; best-effort 读出来, 卸载时才能一并清掉。
+  if [ -f "$ENVFILE" ]; then load_node_env 2>/dev/null || true; fi
   systemctl disable --now sing-box >/dev/null 2>&1 || true
   if [ -f "$SECRETS" ] && ! load_secrets; then warn "密钥文件格式非法, 将按通配路径清理订阅/看板文件"; fi
   rm -f "$SB_DIR/config.json" "$SB_DIR/server.crt" "$SB_DIR/server.key" "$(sub_cert_file)" "$(sub_key_file)" "$SECRETS" 2>/dev/null || true
@@ -3144,11 +3207,17 @@ do_install() {
   trap '_install_exit_trap' EXIT
 
   detect_net
+  # 必须先合并已有 env: gen_secrets 会用 SS_METHOD/ENABLE_OBFS/TLS_SNI 决定是否补密钥、
+  # 是否保留混淆、生成什么 CN 的证书。放在 gen_secrets 之后会导致重装时按默认值误判
+  # (例如自定义 SS_METHOD 被按 128-gcm 重新生成密钥, 随后 sing-box check 失败)。
+  merge_env_defaults "${RESTORING:-0}"   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT 等, 显式传入的仍优先
+  # 旧 env 里的端口/SUB_TLS/证书路径也可能不合法(例如 TLS 订阅与 AnyTLS 抢 443)。
+  # 合并后再校验一次, 避免装到 nginx/sing-box 启动阶段才发现、再走整段回滚。
+  validate_inputs
   gen_secrets
   if [ -f "$WARP_ENV" ]; then load_warp_env || die "WARP 状态文件格式非法: $WARP_ENV"; fi   # 已接入过 WARP 则重装/更新时保留分流
   gen_cert
   config_sysctl   # 在 sing-box 启动前应用, 这样 HY2/QUIC 一启动就拿到大 UDP 缓冲
-  merge_env_defaults "${RESTORING:-0}"   # 重装时沿用已有 LIMIT_GB/EXPIRE_AT 等, 显式传入的仍优先
   write_env
   write_singbox_config
   write_subscription
@@ -3181,7 +3250,7 @@ main() {
     harden)    with_maintenance_lock do_harden ;;
     update)    with_maintenance_lock do_update ;;
     restart)   with_maintenance_lock do_restart ;;
-    cf)        with_maintenance_lock do_cf ;;
+    cf)        shift; with_maintenance_lock do_cf "$@" ;;
     warp)      shift; with_maintenance_lock do_warp "$@" ;;
     admin)     shift; with_maintenance_lock do_admin "$@" ;;
     komari)    with_maintenance_lock do_komari ;;

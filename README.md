@@ -16,7 +16,7 @@
 - **零交互**：自动装依赖与 sing-box、自动生成全部密钥、自动探测公网 IP 和网卡。
 - **多格式订阅**：Clash/Mihomo（YAML）+ 通用 base64 订阅（v2rayN / Shadowrocket / NekoBox 等）两个 URL；`install.sh links` 还能单独打印每个节点的分享链接（`hysteria2://` / `anytls://` / `ss://`）。
 - **客户端分流（订阅内）**：只引用 MetaCubeX 官方 MRS（6 个 provider + 固定 7 条规则，私有→广告→Google→中国→MATCH）；`meta-google` 固定在中国规则之前，避免 Google Play 下载卡 99%。附专用 DNS：`proxy-server-nameserver` 解析节点域名，`fallback: []` 避免境外 DoH 不可达导致的 5 秒解析超时。
-- **可视化看板页**：装完给一个 `http://<IP>/panel-xxxx.html`，浏览器打开看两种订阅 + 二维码 + 节点列表，一键复制、手机扫码导入；只读（服务器管理走 SSH）。
+- **可视化看板页**：装完给一个 `http://<IP>/panel-xxxx.html`（启用订阅 HTTPS 后同页走 `https://域名/...`），浏览器打开看两种订阅 + 二维码 + 节点列表，一键复制、手机扫码导入；只读（服务器管理走 SSH）。
 - **Komari 探针**：`install.sh komari` 傻瓜式装 [Komari](https://github.com/komari-monitor/komari) 监控 agent（可选，与代理无关）。
 - **路由防护**：服务端默认**拦 BT/PT**（防被商家封机收滥用投诉）+ **MRS 广告规则拦截**（`ENABLE_BLOCK_BT=0` / `ENABLE_BLOCK_ADS=0` 可关）。
 - **备份迁移**：`install.sh backup` 把密钥+配置+证书打成一个包，新 VPS 上 `restore <文件>` 一条命令重建——**凭证/订阅路径不变，客户端不用换密码**（换机器只需把订阅 URL 的 IP 改成新 IP，或用域名直接重指 DNS）。
@@ -165,7 +165,7 @@ sudo bash install.sh uninstall   # 卸载（FORCE=1 跳过确认；删前自动�
 ```
 
 ### 可视化看板页
-装完会多打印一个**看板页地址** `http://<IP>/panel-xxxx.html`，浏览器打开就是一个自包含页面：
+装完会多打印一个**看板页地址** `http://<IP>/panel-xxxx.html`（启用订阅 HTTPS 后为 `https://域名/panel-xxxx.html`），浏览器打开就是一个自包含页面：
 - **两种整段订阅**（Clash YAML / 通用 base64）：一键复制 + 二维码 + **一键导入按钮**（`clash://install-config` / `shadowrocket://add/sub://`，点一下直接拉进客户端）。
 - **每个节点独立卡片**：单条分享链接（复制）+ 各自二维码，方便只导入某一个节点。
 - **流量 / 到期**：静态显示限额+到期，并实时拉订阅响应头显示「已用」。
@@ -248,7 +248,7 @@ sudo KOMARI_ENDPOINT='https://你的komari面板' KOMARI_TOKEN='节点token' bas
    /etc/sing-box/sub.crt
    /etc/sing-box/sub.key
    ```
-   也可以用 `SUB_CERT=/path/fullchain.pem SUB_KEY=/path/key.pem` 指定其它路径。
+   也可以用 `SUB_CERT=/etc/sing-box/其它名.crt SUB_KEY=/etc/sing-box/其它名.key` 指定同目录下的其它文件名（限制在该目录内，才能随 `backup` 一起迁移）。
 3. 重跑 `sudo bash install.sh`（或 `install.sh set SUB_TLS=1`）。脚本检测到 `DOMAIN` + 证书就自动给订阅 server 加 `listen 443 ssl`，订阅 URL 变成 `https://node.example.com/随机路径`；443 默认 server 对未知 SNI 直接 444 关闭，不暴露任何内容。
 4. 证书续期后重跑一次 `install.sh` 让 nginx 加载新证书（`doctor` 会检查 30 天到期）。
 

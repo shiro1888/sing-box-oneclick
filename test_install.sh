@@ -344,6 +344,14 @@ if PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/nu
 else
   grep -q '^HY2_UP_MBPS=80$' "$SETX/env" && { echo "FAIL  已下线参数污染 env"; fail=1; } || echo "PASS  do_set 拒绝已下线的 HY2 带宽参数"
 fi
+# main 的子命令参数要真的传下去: cf off 曾因 main 没 shift 而永远只打印帮助, 不执行清理。
+cfargs="$(PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  need_root(){ :; }; with_maintenance_lock(){ "$@"; }; do_cf(){ printf "ARGS:%s" "$*"; }; main cf off' 2>/dev/null)"
+if [ "$cfargs" = "ARGS:off" ]; then
+  echo "PASS  main 把 cf off 的参数传给 do_cf"
+else
+  echo "FAIL  cf 子命令参数丢失: got '$cfargs'"; fail=1
+fi
 # apply_singbox_config: 回滚后旧服务也起不来时, 必须显式报警, 不静默谎称"节点不受影响"
 AP2="$TMP/ap2"; rm -rf "$AP2"; mkdir -p "$AP2"; echo '{"old":1}' > "$AP2/config.json"; echo '{"new":1}' > "$AP2/new.json"
 errout="$(PYTHON="$PYTHON_BIN" bash -c 'source ./install.sh >/dev/null 2>&1; set +e; SB_DIR="'"$AP2"'"; systemctl(){ return 1; }; apply_singbox_config "'"$AP2"'/new.json"' 2>&1)"
@@ -457,6 +465,18 @@ PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 
 bf="$(ls "$BK"/out/sing-box-backup-*.tar.gz 2>/dev/null | head -1)"
 if [ -n "$bf" ] && tar tzf "$bf" 2>/dev/null | grep -q 'secrets' && tar tzf "$bf" 2>/dev/null | grep -q 'server.key'; then
   echo "PASS  backup 生成 tar.gz 且含 密钥/证书/参数"; else echo "FAIL  backup"; ls -la "$BK/out" 2>/dev/null; fail=1; fi
+# 自定义订阅证书名(env 里 SUB_CERT/SUB_KEY)也必须进备份, 否则换机会丢 443 配置
+BKX="$TMP/bk-custom"; rm -rf "$BKX"; mkdir -p "$BKX/sb" "$BKX/out"
+echo 'HY2_PASSWORD=x' > "$BKX/sb/secrets"; echo 'LIMIT_GB=200' > "$BKX/env"
+echo cert > "$BKX/sb/server.crt"; echo key > "$BKX/sb/server.key"
+echo custom-cert > "$BKX/sb/custom.crt"; echo custom-key > "$BKX/sb/custom.key"
+PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="'"$BKX"'/sb"; SECRETS="'"$BKX"'/sb/secrets"; ENVFILE="'"$BKX"'/env"; BACKUP_DIR="'"$BKX"'/out"
+  SUB_CERT="'"$BKX"'/sb/custom.crt"; SUB_KEY="'"$BKX"'/sb/custom.key"; do_backup >/dev/null 2>&1'
+bfx="$(ls "$BKX"/out/sing-box-backup-*.tar.gz 2>/dev/null | head -1)"
+if [ -n "$bfx" ] && tar tzf "$bfx" 2>/dev/null | grep -q 'custom.crt' && tar tzf "$bfx" 2>/dev/null | grep -q 'custom.key'; then
+  echo "PASS  backup 包含自定义订阅证书与私钥"
+else echo "FAIL  backup 漏掉自定义订阅证书"; ls -la "$BKX/out" 2>/dev/null; fail=1; fi
 
 # restore 安全护栏: 含白名单外成员的 tar 必须在解包前被拒(防以 root 解任意 tar 覆盖系统文件)
 if command -v tar >/dev/null 2>&1; then
@@ -490,13 +510,22 @@ CF_WS_PATH=/cf-test
 CF_VERIFIED=1
 CF_NAME=CF-TEST-WS
 E
-  ( cd "$RSP/src" && tar czf "$RSP/good.tar.gz" etc/sing-box/node-secrets.env etc/sing-box/cf.env ) 2>/dev/null
+  cat >"$RSP/src/etc/sing-box-node.env" <<'E'
+SUB_CERT=/etc/sing-box/custom.crt
+SUB_KEY=/etc/sing-box/custom.key
+E
+  printf 'CUSTOM-CERT\n' >"$RSP/src/etc/sing-box/custom.crt"
+  printf 'CUSTOM-KEY\n'  >"$RSP/src/etc/sing-box/custom.key"
+  ( cd "$RSP/src" && tar czf "$RSP/good.tar.gz" etc/sing-box/node-secrets.env etc/sing-box/cf.env \
+      etc/sing-box-node.env etc/sing-box/custom.crt etc/sing-box/custom.key ) 2>/dev/null
   if RSP="$RSP" PYTHON="$PYTHON_BIN" bash -c 'set +euo pipefail; source ./install.sh >/dev/null 2>&1
     RESTORE_ROOT="$RSP/root"; SB_DIR="$RESTORE_ROOT/etc/sing-box"; SECRETS="$SB_DIR/node-secrets.env"; ENVFILE="$RESTORE_ROOT/etc/sing-box-node.env"; CF_ENV="$SB_DIR/cf.env"; CF_PENDING_ENV="$SB_DIR/cf.restore-pending.env"; WARP_ENV="$SB_DIR/warp.env"
     do_install(){ [ -z "${CF_HOSTNAME:-}" ] && [ -z "${CF_VLESS_UUID:-}" ] && [ -z "${CF_VERIFIED:-}" ]; }; do_restore "$RSP/good.tar.gz" >/dev/null 2>&1 \
     && grep -q "^HY2_PASSWORD=pw1$" "$RSP/root/etc/sing-box/node-secrets.env" \
-    && [ ! -e "$RSP/root/etc/sing-box/cf.env" ]'; then
-    echo "PASS  restore 恢复凭证且忽略已下线的 CF 状态"
+    && [ ! -e "$RSP/root/etc/sing-box/cf.env" ] \
+    && grep -q '^CUSTOM-CERT$' "$RSP/root/etc/sing-box/custom.crt" \
+    && grep -q '^CUSTOM-KEY$' "$RSP/root/etc/sing-box/custom.key"'; then
+    echo "PASS  restore 恢复凭证/自定义证书且忽略已下线的 CF 状态"
   else
     echo "FAIL  restore 旧状态处理不正确"; fail=1
   fi
@@ -708,6 +737,45 @@ case "$out" in
   *REACHED_DIE*) echo "PASS  detect_net 探测失败时走到 die 提示(未被 set -e 静默退出)" ;;
   *) echo "FAIL  detect_net 疑似被 set -e 静默打断(应出现 REACHED_DIE): '$out'"; fail=1 ;;
 esac
+# e) do_install 必须先 merge_env_defaults 再 gen_secrets: 否则自定义 SS_METHOD/TLS_SNI/ENABLE_OBFS
+#    会在“默认值”下被误判, 重装时错误重生成密钥/证书或把已关的混淆又打开。
+merge_line=$(grep -n 'merge_env_defaults "${RESTORING:-0}"' install.sh | head -1 | cut -d: -f1)
+gen_line=$(grep -n '^  gen_secrets$' install.sh | head -1 | cut -d: -f1)
+if [ -n "$merge_line" ] && [ -n "$gen_line" ] && [ "$merge_line" -lt "$gen_line" ]; then
+  echo "PASS  do_install 先合并已有 env 再生成密钥(自定义 SS_METHOD/TLS_SNI 不被默认值误判)"
+else echo "FAIL  merge_env_defaults 晚于 gen_secrets ($merge_line vs $gen_line)"; fail=1; fi
+# f) 该顺序的实际效果: env 里 SS_METHOD=256 + ENABLE_OBFS=0 时, 已有 32 字节 SS 密钥不能重生成,
+#    已有关闭的混淆不能被重新打开。
+SG="$TMP/secrets-order"; rm -rf "$SG"; mkdir -p "$SG"
+cat >"$SG/secrets" <<'E'
+HY2_PASSWORD=pw1
+ANYTLS_PASSWORD=pw2
+SUB_PATH=/sub.yaml
+SUB_B64_PATH=/sub.txt
+PANEL_PATH=/panel.html
+SS_PASSWORD="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+OBFS_PASSWORD=keepme
+E
+cat >"$SG/env" <<'E'
+SS_METHOD=2022-blake3-aes-256-gcm
+ENABLE_OBFS=0
+E
+out=$(unset SS_METHOD ENABLE_OBFS; SG="$SG" PYTHON="$PYTHON_BIN" bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1
+  SB_DIR="$SG"; SECRETS="$SG/secrets"; ENVFILE="$SG/env"; merge_env_defaults >/dev/null 2>&1; gen_secrets >/dev/null 2>&1; load_secrets
+  printf "%s|%s|%s" "$SS_METHOD" "$(ss_key_bytes "$SS_PASSWORD")" "${OBFS_PASSWORD:-}"' 2>/dev/null)
+if [ "$out" = "2022-blake3-aes-256-gcm|32|" ]; then
+  echo "PASS  重装按 env 的 SS_METHOD/ENABLE_OBFS 复用密钥, 不误生成也不复活混淆"
+else echo "FAIL  重装密钥/混淆被默认值误改: got '$out'"; fail=1; fi
+# g) 自定义订阅证书路径必须持久化, 否则重装/单独 panel 会退回 /etc/sing-box/sub.* 并悄悄关掉 443
+CP="$TMP/cert-persist"; rm -rf "$CP"; mkdir -p "$CP"
+out=$(CP="$CP" PYTHON="$PYTHON_BIN" bash -c 'set -euo pipefail; source ./install.sh >/dev/null 2>&1
+  ENVFILE="$CP/env"; SECRETS="$CP/no-secrets"; SUB_CERT=/etc/sing-box/custom-fullchain.pem; SUB_KEY=/etc/sing-box/custom-key.pem
+  SUB_HOST=1.2.3.4; PUBLIC_IP=1.2.3.4; INTERFACE=eth0; NODE_ADDR=1.2.3.4
+  write_env >/dev/null 2>&1; SUB_CERT=""; SUB_KEY=""; load_node_env
+  printf "%s|%s" "$SUB_CERT" "$SUB_KEY"' 2>/dev/null)
+if [ "$out" = "/etc/sing-box/custom-fullchain.pem|/etc/sing-box/custom-key.pem" ]; then
+  echo "PASS  SUB_CERT/SUB_KEY 写入 env 并可重新读取"
+else echo "FAIL  自定义证书路径未持久化: got '$out'"; fail=1; fi
 
 echo
 echo "=== 4k) SSH 加固 do_harden(防锁死护栏 + 回滚) ==="
@@ -1097,6 +1165,19 @@ D="超范围端口被拒";        bad_case SS_PORT="70000"
 D="端口重复被拒";          bad_case HY2_PORT="4435"
 D="非法 SNI 被拒";         bad_case TLS_SNI="a;rm -rf"
 D="非法 SUB_TLS 被拒";     bad_case SUB_TLS="on"
+D="非法 LIMIT_GB 被拒";    bad_case LIMIT_GB="abc"
+D="非法 COUNT_MODE 被拒";  bad_case COUNT_MODE="bogus"
+D="含引号 AIRPORT_NAME 被拒"; bad_case AIRPORT_NAME='bad"name'
+D="相对证书路径被拒";      bad_case SUB_CERT="relative.pem"
+D="含 .. 的证书路径被拒";  bad_case SUB_KEY="/etc/ssl/../key.pem"
+D="合法证书路径通过";      ok_case  SUB_CERT="/etc/sing-box/fullchain.pem" SUB_KEY="/etc/sing-box/key.pem"
+D="SUB_TLS=1 缺域名被拒";  bad_case SUB_TLS="1"
+D="SUB_TLS=1 缺证书被拒";  bad_case SUB_TLS="1" DOMAIN="node.example.com"
+# 订阅 HTTPS 占用 443/tcp 时, TCP 节点不能也抢 443(否则 nginx -t 必失败)
+mkdir -p "$SB_DIR"; : > "$SB_DIR/sub.crt"; : > "$SB_DIR/sub.key"
+D="HTTPS 订阅时 AnyTLS 抢 443 被拒"; bad_case SUB_TLS="auto" DOMAIN="node.example.com" ANYTLS_PORT="443"
+D="HTTPS 订阅时 SS 抢 443 被拒";     bad_case SUB_TLS="auto" DOMAIN="node.example.com" SS_PORT="443"
+rm -f "$SB_DIR/sub.crt" "$SB_DIR/sub.key"
 
 echo
 if [ "$fail" = 0 ]; then echo "==== ALL TESTS PASS ===="; else echo "==== SOME TESTS FAILED ===="; fi
